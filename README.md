@@ -28,11 +28,11 @@ This repository contains Python scripts for 3D Mars terrain conversion, automate
 
 ```mermaid
 graph TD
-    HM ->|hm2obj.py| OBJ[OBJ Mesh]
-    OBJ ->|obj2glb.py| GLB[GLB Scene Asset]
+    HM -> |hm2obj.py| OBJ[OBJ Mesh]
+    OBJ -> |obj2glb.py| GLB[GLB Scene Asset]
     GLB -> Sim[Habitat Simulators]
-    Sim ->|Recordings| PNGs[RGB/Depth Frames]
-    PNGs ->|pix2vid.py| MP4[MP4 Videos]
+    Sim -> |Recordings| PNGs[RGB/Depth Frames]
+    PNGs -> |pix2vid.py| MP4[MP4 Videos]
 ```
 
 ---
