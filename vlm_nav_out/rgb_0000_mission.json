@@ -1,0 +1,70 @@
+{
+  "frame_idx": 0,
+  "vlm_response": {
+    "goal_object": {
+      "object_id": 8,
+      "label": "rock",
+      "coordinates2D": [
+        519.4535519125683,
+        419.78142076502735
+      ],
+      "reasoning": "This rock is the most prominent and likely to provide useful scientific data due to its size and position."
+    },
+    "obstacles": [
+      {
+        "object_id": 10,
+        "label": "rock",
+        "coordinates2D": [
+          274.6448087431694,
+          262.4043715846995
+        ],
+        "reasoning": "This rock is close to the goal object and could obstruct the rover's path if not avoided."
+      }
+    ]
+  },
+  "goal_mesh": {
+    "role": "goal",
+    "label": "rock",
+    "bbox": [
+      519.45,
+      419.78,
+      519.45,
+      419.78
+    ],
+    "seed_world": [
+      13.168,
+      0.018,
+      7.589
+    ],
+    "mesh_path": "vlm_nav_out/rgb_0000_goal_rock_r0.50.obj",
+    "radius": 0.5,
+    "num_vertices": 877,
+    "num_faces": 1624
+  },
+  "obstacle_meshes": [
+    {
+      "role": "obstacle",
+      "label": "rock",
+      "bbox": [
+        274.64,
+        262.4,
+        274.64,
+        262.4
+      ],
+      "seed_world": [
+        7.472,
+        0.207,
+        -4.546
+      ],
+      "mesh_path": "vlm_nav_out/rgb_0000_obstacle_rock_r0.50.obj",
+      "radius": 0.5,
+      "num_vertices": 877,
+      "num_faces": 1624
+    }
+  ],
+  "goal_target_world": [
+    13.168,
+    0.018,
+    7.589
+  ]
+}

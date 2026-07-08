@@ -141,6 +141,10 @@ def terrain_height_at(x, z):
     h1 = h01 * (1.0 - dx) + h11 * dx
     return float(h0 * (1.0 - dy) + h1 * dy)
 
+# Default heightmap sampler, captured before any local shadowing (e.g. the
+# `terrain_height_at` override parameter on make_local_height_patch_mesh).
+_DEFAULT_TERRAIN_HEIGHT_AT = terrain_height_at
+
 # Sensor and simulator setup
 def make_sensor(uuid, sensor_type):
     """Create a camera sensor spec (RGB or depth)."""
@@ -630,6 +634,145 @@ def bbox_to_world_seed(
     return seed_world, sampled_world_points
 
 
+# Local mesh patch export
+def make_local_height_patch_mesh(
+    center_world,
+    radius=0.5,
+    terrain_height_at=None,
+    resolution=0.03,
+):
+    """
+    Rebuild a local circular terrain patch as a triangle mesh, centered on
+    `center_world` in the Habitat world frame (X right, Y up, Z per the
+    scene's ground plane). Vertices are sampled on a regular XZ grid at
+    `resolution` spacing, masked to a disc of `radius`, with Y taken from
+    the terrain heightmap at each sample; grid cells are only triangulated
+    when all four corners fall inside the disc, so the boundary is a
+    (stairstepped) circle rather than a square.
+
+    Args:
+        center_world: (x, y, z) world-space point to center the patch on;
+            y is unused (each vertex's height is resampled from the
+            heightmap) but accepted for convenience since callers already
+            have a full seed point.
+        radius: patch radius in meters.
+        terrain_height_at: fn(x, z) -> y; defaults to the module's MarsYard
+            heightmap sampler.
+        resolution: grid spacing in meters between adjacent samples.
+
+    Returns:
+        (verts, faces): verts is an (N, 3) float array of world-space
+        [x, y, z] positions; faces is an (M, 3) int array of 0-based
+        vertex indices, wound so the normal points toward +Y (up).
+    """
+    height_fn = terrain_height_at if terrain_height_at is not None else _DEFAULT_TERRAIN_HEIGHT_AT
+
+    cx, _, cz = center_world
+    n = max(int(np.ceil(radius / resolution)), 1)
+    offsets = np.arange(-n, n + 1) * resolution
+
+    index_grid = -np.ones((len(offsets), len(offsets)), dtype=int)
+    verts = []
+    for j, dz in enumerate(offsets):
+        for i, dx in enumerate(offsets):
+            if dx * dx + dz * dz > radius * radius:
+                continue
+            wx = cx + dx
+            wz = cz + dz
+            wy = height_fn(wx, wz)
+            index_grid[j, i] = len(verts)
+            verts.append((wx, wy, wz))
+
+    faces = []
+    for j in range(len(offsets) - 1):
+        for i in range(len(offsets) - 1):
+            v00 = index_grid[j, i]
+            v10 = index_grid[j, i + 1]
+            v01 = index_grid[j + 1, i]
+            v11 = index_grid[j + 1, i + 1]
+            if v00 < 0 or v10 < 0 or v01 < 0 or v11 < 0:
+                continue
+            faces.append((v00, v01, v11))
+            faces.append((v00, v11, v10))
+
+    verts = np.array(verts, dtype=np.float64) if verts else np.empty((0, 3), dtype=np.float64)
+    faces = np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
+    return verts, faces
+
+
+def save_obj(path, verts, faces):
+    """Write a triangle mesh (0-based vertex indices) to a Wavefront OBJ file."""
+    with open(path, "w") as f:
+        for x, y, z in verts:
+            f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+        for a, b, c in faces:
+            f.write(f"f {int(a) + 1} {int(b) + 1} {int(c) + 1}\n")
+    return path
+
+
+def selected_bbox_to_object_mesh(
+    selected_obj,
+    depth,
+    pose,
+    frame_idx,
+    role,
+    pixel_to_world,
+    terrain_height_at,
+    output_dir,
+    radius=0.5,
+):
+    """
+    Resolve one VLM-selected object entry (goal or obstacle) to a world seed
+    point via bbox back-projection, extract its local terrain mesh patch,
+    save it to disk, and bundle both into a single metadata dict.
+
+    This is the one place bbox->world seeding and mesh extraction meet, so
+    every VLM-selected goal/obstacle - whether resolved live during the
+    interactive loop or replayed via --vlm/--goto - gets an on-disk mesh
+    and consistent metadata without re-deriving the position twice.
+
+    Args:
+        selected_obj: VLM object entry (goal_object or one obstacle), with
+            "label" and "coordinates2D" keys.
+        depth: HxW metric depth array for the frame.
+        pose: agent pose dict active when the frame was captured.
+        frame_idx: frame index the object was resolved from (for naming).
+        role: "goal", "obstacle", "obstacle1", etc.
+        pixel_to_world: fn(u, v, depth_value, pose) -> array-like [x, y, z].
+        terrain_height_at: fn(x, z) -> y.
+        output_dir: directory to save the mesh OBJ into.
+        radius: patch radius in meters.
+
+    Returns:
+        {
+            "role": role, "label": label, "bbox": [x1, y1, x2, y2],
+            "seed_world": [x, y, z], "mesh_path": path, "radius": radius,
+            "num_vertices": int, "num_faces": int,
+        }
+    """
+    seed_world, bbox_xyxy, label = _resolve_entry_seed_world(
+        selected_obj, depth, pose, pixel_to_world, terrain_height_at
+    )
+
+    safe_label = re.sub(r"[^a-zA-Z0-9]+", "_", label.strip().lower()).strip("_") or "object"
+    mesh_path = os.path.join(output_dir, f"rgb_{frame_idx:04d}_{role}_{safe_label}_r{radius:.2f}.obj")
+
+    verts, faces = make_local_height_patch_mesh(seed_world, radius=radius, terrain_height_at=terrain_height_at)
+    save_obj(mesh_path, verts, faces)
+    print(f"[mesh] saved {mesh_path} ({len(verts)} verts, {len(faces)} faces)")
+
+    return {
+        "role": role,
+        "label": label,
+        "bbox": [round(float(c), 2) for c in bbox_xyxy],
+        "seed_world": [round(float(c), 3) for c in seed_world],
+        "mesh_path": mesh_path,
+        "radius": radius,
+        "num_vertices": int(len(verts)),
+        "num_faces": int(len(faces)),
+    }
+
+
 def extract_obstacle_entries(response):
     """
     Normalize the VLM response's obstacle field into a list of entries.
@@ -650,10 +793,12 @@ def extract_obstacle_entries(response):
     return [e for e in entries if e]
 
 
-def entry_world_position(entry, frame_idx):
+def _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height_at):
     """
-    Resolve a single VLM object entry (goal_object or one obstacle) to a
-    world position, using the depth/pose captured alongside frame_idx.
+    Back-project a single VLM object entry's bbox to a world-space seed
+    point. Shared by `entry_world_position` (plain position lookups) and
+    `selected_bbox_to_object_mesh` (position + mesh extraction) so the
+    sampling/fallback logic only lives in one place.
 
     The bbox is back-projected robustly via `bbox_to_world_seed`: many
     pixels inside it are sampled and back-projected, and the median of
@@ -665,13 +810,10 @@ def entry_world_position(entry, frame_idx):
     plain center-pixel back-projection.
 
     Returns:
-        (x, y, z, label)
+        (seed_world, bbox_xyxy, label) - seed_world is an np.array([x, y, z]).
     """
     label = entry.get("label", "?")
     bbox_xyxy = coords2d_to_bbox_xyxy(entry["coordinates2D"])
-
-    depth = load_depth_frame(frame_idx)
-    pose = load_pose(frame_idx)
 
     seed_world, sampled_world_points = bbox_to_world_seed(
         bbox_xyxy, depth, pose, pixel_to_world, terrain_height_at=terrain_height_at,
@@ -689,13 +831,29 @@ def entry_world_position(entry, frame_idx):
             print(f"[warn] non-positive depth ({depth_value}) at pixel ({px},{py}); result will be unreliable")
         world = pixel_to_world(u, v, depth_value, pose)
         grounded_y = terrain_height_at(world[0], world[2])
+        seed_world = np.array([world[0], grounded_y, world[2]], dtype=np.float64)
         print(f"[object] '{label}' pixel=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
-              f"world=({world[0]:.2f}, {grounded_y:.2f}, {world[2]:.2f}) [fallback:center-pixel]")
-        return float(world[0]), float(grounded_y), float(world[2]), label
+              f"world=({seed_world[0]:.2f}, {seed_world[1]:.2f}, {seed_world[2]:.2f}) [fallback:center-pixel]")
+    else:
+        print(f"[object] '{label}' bbox={tuple(round(c, 1) for c in bbox_xyxy)} "
+              f"samples={len(sampled_world_points)} "
+              f"seed=({seed_world[0]:.2f}, {seed_world[1]:.2f}, {seed_world[2]:.2f})")
 
-    print(f"[object] '{label}' bbox={tuple(round(c, 1) for c in bbox_xyxy)} "
-          f"samples={len(sampled_world_points)} "
-          f"seed=({seed_world[0]:.2f}, {seed_world[1]:.2f}, {seed_world[2]:.2f})")
+    return seed_world, bbox_xyxy, label
+
+
+def entry_world_position(entry, frame_idx):
+    """
+    Resolve a single VLM object entry (goal_object or one obstacle) to a
+    world position, using the depth/pose captured alongside frame_idx.
+
+    Returns:
+        (x, y, z, label)
+    """
+    depth = load_depth_frame(frame_idx)
+    pose = load_pose(frame_idx)
+
+    seed_world, _, label = _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height_at)
 
     return float(seed_world[0]), float(seed_world[1]), float(seed_world[2]), label
 
@@ -704,7 +862,7 @@ def object_world_position(frame_idx):
     """
     Resolve the VLM-chosen goal object (from rgb_{idx}_vlm.txt) to a world
     position. Kept as a convenience for the single-object --face CLI path;
-    the full obstacles-then-goal mission uses entry_world_position directly.
+    the full obstacles-then-goal mission uses resolve_mission_meshes directly.
 
     Returns:
         (x, y, z, label)
@@ -716,6 +874,72 @@ def object_world_position(frame_idx):
         raise ValueError(f"no goal_object in {vlm_path}")
 
     return entry_world_position(goal_entry, frame_idx)
+
+
+def resolve_mission_meshes(frame_idx, response, radius=0.5):
+    """
+    Resolve every VLM-selected object in a frame's response (goal +
+    obstacles) to world positions and local terrain meshes, without driving
+    the rover. Shared by the live `navigate_mission` drive and the
+    standalone --vlm/--goto CLI reruns, so mesh generation happens exactly
+    once per object regardless of which path triggers it.
+
+    Returns:
+        (goal_mesh, obstacle_meshes) - goal_mesh is None if there's no
+        goal_object in `response`; obstacle_meshes is a list of metadata
+        dicts, skipping any obstacle entry that fails to resolve.
+    """
+    depth = load_depth_frame(frame_idx)
+    pose = load_pose(frame_idx)
+
+    goal_entry = response.get("goal_object")
+    goal_mesh = None
+    if goal_entry:
+        goal_mesh = selected_bbox_to_object_mesh(
+            goal_entry, depth, pose, frame_idx, "goal",
+            pixel_to_world, terrain_height_at, OUT_DIR, radius=radius,
+        )
+
+    obstacle_meshes = []
+    for i, obstacle in enumerate(extract_obstacle_entries(response)):
+        role = "obstacle" if i == 0 else f"obstacle{i}"
+        try:
+            mesh_meta = selected_bbox_to_object_mesh(
+                obstacle, depth, pose, frame_idx, role,
+                pixel_to_world, terrain_height_at, OUT_DIR, radius=radius,
+            )
+        except Exception as e:
+            oid = obstacle.get("object_id", "?") if isinstance(obstacle, dict) else "?"
+            print(f"[warn] skipping obstacle {i} (object_id={oid}): could not resolve position ({e})")
+            continue
+        obstacle_meshes.append(mesh_meta)
+
+    return goal_mesh, obstacle_meshes
+
+
+def save_mission_metadata(frame_idx, vlm_response, goal_mesh, obstacle_meshes, goal_target_world):
+    """
+    Persist the resolved mission for a frame - the VLM reply plus every
+    generated object mesh and the final navigation target - as
+    rgb_{idx}_mission.json, alongside the raw rgb_{idx}_vlm.txt reply. This
+    lets later steps load the chosen goal/obstacle mesh straight from disk
+    without rerunning annotation + VLM + bbox back-projection.
+
+    Returns:
+        Path to the saved JSON file.
+    """
+    meta_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_mission.json"
+    metadata = {
+        "frame_idx": frame_idx,
+        "vlm_response": vlm_response,
+        "goal_mesh": goal_mesh,
+        "obstacle_meshes": obstacle_meshes,
+        "goal_target_world": [float(c) for c in goal_target_world],
+    }
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"[mission] metadata saved: {meta_path}")
+    return meta_path
 
 
 def yaw_to_face(agent_x, agent_z, target_x, target_z):
@@ -855,26 +1079,21 @@ class InteractiveCapture:
         else:
             print(f"[nav] max steps ({NAV_MAX_STEPS}) reached before arriving at '{label}'")
 
-    def navigate_to_obstacles(self, obstacles, frame_idx):
+    def navigate_to_obstacles(self, obstacle_meshes):
         """
-        Drive to each obstacle in turn. Obstacles are visited one at a time so
-        the list can safely grow beyond today's single entry: a bad entry
-        (unresolvable position, missing depth) is logged and skipped rather
-        than aborting the rest of the list or the mission.
+        Drive to each already-resolved obstacle mesh in turn. Takes
+        pre-resolved metadata (from `resolve_mission_meshes`) rather than raw
+        VLM entries, so position resolution and mesh extraction happen
+        exactly once per obstacle regardless of caller.
         """
-        for i, obstacle in enumerate(obstacles):
-            try:
-                obs_x, _, obs_z, label = entry_world_position(obstacle, frame_idx)
-            except Exception as e:
-                oid = obstacle.get("object_id", "?") if isinstance(obstacle, dict) else "?"
-                print(f"[warn] skipping obstacle {i} (object_id={oid}): could not resolve position ({e})")
-                continue
+        for i, mesh_meta in enumerate(obstacle_meshes):
+            obs_x, _, obs_z = mesh_meta["seed_world"]
+            self.navigate_to_target(obs_x, obs_z, label=f"obstacle[{i}]:{mesh_meta['label']}")
 
-            self.navigate_to_target(obs_x, obs_z, label=f"obstacle[{i}]:{label}")
-
-    def navigate_to_goal(self, goal_entry, frame_idx):
-        """Drive to the goal object, then rotate in place to square up and face it."""
-        goal_x, goal_y, goal_z, label = entry_world_position(goal_entry, frame_idx)
+    def navigate_to_goal(self, goal_mesh):
+        """Drive to the already-resolved goal mesh, then rotate in place to square up and face it."""
+        goal_x, goal_y, goal_z = goal_mesh["seed_world"]
+        label = goal_mesh["label"]
         self.navigate_to_target(goal_x, goal_z, label=f"goal:{label}")
 
         self.yaw = yaw_to_face(self.x, self.z, goal_x, goal_z)
@@ -886,9 +1105,11 @@ class InteractiveCapture:
 
     def navigate_mission(self, frame_idx):
         """
-        Full mission for a queried frame: resolve the VLM's goal + obstacles,
-        drive to each obstacle first, then drive to the goal and stand facing
-        it at the controller's standoff distance.
+        Full mission for a queried frame: resolve the VLM's goal + obstacles
+        (including local terrain meshes), drive to each obstacle first, then
+        drive to the goal and stand facing it at the controller's standoff
+        distance. Mission metadata (VLM reply, meshes, final target) is
+        saved to rgb_{idx}_mission.json on completion.
         """
         vlm_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
         try:
@@ -897,22 +1118,22 @@ class InteractiveCapture:
             print(f"[error] could not parse VLM response {vlm_path}: {e}")
             return
 
-        goal_entry = response.get("goal_object")
-        if not goal_entry:
+        goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response)
+        if goal_mesh is None:
             print(f"[error] no goal_object in {vlm_path}")
             return
 
-        obstacles = extract_obstacle_entries(response)
-        print(f"[mission] {len(obstacles)} obstacle(s) to visit before the goal")
+        print(f"[mission] {len(obstacle_meshes)} obstacle(s) to visit before the goal")
 
-        self.navigate_to_obstacles(obstacles, frame_idx)
+        self.navigate_to_obstacles(obstacle_meshes)
 
         try:
-            self.navigate_to_goal(goal_entry, frame_idx)
+            goal_x, goal_y, goal_z, _ = self.navigate_to_goal(goal_mesh)
         except Exception as e:
-            print(f"[error] could not resolve/reach goal position: {e}")
+            print(f"[error] could not reach goal position: {e}")
             return
 
+        save_mission_metadata(frame_idx, response, goal_mesh, obstacle_meshes, (goal_x, goal_y, goal_z))
         print(f"[mission] complete")
 
     def close(self):
@@ -989,7 +1210,12 @@ def regenerate_overlays():
 
 
 def run_vlm_on_frame(frame_idx, prompt=VLM_PROMPT):
-    """Query the VLM on an already-captured/annotated frame, without touching the sim."""
+    """
+    Query the VLM on an already-captured/annotated frame, without touching
+    the sim, then resolve the chosen goal/obstacles to world-space meshes
+    and save mission metadata - same mesh generation the live interactive
+    loop performs, so a --vlm rerun alone is enough to produce meshes.
+    """
     rgb_path = f"{OUT_DIR}/rgb_{frame_idx:04d}.png"
     annotation_path = f"{ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
     overlay_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_at.png"
@@ -1007,9 +1233,23 @@ def run_vlm_on_frame(frame_idx, prompt=VLM_PROMPT):
     if not os.path.exists(overlay_path):
         draw_annotation_overlay(rgb_path, annotation_path, overlay_path)
 
-    success, _, status_msg = query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt)
+    success, vlm_out_path, status_msg = query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt)
     if not success:
         print(f"[error] VLM query failed: {status_msg}")
+        return
+
+    try:
+        response = parse_vlm_response(vlm_out_path)
+    except Exception as e:
+        print(f"[error] could not parse VLM response {vlm_out_path}: {e}")
+        return
+
+    goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response)
+    if goal_mesh is None:
+        print(f"[error] no goal_object in {vlm_out_path}")
+        return
+
+    save_mission_metadata(frame_idx, response, goal_mesh, obstacle_meshes, goal_mesh["seed_world"])
 
 
 def run_face_on_frame(frame_idx):
