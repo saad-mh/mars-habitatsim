@@ -1,0 +1,890 @@
+"""
+Interactive frame capture + labelme annotation handoff for VLM navigation.
+
+Loads the marsyard2022 scene from vlm_nav_demo.py configuration.
+Allows manual frame capture via spacebar and immediate annotation via labelme.
+Validates annotation JSON output for structural correctness.
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import subprocess
+import numpy as np
+from pathlib import Path
+from PIL import Image, ImageTk, ImageDraw
+import quaternion
+import tkinter as tk
+
+import habitat_sim
+from habitat_sim.agent import AgentConfiguration
+from habitat_sim.utils.common import quat_rotate_vector
+
+from vlm_nav_demo import GoToGoalController, DT as NAV_DT, MAX_STEPS as NAV_MAX_STEPS
+
+# ============================================================================
+# Configuration (from vlm_nav_demo.py)
+# ============================================================================
+
+SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/marsyard2022_tri.glb"
+HEIGHTMAP = "/home/nahar/Desktop/pineapple/conversion/marsyard2022/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
+
+OUT_DIR = "vlm_nav_out"
+ANNOTATIONS_DIR = "annotations"
+MASKS_DIR = "masks"
+
+# Terrain scale
+SIZE_X = 50.0
+SIZE_Z = 50.0
+SIZE_Y = 4.820803273566
+
+# Start pose (fixed for interactive capture)
+START_X = 12.2
+START_Z = 10.0
+START_YAW_DEG = 10.0
+
+# Camera height above terrain
+INITIAL_CLEARANCE = 0.9
+
+# Display
+RGBD_RESOLUTION = [480, 640]
+
+# Camera intrinsics (must match the sensor spec below)
+HFOV_DEG = 90.0
+
+# Heightmap correction
+FLIP_HEIGHTMAP_X = False
+FLIP_HEIGHTMAP_Z = True
+SWAP_HEIGHTMAP_XZ = False
+
+# Annotation
+LABELS_FILE = "labels.txt"
+CONDA_BASE = "/home/nahar/miniconda3"
+LABELME_BIN = f"{CONDA_BASE}/envs/annotate/bin/labelme"
+
+# VLM query (runs in a separate conda env — see qwen_vlm_smoke_test.py)
+VLM_PYTHON_BIN = f"{CONDA_BASE}/envs/qwen_vlm/bin/python"
+VLM_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_query.py")
+VLM_PROMPT = "Identify the most scientifically significant test subject among the detected objects. Output strictly in JSON format with keys: 'object_id', 'label', 'coordinates2Darray', 'reasoning'."
+
+# ============================================================================
+# Heightmap utilities
+# ============================================================================
+
+def load_heightmap(path):
+    """Load and normalize heightmap from PNG."""
+    img = Image.open(path)
+    arr = np.array(img)
+
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+
+    arr = arr.astype(np.float32)
+    arr = (arr - arr.min()) / max(arr.max() - arr.min(), 1e-8)
+
+    y = arr * SIZE_Y
+    y = y - np.mean(y)
+
+    return y
+
+
+HEIGHT = load_heightmap(HEIGHTMAP)
+HM_H, HM_W = HEIGHT.shape
+
+
+def terrain_height_at(x, z):
+    """Bilinear interpolation of terrain height at (x, z)."""
+    if SWAP_HEIGHTMAP_XZ:
+        x, z = z, x
+    u = (x + SIZE_X / 2.0) / SIZE_X
+    v = (z + SIZE_Z / 2.0) / SIZE_Z
+    if FLIP_HEIGHTMAP_X:
+        u = 1.0 - u
+    if FLIP_HEIGHTMAP_Z:
+        v = 1.0 - v
+    u = np.clip(u, 0.0, 1.0)
+    v = np.clip(v, 0.0, 1.0)
+    px = u * (HM_W - 1)
+    py = v * (HM_H - 1)
+    x0 = int(np.floor(px))
+    y0 = int(np.floor(py))
+    x1 = min(x0 + 1, HM_W - 1)
+    y1 = min(y0 + 1, HM_H - 1)
+    dx = px - x0
+    dy = py - y0
+    h00 = HEIGHT[y0, x0]
+    h10 = HEIGHT[y0, x1]
+    h01 = HEIGHT[y1, x0]
+    h11 = HEIGHT[y1, x1]
+    h0 = h00 * (1.0 - dx) + h10 * dx
+    h1 = h01 * (1.0 - dx) + h11 * dx
+    return float(h0 * (1.0 - dy) + h1 * dy)
+
+
+# ============================================================================
+# Sensor and simulator setup
+# ============================================================================
+
+def make_sensor(uuid, sensor_type):
+    """Create a camera sensor spec (RGB or depth)."""
+    spec = habitat_sim.CameraSensorSpec()
+    spec.uuid = uuid
+    spec.sensor_type = sensor_type
+    spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
+    spec.resolution = RGBD_RESOLUTION
+    spec.position = [0.0, 0.0, 0.0]
+    spec.hfov = HFOV_DEG
+    return spec
+
+
+def make_sim():
+    """Initialize Habitat simulator with scene and sensors."""
+    sim_cfg = habitat_sim.SimulatorConfiguration()
+    sim_cfg.scene_id = SCENE
+    sim_cfg.enable_physics = False
+
+    rgb = make_sensor("rgb", habitat_sim.SensorType.COLOR)
+    depth = make_sensor("depth", habitat_sim.SensorType.DEPTH)
+
+    agent_cfg = AgentConfiguration()
+    agent_cfg.sensor_specifications = [rgb, depth]
+
+    return habitat_sim.Simulator(
+        habitat_sim.Configuration(sim_cfg, [agent_cfg])
+    )
+
+
+def rgb_depth_from_obs(obs):
+    """Extract and process RGB and depth from sensor observation."""
+    rgb = obs["rgb"]
+    if rgb.shape[-1] == 4:
+        rgb = rgb[:, :, :3]
+    rgb = rgb.astype(np.uint8)
+
+    depth = obs["depth"]
+    return rgb, depth
+
+
+# ============================================================================
+# Frame capture and validation
+# ============================================================================
+
+def save_frame(obs, frame_idx):
+    """Save RGB and depth frames to disk."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    rgb, depth = rgb_depth_from_obs(obs)
+
+    rgb_path = f"{OUT_DIR}/rgb_{frame_idx:04d}.png"
+    depth_path = f"{OUT_DIR}/depth_{frame_idx:04d}.png"
+
+    Image.fromarray(rgb).save(rgb_path)
+
+    # Normalize depth for visualization
+    depth_clip = np.clip(depth, 0.0, 10.0)
+    depth_vis = (depth_clip / 10.0 * 255.0).astype(np.uint8)
+    Image.fromarray(depth_vis).save(depth_path)
+
+    # Raw metric depth, kept alongside the 8-bit visualization so bbox->world
+    # back-projection isn't limited to the 0-10m visualization clip range.
+    depth_npy_path = f"{OUT_DIR}/depth_{frame_idx:04d}.npy"
+    np.save(depth_npy_path, depth.astype(np.float32))
+
+    print(f"[captured] {rgb_path}")
+    print(f"[captured] {depth_path}")
+    print(f"[captured] {depth_npy_path}")
+
+    return rgb_path
+
+
+def save_pose(frame_idx, x, y, z, yaw):
+    """Persist the agent pose active when a frame was captured, for later back-projection."""
+    pose_path = f"{OUT_DIR}/pose_{frame_idx:04d}.json"
+    with open(pose_path, "w") as f:
+        json.dump({"x": x, "y": y, "z": z, "yaw": yaw}, f, indent=2)
+    return pose_path
+
+
+def load_pose(frame_idx):
+    """Load the pose saved for a frame, falling back to the fixed start pose for older captures."""
+    pose_path = f"{OUT_DIR}/pose_{frame_idx:04d}.json"
+    if os.path.exists(pose_path):
+        with open(pose_path, "r") as f:
+            return json.load(f)
+
+    print(f"[warn] no saved pose for frame {frame_idx}, assuming the fixed start pose")
+    x, z = START_X, START_Z
+    return {
+        "x": x,
+        "y": terrain_height_at(x, z) + INITIAL_CLEARANCE,
+        "z": z,
+        "yaw": float(np.deg2rad(START_YAW_DEG)),
+    }
+
+
+def load_depth_frame(frame_idx):
+    """Load raw metric depth for a frame, reconstructing from the 8-bit visualization if needed."""
+    npy_path = f"{OUT_DIR}/depth_{frame_idx:04d}.npy"
+    if os.path.exists(npy_path):
+        return np.load(npy_path)
+
+    png_path = f"{OUT_DIR}/depth_{frame_idx:04d}.png"
+    print(f"[warn] no raw depth for frame {frame_idx}, reconstructing from {png_path} "
+          f"(precision limited to the 0-10m visualization clip range)")
+    depth_vis = np.array(Image.open(png_path)).astype(np.float32)
+    return depth_vis / 255.0 * 10.0
+
+
+def validate_annotation_json(json_path):
+    """
+    Validate labelme annotation JSON structure.
+
+    Args:
+        json_path: Path to the annotation JSON file
+
+    Returns:
+        (is_valid, status_message)
+    """
+    if not os.path.exists(json_path):
+        return False, f"annotation file not found: {json_path}"
+
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        return False, f"invalid JSON: {e}"
+    except Exception as e:
+        return False, f"error reading file: {e}"
+
+    # Validate required top-level keys
+    required_keys = ["version", "flags", "shapes", "imagePath", "imageHeight", "imageWidth"]
+    missing_keys = [k for k in required_keys if k not in data]
+    if missing_keys:
+        return False, f"missing required keys: {missing_keys}"
+
+    # Validate shapes structure
+    if not isinstance(data["shapes"], list):
+        return False, f"'shapes' must be a list, got {type(data['shapes']).__name__}"
+
+    for i, shape in enumerate(data["shapes"]):
+        if not isinstance(shape, dict):
+            return False, f"shape {i}: expected dict, got {type(shape).__name__}"
+
+        shape_required = ["label", "points"]
+        shape_missing = [k for k in shape_required if k not in shape]
+        if shape_missing:
+            return False, f"shape {i}: missing required keys {shape_missing}"
+
+        if not isinstance(shape["label"], str) or not shape["label"]:
+            return False, f"shape {i}: 'label' must be a non-empty string"
+
+        if not isinstance(shape["points"], list):
+            return False, f"shape {i}: 'points' must be a list"
+
+        if len(shape["points"]) < 2:
+            return False, f"shape {i}: 'points' must have at least 2 coordinates"
+
+        for j, point in enumerate(shape["points"]):
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                return False, f"shape {i}, point {j}: expected [x, y], got {point}"
+
+    return True, "accepted"
+
+
+# ============================================================================
+# Bounding box overlay
+# ============================================================================
+
+# Fixed palette so each class id keeps a stable, distinct color across frames.
+BOX_COLOR_PALETTE = [
+    (231, 76, 60),    # red
+    (52, 152, 219),   # blue
+    (46, 204, 113),   # green
+    (241, 196, 15),   # yellow
+    (155, 89, 182),   # purple
+    (26, 188, 156),   # teal
+]
+
+
+def load_labels(labels_path=LABELS_FILE):
+    """Load ordered label list; list index is the class id."""
+    with open(labels_path, "r") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def color_for_class(class_id):
+    """Deterministic color per class id."""
+    return BOX_COLOR_PALETTE[class_id % len(BOX_COLOR_PALETTE)]
+
+
+def assign_object_ids(annotation_path):
+    """
+    Assign a unique incrementing object id (0, 1, 2, ...) to each shape in a
+    labelme annotation and persist it back to the JSON.
+
+    This lets a VLM reading the RGB frame, the annotation JSON, and the overlay
+    PNG together refer to "object 3" and have that resolve to the exact same
+    shape across all three artifacts.
+
+    Args:
+        annotation_path: Path to the labelme annotation JSON (modified in place)
+
+    Returns:
+        The updated annotation dict.
+    """
+    with open(annotation_path, "r") as f:
+        data = json.load(f)
+
+    for i, shape in enumerate(data["shapes"]):
+        shape["id"] = i
+
+    with open(annotation_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+    return data
+
+
+def draw_annotation_overlay(image_path, annotation_path, output_path):
+    """
+    Assign per-object ids to a labelme annotation, then draw its labeled
+    bounding boxes (tagged with those ids) onto the source image.
+
+    Args:
+        image_path: Path to the source RGB image
+        annotation_path: Path to the validated labelme annotation JSON
+        output_path: Path to write the overlaid image
+
+    Returns:
+        output_path
+    """
+    data = assign_object_ids(annotation_path)
+
+    labels = load_labels()
+    label_to_id = {name: i for i, name in enumerate(labels)}
+
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    for shape in data["shapes"]:
+        object_id = shape["id"]
+        label = shape["label"]
+        class_id = label_to_id.get(label, -1)
+        color = color_for_class(max(class_id, 0))
+        points = [tuple(p) for p in shape["points"]]
+
+        if shape.get("shape_type") == "rectangle":
+            (x0, y0), (x1, y1) = points
+            x0, x1 = sorted((x0, x1))
+            y0, y1 = sorted((y0, y1))
+            draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
+            tag_xy = (x0, max(y0 - 12, 0))
+        else:
+            draw.polygon(points, outline=color)
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            tag_xy = (min(xs), max(min(ys) - 12, 0))
+
+        tag = f"#{object_id} {label}"
+        tag_bbox = draw.textbbox(tag_xy, tag)
+        draw.rectangle(tag_bbox, fill=color)
+        draw.text(tag_xy, tag, fill=(255, 255, 255))
+
+    img.save(output_path)
+    print(f"[overlay] {output_path}")
+
+    return output_path
+
+
+# ============================================================================
+# Labelme launch
+# ============================================================================
+
+def launch_labelme_on_frame(rgb_path, frame_idx):
+    """
+    Launch labelme on the captured frame and wait for annotation.
+
+    Args:
+        rgb_path: Path to the RGB image
+        frame_idx: Frame index (for naming convention)
+
+    Returns:
+        (success, annotation_json_path, status_message)
+    """
+    # Ensure output directories exist
+    os.makedirs(ANNOTATIONS_DIR, exist_ok=True)
+    os.makedirs(MASKS_DIR, exist_ok=True)
+
+    # Build labelme command
+    cmd = [
+        LABELME_BIN,
+        rgb_path,
+        "--labels", LABELS_FILE,
+        "--output", ANNOTATIONS_DIR,
+        "--no-sort-labels"
+    ]
+
+    print(f"\n[info] Launching labelme...")
+    print(f"[cmd] {' '.join(cmd)}\n")
+
+    try:
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            return False, None, f"labelme process exited with code {result.returncode}"
+    except FileNotFoundError:
+        return False, None, f"labelme binary not found at {LABELME_BIN}"
+    except Exception as e:
+        return False, None, f"error launching labelme: {e}"
+
+    # Determine expected annotation path (labelme uses input filename)
+    annotation_path = f"{ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
+
+    # Validate the annotation
+    is_valid, status_msg = validate_annotation_json(annotation_path)
+
+    return is_valid, annotation_path, status_msg
+
+
+# ============================================================================
+# VLM query
+# ============================================================================
+
+def query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PROMPT):
+    """
+    Feed the raw RGB frame, its annotated overlay, and the labelme annotation
+    JSON to the Qwen2.5-VL model and print/save its response.
+
+    Runs as a subprocess in the `qwen_vlm` conda env (separate from the env
+    this script runs in), same pattern as launch_labelme_on_frame.
+
+    Args:
+        rgb_path: Path to the raw RGB image
+        overlay_path: Path to the annotated overlay image
+        annotation_path: Path to the validated labelme annotation JSON
+        frame_idx: Frame index (for naming the output file)
+        prompt: Question to ask the VLM about the detected objects
+
+    Returns:
+        (success, output_path_or_None, status_message)
+    """
+    out_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
+
+    cmd = [
+        VLM_PYTHON_BIN, VLM_SCRIPT,
+        "--rgb", rgb_path,
+        # "--overlay", overlay_path,
+        "--annotation", annotation_path,
+        "--prompt", prompt,
+        "--out", out_path,
+    ]
+
+    print(f"\n[info] Querying VLM")
+    print(f"[cmd] {' '.join(cmd)}\n")
+
+    try:
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            return False, None, f"VLM process exited with code {result.returncode}"
+    except FileNotFoundError:
+        return False, None, f"VLM python binary not found at {VLM_PYTHON_BIN}"
+    except Exception as e:
+        return False, None, f"error launching VLM: {e}"
+
+    return True, out_path, "accepted"
+
+
+# ============================================================================
+# Bbox -> world position, and facing the chosen object
+# ============================================================================
+
+def parse_vlm_response(vlm_out_path):
+    """Parse the VLM's JSON reply, tolerating markdown code fences or stray prose around it."""
+    with open(vlm_out_path, "r") as f:
+        text = f.read().strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError(f"no JSON object found in {vlm_out_path}")
+    return json.loads(match.group(0))
+
+
+def bbox_center_pixel(coords2d):
+    """Average the VLM's 2D coordinates into a single target pixel (u, v)."""
+    pts = np.array(coords2d, dtype=np.float32)
+    u, v = pts.mean(axis=0)
+    return float(u), float(v)
+
+
+def camera_intrinsics():
+    """Pinhole intrinsics for the RGB/depth sensors (square pixels, matching hfov below)."""
+    h, w = RGBD_RESOLUTION
+    f = (w / 2.0) / np.tan(np.deg2rad(HFOV_DEG) / 2.0)
+    return f, f, w / 2.0, h / 2.0
+
+
+def pixel_to_world(u, v, depth_value, pose):
+    """
+    Back-project a pixel + depth reading into a world-space point.
+
+    Habitat's pinhole camera sits at the agent's origin (see make_sensor)
+    looking down -Z, with +X right and +Y up; depth is the planar
+    (z-axis) distance, not radial range. The camera-space point is rotated
+    into world space with the same yaw-about-Y construction used by
+    set_agent_pose, then offset by the agent's world position.
+    """
+    fx, fy, cx, cy = camera_intrinsics()
+    x_cam = (u - cx) * depth_value / fx
+    y_cam = -(v - cy) * depth_value / fy
+    z_cam = -depth_value
+
+    q = quaternion.from_rotation_vector([0.0, pose["yaw"], 0.0])
+    world_offset = quat_rotate_vector(q, np.array([x_cam, y_cam, z_cam]))
+
+    agent_pos = np.array([pose["x"], pose["y"], pose["z"]])
+    return agent_pos + world_offset
+
+
+def object_world_position(frame_idx):
+    """
+    Resolve the VLM-chosen object (from rgb_{idx}_vlm.txt) to a world position.
+
+    (x, z) come from unprojecting the bbox center pixel using the depth
+    frame captured alongside it; y is re-derived from the terrain
+    heightmap at that (x, z) since the depth reading lands on the
+    object's surface, not the ground it's sitting on.
+
+    Returns:
+        (x, y, z, label)
+    """
+    vlm_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
+    response = parse_vlm_response(vlm_path)
+    u, v = bbox_center_pixel(response["coordinates2Darray"])
+
+    depth = load_depth_frame(frame_idx)
+    h, w = depth.shape[:2]
+    px = int(np.clip(round(u), 0, w - 1))
+    py = int(np.clip(round(v), 0, h - 1))
+    depth_value = float(depth[py, px])
+    if depth_value <= 0.0:
+        print(f"[warn] non-positive depth ({depth_value}) at pixel ({px},{py}); result will be unreliable")
+
+    pose = load_pose(frame_idx)
+    world = pixel_to_world(u, v, depth_value, pose)
+    grounded_y = terrain_height_at(world[0], world[2])
+
+    print(f"[object] pixel=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
+          f"world=({world[0]:.2f}, {world[1]:.2f}, {world[2]:.2f})")
+
+    return float(world[0]), float(grounded_y), float(world[2]), response.get("label", "?")
+
+
+def yaw_to_face(agent_x, agent_z, target_x, target_z):
+    """Yaw (about Y, same convention as START_YAW_DEG/set_agent_pose) that points the agent at a target."""
+    dx = target_x - agent_x
+    dz = target_z - agent_z
+    return float(np.arctan2(-dx, -dz))
+
+
+# ============================================================================
+# Interactive capture loop
+# ============================================================================
+
+class InteractiveCapture:
+    """Main interactive capture and annotation class."""
+
+    def __init__(self):
+        print("[info] Initializing sim")
+        self.sim = make_sim()
+        self.agent = self.sim.initialize_agent(0)
+
+        self.x = START_X
+        self.z = START_Z
+        self.yaw = np.deg2rad(START_YAW_DEG)
+
+        # Compute Y from heightmap
+        self.terrain_y = terrain_height_at(self.x, self.z)
+        self.y = self.terrain_y + INITIAL_CLEARANCE
+
+        self.set_agent_pose()
+        self.frame_idx = 0
+        self.root = None  # set by run(); navigate_to_target() pumps it if present
+
+        # Initialize output directory
+        os.makedirs(OUT_DIR, exist_ok=True)
+
+        print(f"[info] Simulator ready.")
+        print(f"[info] Start pose: x={self.x:.2f}, z={self.z:.2f}, yaw={np.rad2deg(self.yaw):.1f}°")
+        print(f"\n[info] Controls:")
+        print(f"  SPACE - Capture frame and launch labelme")
+        print(f"  Q     - Quit")
+        print(f"\n[info] Window will display RGB stream. Annotations saved to '{ANNOTATIONS_DIR}/'.\n")
+
+    def set_agent_pose(self):
+        """Update agent pose in simulator."""
+        state = self.agent.get_state()
+        state.position = np.array([self.x, self.y, self.z], dtype=np.float32)
+        state.rotation = quaternion.from_rotation_vector([0.0, self.yaw, 0.0])
+        self.agent.set_state(state)
+
+    def get_observation(self):
+        """Get current RGB observation."""
+        obs = self.sim.get_sensor_observations()
+        rgb, _ = rgb_depth_from_obs(obs)
+        return rgb
+
+    def on_spacebar(self):
+        """Handle spacebar: capture frame and launch labelme."""
+        obs = self.sim.get_sensor_observations()
+
+        # Save RGB and depth
+        rgb_path = save_frame(obs, self.frame_idx)
+        save_pose(self.frame_idx, self.x, self.y, self.z, self.yaw)
+
+        # Launch labelme
+        success, annotation_path, status_msg = launch_labelme_on_frame(rgb_path, self.frame_idx)
+
+        print(f"\n[annotation status] {status_msg}")
+
+        if success:
+            print(f"[info] Annotation saved: {annotation_path}\n")
+            overlay_path = f"{OUT_DIR}/rgb_{self.frame_idx:04d}_at.png"
+            draw_annotation_overlay(rgb_path, annotation_path, overlay_path)
+
+            vlm_success, vlm_out_path, vlm_status = query_vlm(
+                rgb_path, overlay_path, annotation_path, self.frame_idx
+            )
+            if vlm_success:
+                print(f"[info] VLM response saved: {vlm_out_path}\n")
+                self.navigate_to_object(self.frame_idx)
+            else:
+                print(f"[error] VLM query failed: {vlm_status}\n")
+        else:
+            print(f"[error] Annotation validation failed\n")
+
+        self.frame_idx += 1
+
+    def face_object(self, frame_idx):
+        """Rotate in place to face the VLM-chosen object from the given frame."""
+        try:
+            obj_x, obj_y, obj_z, label = object_world_position(frame_idx)
+        except Exception as e:
+            print(f"[error] could not resolve object position: {e}")
+            return
+
+        self.yaw = yaw_to_face(self.x, self.z, obj_x, obj_z)
+        self.set_agent_pose()
+        print(f"[face] turned to face '{label}' at ({obj_x:.2f}, {obj_y:.2f}, {obj_z:.2f}), "
+              f"yaw={np.rad2deg(self.yaw):.1f}°")
+
+    def navigate_to_target(self, target_x, target_z, label="target"):
+        """
+        Drive to (target_x, target_z) using vlm_nav_demo's proportional
+        go-to-goal controller, integrating pose the same way RoverSim does.
+        """
+        target_y = terrain_height_at(target_x, target_z) + INITIAL_CLEARANCE
+        controller = GoToGoalController(target_x, target_y, target_z)
+
+        print(f"[nav] driving to '{label}' at ({target_x:.2f}, {target_z:.2f})")
+
+        step = 0
+        for step in range(NAV_MAX_STEPS):
+            obs = self.sim.get_sensor_observations()
+            _, depth = rgb_depth_from_obs(obs)
+
+            linear_x, angular_y, distance, heading_error = controller.update(
+                self.x, self.y, self.z, self.yaw
+            )
+            linear_x, angular_y = controller.obstacle_avoidance_hook(linear_x, angular_y, depth)
+
+            self.x += linear_x * (-np.sin(self.yaw)) * NAV_DT
+            self.z += linear_x * (-np.cos(self.yaw)) * NAV_DT
+            self.yaw += angular_y * NAV_DT
+
+            self.terrain_y = terrain_height_at(self.x, self.z)
+            self.y = self.terrain_y + INITIAL_CLEARANCE
+            self.set_agent_pose()
+
+            # Pump the tk event loop so the display doesn't freeze while driving
+            if self.root is not None:
+                self.root.update()
+
+            if step % 10 == 0:
+                print(f"[nav] step={step:4d} pos=({self.x:.2f},{self.z:.2f}) "
+                      f"dist={distance:.2f}m heading_err={np.rad2deg(heading_error):.1f}°")
+
+            if controller.at_target:
+                print(f"[nav] reached '{label}' in {step} steps, "
+                      f"pos=({self.x:.2f},{self.z:.2f})")
+                break
+        else:
+            print(f"[nav] max steps ({NAV_MAX_STEPS}) reached before arriving at '{label}'")
+
+    def navigate_to_object(self, frame_idx):
+        """Resolve the VLM-chosen object from the given frame and drive to it."""
+        try:
+            obj_x, _, obj_z, label = object_world_position(frame_idx)
+        except Exception as e:
+            print(f"[error] could not resolve object position: {e}")
+            return
+
+        self.navigate_to_target(obj_x, obj_z, label=label)
+
+    def close(self):
+        """Cleanup."""
+        try:
+            self.sim.close()
+        except Exception:
+            pass
+
+    def run(self):
+        """Main interactive loop using tkinter for windowed display and input."""
+        root = tk.Tk()
+        root.title("VLM Nav Capture")
+        root.geometry(f"{RGBD_RESOLUTION[1]}x{RGBD_RESOLUTION[0]}")
+        self.root = root
+
+        canvas = tk.Canvas(root, width=RGBD_RESOLUTION[1], height=RGBD_RESOLUTION[0])
+        canvas.pack()
+
+        info_label = tk.Label(root, text="SPACE: capture & annotate | Q: quit", bg="black", fg="white")
+        info_label.pack(side=tk.BOTTOM, fill=tk.X)
+
+        running = True
+
+        def update_frame():
+            """Update display with current observation."""
+            if not running:
+                return
+
+            rgb = self.get_observation()
+            pil_image = Image.fromarray(rgb)
+            photo = ImageTk.PhotoImage(pil_image)
+
+            canvas.create_image(0, 0, image=photo, anchor=tk.NW)
+            canvas.image = photo  # Keep a reference
+
+            root.after(33, update_frame)
+
+        def on_key_press(event):
+            """Handle key press events."""
+            nonlocal running
+            if event.keysym == "space":
+                self.on_spacebar()
+            elif event.keysym == "q":
+                running = False
+                root.quit()
+
+        root.bind("<KeyPress>", on_key_press)
+        root.focus_set()
+
+        try:
+            update_frame()
+            root.mainloop()
+        finally:
+            self.close()
+
+def regenerate_overlays():
+    """Rebuild rgb_*_at.png for every existing annotation, without touching the sim."""
+    for json_path in sorted(Path(ANNOTATIONS_DIR).glob("rgb_*.json")):
+        frame_idx = int(json_path.stem.split("_")[1])
+        rgb_path = f"{OUT_DIR}/rgb_{frame_idx:04d}.png"
+        out_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_at.png"
+
+        if not os.path.exists(rgb_path):
+            print(f"[warn] missing image for {json_path}, skipping")
+            continue
+
+        is_valid, status_msg = validate_annotation_json(str(json_path))
+        if not is_valid:
+            print(f"[warn] {json_path}: {status_msg}, skipping")
+            continue
+
+        draw_annotation_overlay(rgb_path, str(json_path), out_path)
+
+
+def run_vlm_on_frame(frame_idx, prompt=VLM_PROMPT):
+    """Query the VLM on an already-captured/annotated frame, without touching the sim."""
+    rgb_path = f"{OUT_DIR}/rgb_{frame_idx:04d}.png"
+    annotation_path = f"{ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
+    overlay_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_at.png"
+
+    for path in (rgb_path, annotation_path):
+        if not os.path.exists(path):
+            print(f"[error] missing file: {path}")
+            return
+
+    is_valid, status_msg = validate_annotation_json(annotation_path)
+    if not is_valid:
+        print(f"[error] {annotation_path}: {status_msg}")
+        return
+
+    if not os.path.exists(overlay_path):
+        draw_annotation_overlay(rgb_path, annotation_path, overlay_path)
+
+    success, _, status_msg = query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt)
+    if not success:
+        print(f"[error] VLM query failed: {status_msg}")
+
+
+def run_face_on_frame(frame_idx):
+    """Turn the agent to face the VLM-chosen object from an already-queried frame, then save a check frame."""
+    vlm_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
+    if not os.path.exists(vlm_path):
+        print(f"[error] missing file: {vlm_path}")
+        return
+
+    capture = InteractiveCapture()
+    try:
+        capture.face_object(frame_idx)
+        obs = capture.sim.get_sensor_observations()
+        rgb, _ = rgb_depth_from_obs(obs)
+        check_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_faced.png"
+        Image.fromarray(rgb).save(check_path)
+        print(f"[info] saved post-turn view: {check_path}")
+    finally:
+        capture.close()
+
+
+def run_goto_on_frame(frame_idx):
+    """Drive the agent to the VLM-chosen object from an already-queried frame."""
+    vlm_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
+    if not os.path.exists(vlm_path):
+        print(f"[error] missing file: {vlm_path}")
+        return
+
+    capture = InteractiveCapture()
+    try:
+        capture.navigate_to_object(frame_idx)
+    finally:
+        capture.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--overlay":
+        regenerate_overlays()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--vlm":
+        if len(sys.argv) < 3:
+            print("usage: python vlm_nav_interactive.py --vlm <frame_idx>")
+            sys.exit(1)
+        run_vlm_on_frame(int(sys.argv[2]))
+    elif len(sys.argv) > 1 and sys.argv[1] == "--face":
+        if len(sys.argv) < 3:
+            print("usage: python vlm_nav_interactive.py --face <frame_idx>")
+            sys.exit(1)
+        run_face_on_frame(int(sys.argv[2]))
+    elif len(sys.argv) > 1 and sys.argv[1] == "--goto":
+        if len(sys.argv) < 3:
+            print("usage: python vlm_nav_interactive.py --goto <frame_idx>")
+            sys.exit(1)
+        run_goto_on_frame(int(sys.argv[2]))
+    else:
+        capture = InteractiveCapture()
+        capture.run()
+        print("[info] khel khatam.")
+

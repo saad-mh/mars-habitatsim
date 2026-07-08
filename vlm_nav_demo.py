@@ -47,7 +47,7 @@ TARGET_Y = None
 
 # Controller parameters
 HEADING_ERROR_THRESHOLD = np.deg2rad(15.0)  # rotate in place if error > 15°
-MAX_LINEAR_VELOCITY = 1.5  # m/s
+MAX_LINEAR_VELOCITY = 0.8  # m/s
 MAX_ANGULAR_VELOCITY = np.deg2rad(45.0)  # deg(rad)/s ?? how do i convey what unit this is in?
 PROPORTIONAL_GAIN_HEADING = 1.0  # heading correction gain while driving
 PROPORTIONAL_GAIN_ANGULAR = 2.0  # rotation-only gain when heading error large
