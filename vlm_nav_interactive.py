@@ -1057,24 +1057,52 @@ def resolve_mission_meshes(frame_idx, response, radius=0.5):
     return goal_mesh, obstacle_meshes
 
 
-def save_mission_metadata(frame_idx, vlm_response, goal_mesh, obstacle_meshes, goal_target_world):
+def save_mission_metadata(
+    frame_idx, vlm_response, goal_mesh, obstacle_meshes, goal_target_world, semantic_paths=None
+):
     """
-    Persist the resolved mission for a frame - the VLM reply plus every
-    generated object mesh and the final navigation target - as
+    Persist the resolved mission for a frame - the VLM reply, every
+    generated object mesh (goal + obstacles) enriched with its semantic id
+    and rendered mask path, and the final navigation target - as
     rgb_{idx}_mission.json, alongside the raw rgb_{idx}_vlm.txt reply. This
-    lets later steps load the chosen goal/obstacle mesh straight from disk
-    without rerunning annotation + VLM + bbox back-projection.
+    lets later steps load the chosen goal/obstacle mesh and its mask
+    straight from disk without rerunning annotation + VLM + bbox
+    back-projection + semantic rendering.
+
+    `semantic_paths` is the dict returned by `capture_mission_semantics`
+    (semantic_path/goal_mask_path/obstacle_mask_path); obstacles all share
+    one obstacle_mask_path since SemanticMeshRegistry only distinguishes
+    the goal/obstacle *category* (SEMANTIC_ID_GOAL/OBSTACLE), not
+    per-instance ids.
 
     Returns:
         Path to the saved JSON file.
     """
+    semantic_paths = semantic_paths or {}
+    goal_mask_path = semantic_paths.get("goal_mask_path")
+    obstacle_mask_path = semantic_paths.get("obstacle_mask_path")
+
+    goal = None
+    if goal_mesh is not None:
+        goal = dict(goal_mesh)
+        goal["semantic_id"] = SEMANTIC_ID_GOAL
+        goal["mask_path"] = goal_mask_path
+
+    obstacles = []
+    for mesh_meta in obstacle_meshes:
+        obstacle = dict(mesh_meta)
+        obstacle["semantic_id"] = SEMANTIC_ID_OBSTACLE
+        obstacle["mask_path"] = obstacle_mask_path
+        obstacles.append(obstacle)
+
     meta_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_mission.json"
     metadata = {
-        "frame_idx": frame_idx,
+        "frame_id": frame_idx,
         "vlm_response": vlm_response,
-        "goal_mesh": goal_mesh,
-        "obstacle_meshes": obstacle_meshes,
+        "goal": goal,
+        "obstacles": obstacles,
         "goal_target_world": [float(c) for c in goal_target_world],
+        "semantic_render_path": semantic_paths.get("semantic_path"),
     }
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -1238,6 +1266,43 @@ class InteractiveCapture:
                 mesh_meta["mesh_path"], mesh_meta["role"], semantic_id_for_role(mesh_meta["role"])
             )
 
+    def capture_mission_semantics(self, frame_idx, pose):
+        """
+        Move to the pose the frame was originally captured at (a no-op
+        during the live capture loop, since the agent hasn't moved since
+        save_frame; required for standalone --vlm reruns, which start from
+        a fresh sim at START_*) and re-render the semantic sensor now that
+        this mission's goal/obstacle meshes are registered. Overwrites the
+        semantic/goal_mask/obstacle_mask files save_frame wrote at capture
+        time (all-environment, since no semantic objects existed yet) with
+        the real render, and resyncs self.x/y/z/yaw so any navigation that
+        follows starts from the frame's actual pose.
+        """
+        self.x, self.y, self.z, self.yaw = pose["x"], pose["y"], pose["z"], pose["yaw"]
+        self.set_agent_pose()
+
+        obs = self.sim.get_sensor_observations()
+        semantic = semantic_from_obs(obs)
+
+        semantic_path = f"{OUT_DIR}/semantic_{frame_idx:04d}.png"
+        goal_mask_path = f"{OUT_DIR}/goal_mask_{frame_idx:04d}.png"
+        obstacle_mask_path = f"{OUT_DIR}/obstacle_mask_{frame_idx:04d}.png"
+
+        Image.fromarray(semantic).save(semantic_path)
+        goal_mask, obstacle_mask = semantic_to_masks(semantic)
+        Image.fromarray(goal_mask).save(goal_mask_path)
+        Image.fromarray(obstacle_mask).save(obstacle_mask_path)
+
+        print(f"[semantic] rendered {semantic_path}")
+        print(f"[semantic] {goal_mask_path}")
+        print(f"[semantic] {obstacle_mask_path}")
+
+        return {
+            "semantic_path": semantic_path,
+            "goal_mask_path": goal_mask_path,
+            "obstacle_mask_path": obstacle_mask_path,
+        }
+
     def navigate_to_obstacles(self, obstacle_meshes):
         """
         Drive to each already-resolved obstacle mesh in turn. Takes
@@ -1283,6 +1348,9 @@ class InteractiveCapture:
             return
 
         self.register_mission_semantics(goal_mesh, obstacle_meshes)
+        pose = load_pose(frame_idx)
+        semantic_paths = self.capture_mission_semantics(frame_idx, pose)
+
         print(f"[mission] {len(obstacle_meshes)} obstacle(s) to visit before the goal")
 
         self.navigate_to_obstacles(obstacle_meshes)
@@ -1293,7 +1361,9 @@ class InteractiveCapture:
             print(f"[error] could not reach goal position: {e}")
             return
 
-        save_mission_metadata(frame_idx, response, goal_mesh, obstacle_meshes, (goal_x, goal_y, goal_z))
+        save_mission_metadata(
+            frame_idx, response, goal_mesh, obstacle_meshes, (goal_x, goal_y, goal_z), semantic_paths
+        )
         print(f"[mission] complete")
 
     def close(self):
@@ -1371,10 +1441,13 @@ def regenerate_overlays():
 
 def run_vlm_on_frame(frame_idx, prompt=VLM_PROMPT):
     """
-    Query the VLM on an already-captured/annotated frame, without touching
-    the sim, then resolve the chosen goal/obstacles to world-space meshes
-    and save mission metadata - same mesh generation the live interactive
-    loop performs, so a --vlm rerun alone is enough to produce meshes.
+    Query the VLM on an already-captured/annotated frame, then resolve the
+    chosen goal/obstacles to world-space meshes, register them as semantic
+    objects, re-render the semantic sensor from the frame's saved pose, and
+    save the resulting goal/obstacle masks plus mission metadata - the same
+    semantic pipeline the live interactive loop runs (minus navigation), so
+    a --vlm rerun alone is enough to regenerate everything for a previously
+    captured frame without launching a new interactive capture.
     """
     rgb_path = f"{OUT_DIR}/rgb_{frame_idx:04d}.png"
     annotation_path = f"{ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
@@ -1409,7 +1482,17 @@ def run_vlm_on_frame(frame_idx, prompt=VLM_PROMPT):
         print(f"[error] no goal_object in {vlm_out_path}")
         return
 
-    save_mission_metadata(frame_idx, response, goal_mesh, obstacle_meshes, goal_mesh["seed_world"])
+    pose = load_pose(frame_idx)
+    capture = InteractiveCapture()
+    try:
+        capture.register_mission_semantics(goal_mesh, obstacle_meshes)
+        semantic_paths = capture.capture_mission_semantics(frame_idx, pose)
+    finally:
+        capture.close()
+
+    save_mission_metadata(
+        frame_idx, response, goal_mesh, obstacle_meshes, goal_mesh["seed_world"], semantic_paths
+    )
 
 
 def run_face_on_frame(frame_idx):
@@ -1445,6 +1528,51 @@ def run_goto_on_frame(frame_idx):
         capture.close()
 
 
+def validate_semantic_masks(frame_idx):
+    """
+    Sanity-check a frame's semantic pipeline output: the goal and obstacle
+    masks must be mutually exclusive (no pixel belongs to both), each
+    mask's 255 pixels must exactly match the corresponding semantic id in
+    the raw semantic render, and every pixel neither mask claims must be
+    SEMANTIC_ID_ENVIRONMENT. This is the pixel-level demonstration that
+    goal pixels only cover the selected goal region, obstacle pixels only
+    cover the selected obstacle region(s), and everything else is
+    environment.
+
+    Returns:
+        True if every check passes, False otherwise.
+    """
+    semantic_path = f"{OUT_DIR}/semantic_{frame_idx:04d}.png"
+    goal_mask_path = f"{OUT_DIR}/goal_mask_{frame_idx:04d}.png"
+    obstacle_mask_path = f"{OUT_DIR}/obstacle_mask_{frame_idx:04d}.png"
+
+    for path in (semantic_path, goal_mask_path, obstacle_mask_path):
+        if not os.path.exists(path):
+            print(f"[error] missing file: {path}")
+            return False
+
+    semantic = np.array(Image.open(semantic_path))
+    goal_mask = np.array(Image.open(goal_mask_path)) > 0
+    obstacle_mask = np.array(Image.open(obstacle_mask_path)) > 0
+
+    overlap = np.logical_and(goal_mask, obstacle_mask)
+    goal_matches = np.array_equal(goal_mask, semantic == SEMANTIC_ID_GOAL)
+    obstacle_matches = np.array_equal(obstacle_mask, semantic == SEMANTIC_ID_OBSTACLE)
+    environment_matches = np.array_equal(
+        semantic == SEMANTIC_ID_ENVIRONMENT,
+        ~np.logical_or(goal_mask, obstacle_mask),
+    )
+
+    ok = not overlap.any() and goal_matches and obstacle_matches and environment_matches
+    status = "PASS" if ok else "FAIL"
+    print(f"[validate] frame {frame_idx}: {status} "
+          f"(goal_px={int(goal_mask.sum())}, obstacle_px={int(obstacle_mask.sum())}, "
+          f"overlap_px={int(overlap.sum())}, "
+          f"goal_matches_render={goal_matches}, obstacle_matches_render={obstacle_matches}, "
+          f"remainder_is_environment={environment_matches})")
+    return ok
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--overlay":
         regenerate_overlays()
@@ -1463,6 +1591,12 @@ if __name__ == "__main__":
             print("usage: python vlm_nav_interactive.py --goto <frame_idx>")
             sys.exit(1)
         run_goto_on_frame(int(sys.argv[2]))
+    elif len(sys.argv) > 1 and sys.argv[1] == "--validate":
+        if len(sys.argv) < 3:
+            print("usage: python vlm_nav_interactive.py --validate <frame_idx>")
+            sys.exit(1)
+        ok = validate_semantic_masks(int(sys.argv[2]))
+        sys.exit(0 if ok else 1)
     else:
         capture = InteractiveCapture()
         capture.run()
