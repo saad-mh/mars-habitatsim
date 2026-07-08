@@ -11,7 +11,7 @@
       "object_id": 10,
       "label": "rock",
       "coordinates2D": [274.6448087431694, 262.4043715846995],
-      "reasoning": "This rock is close to the goal object and could obstruct the rover's path if not driven around."
+      "reasoning": "This rock is close to the goal object and could obstruct the rover's path if not avoided."
     }
   ]
 }

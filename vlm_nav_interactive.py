@@ -510,6 +510,22 @@ def bbox_center_pixel(coords2d):
         u, v = pts.mean(axis=0)
     return float(u), float(v)
 
+def coords2d_to_bbox_xyxy(coords2d):
+    """
+    Reduce the VLM's 2D coordinates into an axis-aligned (x1, y1, x2, y2)
+    bbox. Handles the rectangle case (two corner points, in either order,
+    as stored by labelme) as well as denser polygons, by taking the
+    point cloud's bounding box. A bare [u, v] pair degenerates to a
+    zero-area box at that point.
+    """
+    pts = np.array(coords2d, dtype=np.float32)
+    if pts.ndim == 1:
+        u, v = pts
+        return float(u), float(v), float(u), float(v)
+    x1, y1 = pts.min(axis=0)
+    x2, y2 = pts.max(axis=0)
+    return float(x1), float(y1), float(x2), float(y2)
+
 def camera_intrinsics():
     """Pinhole intrinsics for the RGB/depth sensors (square pixels, matching hfov below)."""
     h, w = RGBD_RESOLUTION
@@ -532,6 +548,86 @@ def pixel_to_world(u, v, depth_value, pose):
 
     agent_pos = np.array([pose["x"], pose["y"], pose["z"]])
     return agent_pos + world_offset
+
+
+def bbox_to_world_seed(
+    bbox_xyxy,
+    depth,
+    pose,
+    pixel_to_world,
+    terrain_height_at=None,
+    stride=4,
+    inner_crop=0.15,
+):
+    """
+    Robustly back-project a 2D bbox into a single 3D world-space seed point.
+
+    A single bbox-center pixel is fragile: it can land on background, a
+    shadow, or a depth discontinuity at the object's silhouette edge. This
+    instead samples a grid of pixels from the bbox's inner region (shrunk
+    by `inner_crop` on each side to stay off the box's own boundary),
+    back-projects every pixel with a valid (finite, positive) depth
+    reading via `pixel_to_world`, and takes the per-axis median of the
+    resulting world points. The median tolerates the handful of outlier
+    samples that straddle an edge or fall through to background depth
+    without a mean's sensitivity to them.
+
+    Args:
+        bbox_xyxy: (x1, y1, x2, y2) pixel bbox, corners in any order.
+        depth: HxW metric depth array for the frame.
+        pose: agent pose dict, as consumed by `pixel_to_world`.
+        pixel_to_world: fn(u, v, depth_value, pose) -> array-like [x, y, z].
+        terrain_height_at: optional fn(x, z) -> y; if given, the seed's y
+            is replaced with the terrain height under it, since depth
+            lands on the object's near surface, not the ground it sits on.
+        stride: pixel spacing between samples inside the bbox.
+        inner_crop: fraction of width/height to shave off each edge before
+            sampling.
+
+    Returns:
+        (seed_world, sampled_world_points): seed_world is an
+        np.array([x, y, z]), or None if no pixel in the bbox had valid
+        depth; sampled_world_points is an (N, 3) array of the valid
+        samples the median was computed from (N == 0 when seed_world is
+        None).
+    """
+    x1, y1, x2, y2 = bbox_xyxy
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+
+    bw, bh = x2 - x1, y2 - y1
+    cx1, cx2 = x1 + bw * inner_crop, x2 - bw * inner_crop
+    cy1, cy2 = y1 + bh * inner_crop, y2 - bh * inner_crop
+    if cx2 <= cx1:
+        cx1, cx2 = x1, x2
+    if cy2 <= cy1:
+        cy1, cy2 = y1, y2
+
+    h, w = depth.shape[:2]
+    px_min = int(np.clip(round(cx1), 0, w - 1))
+    px_max = int(np.clip(round(cx2), 0, w - 1))
+    py_min = int(np.clip(round(cy1), 0, h - 1))
+    py_max = int(np.clip(round(cy2), 0, h - 1))
+    step = max(int(stride), 1)
+
+    samples = []
+    for py in range(py_min, py_max + 1, step):
+        for px in range(px_min, px_max + 1, step):
+            depth_value = float(depth[py, px])
+            if not np.isfinite(depth_value) or depth_value <= 0.0:
+                continue
+            samples.append(pixel_to_world(px, py, depth_value, pose))
+
+    if not samples:
+        return None, np.empty((0, 3), dtype=np.float64)
+
+    sampled_world_points = np.array(samples, dtype=np.float64)
+    seed_world = np.median(sampled_world_points, axis=0)
+
+    if terrain_height_at is not None:
+        seed_world[1] = terrain_height_at(seed_world[0], seed_world[2])
+
+    return seed_world, sampled_world_points
 
 
 def extract_obstacle_entries(response):
@@ -559,33 +655,49 @@ def entry_world_position(entry, frame_idx):
     Resolve a single VLM object entry (goal_object or one obstacle) to a
     world position, using the depth/pose captured alongside frame_idx.
 
-    (x, z) come from unprojecting the bbox center pixel using the depth
-    frame captured alongside it; y is re-derived from the terrain
-    heightmap at that (x, z) since the depth reading lands on the
-    object's surface, not the ground it's sitting on.
+    The bbox is back-projected robustly via `bbox_to_world_seed`: many
+    pixels inside it are sampled and back-projected, and the median of
+    the valid ones is used instead of a single (fragile) center pixel.
+    y is re-derived from the terrain heightmap at the seed's (x, z)
+    since the depth reading lands on the object's surface, not the
+    ground it's sitting on. If the bbox has no valid depth anywhere
+    (e.g. a degenerate single-point "bbox"), this falls back to the
+    plain center-pixel back-projection.
 
     Returns:
         (x, y, z, label)
     """
-    u, v = bbox_center_pixel(entry["coordinates2D"])
+    label = entry.get("label", "?")
+    bbox_xyxy = coords2d_to_bbox_xyxy(entry["coordinates2D"])
 
     depth = load_depth_frame(frame_idx)
-    h, w = depth.shape[:2]
-    px = int(np.clip(round(u), 0, w - 1))
-    py = int(np.clip(round(v), 0, h - 1))
-    depth_value = float(depth[py, px])
-    if depth_value <= 0.0:
-        print(f"[warn] non-positive depth ({depth_value}) at pixel ({px},{py}); result will be unreliable")
-
     pose = load_pose(frame_idx)
-    world = pixel_to_world(u, v, depth_value, pose)
-    grounded_y = terrain_height_at(world[0], world[2])
 
-    label = entry.get("label", "?")
-    print(f"[object] '{label}' pixel=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
-          f"world=({world[0]:.2f}, {world[1]:.2f}, {world[2]:.2f})")
+    seed_world, sampled_world_points = bbox_to_world_seed(
+        bbox_xyxy, depth, pose, pixel_to_world, terrain_height_at=terrain_height_at,
+    )
 
-    return float(world[0]), float(grounded_y), float(world[2]), label
+    if seed_world is None:
+        print(f"[warn] no valid depth samples inside bbox={bbox_xyxy} for '{label}'; "
+              f"falling back to bbox-center pixel")
+        u, v = bbox_center_pixel(entry["coordinates2D"])
+        h, w = depth.shape[:2]
+        px = int(np.clip(round(u), 0, w - 1))
+        py = int(np.clip(round(v), 0, h - 1))
+        depth_value = float(depth[py, px])
+        if depth_value <= 0.0:
+            print(f"[warn] non-positive depth ({depth_value}) at pixel ({px},{py}); result will be unreliable")
+        world = pixel_to_world(u, v, depth_value, pose)
+        grounded_y = terrain_height_at(world[0], world[2])
+        print(f"[object] '{label}' pixel=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
+              f"world=({world[0]:.2f}, {grounded_y:.2f}, {world[2]:.2f}) [fallback:center-pixel]")
+        return float(world[0]), float(grounded_y), float(world[2]), label
+
+    print(f"[object] '{label}' bbox={tuple(round(c, 1) for c in bbox_xyxy)} "
+          f"samples={len(sampled_world_points)} "
+          f"seed=({seed_world[0]:.2f}, {seed_world[1]:.2f}, {seed_world[2]:.2f})")
+
+    return float(seed_world[0]), float(seed_world[1]), float(seed_world[2]), label
 
 
 def object_world_position(frame_idx):
