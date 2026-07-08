@@ -47,6 +47,14 @@ RGBD_RESOLUTION = [480, 640]
 # camera intrinisics
 HFOV_DEG = 90.0
 
+# Semantic categories for dynamically generated goal/obstacle meshes.
+# 0 (environment/default scene) is never assigned explicitly - it's what
+# Habitat-Sim reports for the static stage and any object nobody has
+# touched.
+SEMANTIC_ID_ENVIRONMENT = 0
+SEMANTIC_ID_GOAL = 1
+SEMANTIC_ID_OBSTACLE = 2
+
 # hm correction
 FLIP_HEIGHTMAP_X = False
 FLIP_HEIGHTMAP_Z = True
@@ -166,9 +174,10 @@ def make_sim():
 
     rgb = make_sensor("rgb", habitat_sim.SensorType.COLOR)
     depth = make_sensor("depth", habitat_sim.SensorType.DEPTH)
+    semantic = make_sensor("semantic", habitat_sim.SensorType.SEMANTIC)
 
     agent_cfg = AgentConfiguration()
-    agent_cfg.sensor_specifications = [rgb, depth]
+    agent_cfg.sensor_specifications = [rgb, depth, semantic]
 
     return habitat_sim.Simulator(
         habitat_sim.Configuration(sim_cfg, [agent_cfg])
@@ -710,6 +719,93 @@ def save_obj(path, verts, faces):
     return path
 
 
+# Semantic object registration
+def semantic_id_for_role(role):
+    """Map a mesh role ("goal", "obstacle", "obstacle1", ...) to its semantic category id."""
+    if role == "goal":
+        return SEMANTIC_ID_GOAL
+    if role.startswith("obstacle"):
+        return SEMANTIC_ID_OBSTACLE
+    return SEMANTIC_ID_ENVIRONMENT
+
+
+class SemanticMeshRegistry:
+    """
+    Loads dynamically generated mesh patches (goal/obstacle terrain regions)
+    into a Habitat-Sim scene as temporary, render-only semantic objects.
+
+    Every object this registers is forced kinematic and non-collidable, so
+    it exists purely for the semantic/RGB/depth sensors to see - it never
+    enters collision detection, never gets a navmesh presence, and the
+    GoToGoalController's depth-based obstacle_avoidance_hook is untouched
+    (it only ever reads the depth sensor, which these objects still
+    contribute to exactly like the terrain patch they represent, since the
+    mesh geometry is the same local terrain resampled).
+    """
+
+    def __init__(self, sim):
+        self.sim = sim
+        self.object_template_manager = sim.get_object_template_manager()
+        self.rigid_object_manager = sim.get_rigid_object_manager()
+        self._object_ids = []  # ManagedRigidObject.object_id, registration order
+
+    def register(self, mesh_path, role, semantic_id, transform=None):
+        """
+        Register one mesh patch as a semantic object.
+
+        Args:
+            mesh_path: path to the mesh file (e.g. an OBJ produced by
+                make_local_height_patch_mesh + save_obj).
+            role: "goal", "obstacle", "obstacle1", ... - used only to build
+                a unique object template handle; purely for bookkeeping.
+            semantic_id: integer semantic category id (see SEMANTIC_ID_*).
+            transform: optional (translation, rotation) pair placing the
+                object in world coordinates - translation is an (x, y, z)
+                world position and rotation a quaternion.quaternion. Left
+                as None (the default) for meshes like ours that already
+                bake world-space vertex positions in: Habitat-Sim derives
+                a newly added object's initial translation/rotation from
+                its own asset bounding box, which already lines up with
+                those baked-in coordinates, so touching it would only
+                relocate the object away from where its mesh actually is.
+                Pass an explicit transform for meshes authored in local
+                (object-relative) coordinates instead.
+
+        Returns:
+            The newly created habitat_sim.physics.ManagedRigidObject.
+        """
+        template = self.object_template_manager.create_new_template(mesh_path)
+        template.render_asset_handle = mesh_path
+        template.collision_asset_handle = mesh_path
+        template.is_collidable = False
+
+        template_name = f"semantic_{role}_{len(self._object_ids)}_{os.path.basename(mesh_path)}"
+        template_id = self.object_template_manager.register_template(template, template_name)
+        template_handle = self.object_template_manager.get_template_handle_by_id(template_id)
+
+        obj = self.rigid_object_manager.add_object_by_template_handle(template_handle)
+        obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC
+        obj.collidable = False
+        obj.semantic_id = int(semantic_id)
+        if transform is not None:
+            translation, rotation = transform
+            obj.translation = np.array(translation, dtype=np.float32)
+            if rotation is not None:
+                obj.rotation = rotation
+
+        self._object_ids.append(obj.object_id)
+        print(f"[semantic] registered {role} mesh '{mesh_path}' as "
+              f"object_id={obj.object_id} semantic_id={semantic_id}")
+        return obj
+
+    def clear(self):
+        """Remove every object this registry has added so far."""
+        for obj_id in self._object_ids:
+            if self.rigid_object_manager.get_library_has_id(obj_id):
+                self.rigid_object_manager.remove_object_by_id(obj_id)
+        self._object_ids.clear()
+
+
 def selected_bbox_to_object_mesh(
     selected_obj,
     depth,
@@ -956,6 +1052,7 @@ class InteractiveCapture:
         print("[info] Initializing sim")
         self.sim = make_sim()
         self.agent = self.sim.initialize_agent(0)
+        self.semantic_registry = SemanticMeshRegistry(self.sim)
 
         self.x = START_X
         self.z = START_Z
@@ -1079,6 +1176,24 @@ class InteractiveCapture:
         else:
             print(f"[nav] max steps ({NAV_MAX_STEPS}) reached before arriving at '{label}'")
 
+    def register_mission_semantics(self, goal_mesh, obstacle_meshes):
+        """
+        Load the resolved goal/obstacle meshes into the sim as semantic
+        objects, replacing whatever the previous mission (if any) had
+        registered. Purely a rendering/perception aid - see
+        SemanticMeshRegistry for why this can't affect physics, collision,
+        or navigation.
+        """
+        self.semantic_registry.clear()
+        if goal_mesh is not None:
+            self.semantic_registry.register(
+                goal_mesh["mesh_path"], "goal", semantic_id_for_role("goal")
+            )
+        for mesh_meta in obstacle_meshes:
+            self.semantic_registry.register(
+                mesh_meta["mesh_path"], mesh_meta["role"], semantic_id_for_role(mesh_meta["role"])
+            )
+
     def navigate_to_obstacles(self, obstacle_meshes):
         """
         Drive to each already-resolved obstacle mesh in turn. Takes
@@ -1123,6 +1238,7 @@ class InteractiveCapture:
             print(f"[error] no goal_object in {vlm_path}")
             return
 
+        self.register_mission_semantics(goal_mesh, obstacle_meshes)
         print(f"[mission] {len(obstacle_meshes)} obstacle(s) to visit before the goal")
 
         self.navigate_to_obstacles(obstacle_meshes)

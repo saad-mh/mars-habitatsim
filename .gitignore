@@ -2,3 +2,4 @@
 mars_teleop_out*
 mars_rgbd_test_out
 mars_ht_vel_out*
+__pycache__/*
