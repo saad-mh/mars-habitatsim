@@ -1,0 +1,18 @@
+```json
+{
+  "goal_object": {
+    "object_id": 8,
+    "label": "rock",
+    "coordinates2D": [519.4535519125683, 419.78142076502735],
+    "reasoning": "This rock is the most prominent and likely to provide useful scientific data due to its size and position."
+  },
+  "obstacles": [
+    {
+      "object_id": 10,
+      "label": "rock",
+      "coordinates2D": [274.6448087431694, 262.4043715846995],
+      "reasoning": "This rock is close to the goal object and could obstruct the rover's path if not driven around."
+    }
+  ]
+}
+```

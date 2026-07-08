@@ -267,6 +267,63 @@
       "shape_type": "rectangle",
       "flags": {},
       "mask": null
+    },
+    {
+      "label": "rock",
+      "points": [
+        [
+          459.33747412008285,
+          292.8985507246377
+        ],
+        [
+          475.48654244306414,
+          305.94202898550725
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "shape_type": "rectangle",
+      "flags": {},
+      "mask": null,
+      "id": 14
+    },
+    {
+      "label": "rock",
+      "points": [
+        [
+          137.18426501035196,
+          242.1739130434783
+        ],
+        [
+          143.8095238095238,
+          249.00621118012424
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "shape_type": "rectangle",
+      "flags": {},
+      "mask": null,
+      "id": 15
+    },
+    {
+      "label": "rock",
+      "points": [
+        [
+          20.41407867494823,
+          310.4968944099379
+        ],
+        [
+          0.0,
+          297.45456636760986
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "shape_type": "rectangle",
+      "flags": {},
+      "mask": null,
+      "id": 16
     }
   ],
   "imagePath": "../vlm_nav_out/rgb_0000.png",

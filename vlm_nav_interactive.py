@@ -24,10 +24,6 @@ from habitat_sim.utils.common import quat_rotate_vector
 
 from vlm_nav_demo import GoToGoalController, DT as NAV_DT, MAX_STEPS as NAV_MAX_STEPS
 
-# ============================================================================
-# Configuration (from vlm_nav_demo.py)
-# ============================================================================
-
 SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/marsyard2022_tri.glb"
 HEIGHTMAP = "/home/nahar/Desktop/pineapple/conversion/marsyard2022/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
 
@@ -35,44 +31,67 @@ OUT_DIR = "vlm_nav_out"
 ANNOTATIONS_DIR = "annotations"
 MASKS_DIR = "masks"
 
-# Terrain scale
 SIZE_X = 50.0
 SIZE_Z = 50.0
 SIZE_Y = 4.820803273566
 
-# Start pose (fixed for interactive capture)
+# Start pose
 START_X = 12.2
 START_Z = 10.0
 START_YAW_DEG = 10.0
-
-# Camera height above terrain
 INITIAL_CLEARANCE = 0.9
 
-# Display
+# display
 RGBD_RESOLUTION = [480, 640]
 
-# Camera intrinsics (must match the sensor spec below)
+# camera intrinisics
 HFOV_DEG = 90.0
 
-# Heightmap correction
+# hm correction
 FLIP_HEIGHTMAP_X = False
 FLIP_HEIGHTMAP_Z = True
 SWAP_HEIGHTMAP_XZ = False
 
-# Annotation
+# annotation
 LABELS_FILE = "labels.txt"
 CONDA_BASE = "/home/nahar/miniconda3"
 LABELME_BIN = f"{CONDA_BASE}/envs/annotate/bin/labelme"
 
-# VLM query (runs in a separate conda env — see qwen_vlm_smoke_test.py)
 VLM_PYTHON_BIN = f"{CONDA_BASE}/envs/qwen_vlm/bin/python"
 VLM_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_query.py")
-VLM_PROMPT = "Identify the most scientifically significant test subject among the detected objects. Output strictly in JSON format with keys: 'object_id', 'label', 'coordinates2Darray', 'reasoning'."
+VLM_PROMPT = """You must output ONLY valid JSON with no other text.
 
-# ============================================================================
+1. Goal Object: Identify the single most scientifically significant detected object (can be rock or sand). This is your primary target.
+2. Obstacles: Select only 1 rock object from the remaining detected objects (not the goal object) that the rover must drive to/around before it heads to the goal. For now, select exactly one, but the field must always be a JSON list so more can be added later without changing this format.
+
+Output format:
+{
+  "goal_object": {
+    "object_id": <int>,
+    "label": <string>,
+    "coordinates2D": <array>,
+    "reasoning": <string>
+  },
+  "obstacles": [
+    {
+      "object_id": <int>,
+      "label": <string>,
+      "coordinates2D": <array>,
+      "reasoning": <string>
+    }
+  ]
+}
+
+Requirements:
+- No obstacle may share an object_id with the goal_object
+- Every obstacle's label must be "rock"
+- "obstacles" must always be a JSON array (never a bare object), even when it holds a single entry
+- Output ONLY JSON, no preamble or explanation
+- If no valid obstacle is detected, output "obstacles": []"""
+
+"""VLM_PROMPT = "Identify the most scientifically significant test subject among the detected objects. Output strictly in JSON format with keys: 'object_id', 'label', 'coordinates2Darray', 'reasoning'."""
+
 # Heightmap utilities
-# ============================================================================
-
 def load_heightmap(path):
     """Load and normalize heightmap from PNG."""
     img = Image.open(path)
@@ -122,11 +141,7 @@ def terrain_height_at(x, z):
     h1 = h01 * (1.0 - dx) + h11 * dx
     return float(h0 * (1.0 - dy) + h1 * dy)
 
-
-# ============================================================================
 # Sensor and simulator setup
-# ============================================================================
-
 def make_sensor(uuid, sensor_type):
     """Create a camera sensor spec (RGB or depth)."""
     spec = habitat_sim.CameraSensorSpec()
@@ -155,7 +170,6 @@ def make_sim():
         habitat_sim.Configuration(sim_cfg, [agent_cfg])
     )
 
-
 def rgb_depth_from_obs(obs):
     """Extract and process RGB and depth from sensor observation."""
     rgb = obs["rgb"]
@@ -165,11 +179,6 @@ def rgb_depth_from_obs(obs):
 
     depth = obs["depth"]
     return rgb, depth
-
-
-# ============================================================================
-# Frame capture and validation
-# ============================================================================
 
 def save_frame(obs, frame_idx):
     """Save RGB and depth frames to disk."""
@@ -198,14 +207,12 @@ def save_frame(obs, frame_idx):
 
     return rgb_path
 
-
 def save_pose(frame_idx, x, y, z, yaw):
     """Persist the agent pose active when a frame was captured, for later back-projection."""
     pose_path = f"{OUT_DIR}/pose_{frame_idx:04d}.json"
     with open(pose_path, "w") as f:
         json.dump({"x": x, "y": y, "z": z, "yaw": yaw}, f, indent=2)
     return pose_path
-
 
 def load_pose(frame_idx):
     """Load the pose saved for a frame, falling back to the fixed start pose for older captures."""
@@ -223,7 +230,6 @@ def load_pose(frame_idx):
         "yaw": float(np.deg2rad(START_YAW_DEG)),
     }
 
-
 def load_depth_frame(frame_idx):
     """Load raw metric depth for a frame, reconstructing from the 8-bit visualization if needed."""
     npy_path = f"{OUT_DIR}/depth_{frame_idx:04d}.npy"
@@ -235,7 +241,6 @@ def load_depth_frame(frame_idx):
           f"(precision limited to the 0-10m visualization clip range)")
     depth_vis = np.array(Image.open(png_path)).astype(np.float32)
     return depth_vis / 255.0 * 10.0
-
 
 def validate_annotation_json(json_path):
     """
@@ -292,32 +297,24 @@ def validate_annotation_json(json_path):
 
     return True, "accepted"
 
-
-# ============================================================================
 # Bounding box overlay
-# ============================================================================
-
-# Fixed palette so each class id keeps a stable, distinct color across frames.
 BOX_COLOR_PALETTE = [
-    (231, 76, 60),    # red
-    (52, 152, 219),   # blue
-    (46, 204, 113),   # green
-    (241, 196, 15),   # yellow
-    (155, 89, 182),   # purple
-    (26, 188, 156),   # teal
+    (231, 76, 60),
+    (52, 152, 219),
+    (46, 204, 113),
+    (241, 196, 15),
+    (155, 89, 182),
+    (26, 188, 156),
 ]
-
 
 def load_labels(labels_path=LABELS_FILE):
     """Load ordered label list; list index is the class id."""
     with open(labels_path, "r") as f:
         return [line.strip() for line in f if line.strip()]
 
-
 def color_for_class(class_id):
     """Deterministic color per class id."""
     return BOX_COLOR_PALETTE[class_id % len(BOX_COLOR_PALETTE)]
-
 
 def assign_object_ids(annotation_path):
     """
@@ -344,7 +341,6 @@ def assign_object_ids(annotation_path):
         json.dump(data, f, indent=2)
 
     return data
-
 
 def draw_annotation_overlay(image_path, annotation_path, output_path):
     """
@@ -396,11 +392,7 @@ def draw_annotation_overlay(image_path, annotation_path, output_path):
 
     return output_path
 
-
-# ============================================================================
 # Labelme launch
-# ============================================================================
-
 def launch_labelme_on_frame(rgb_path, frame_idx):
     """
     Launch labelme on the captured frame and wait for annotation.
@@ -412,11 +404,9 @@ def launch_labelme_on_frame(rgb_path, frame_idx):
     Returns:
         (success, annotation_json_path, status_message)
     """
-    # Ensure output directories exist
     os.makedirs(ANNOTATIONS_DIR, exist_ok=True)
     os.makedirs(MASKS_DIR, exist_ok=True)
 
-    # Build labelme command
     cmd = [
         LABELME_BIN,
         rgb_path,
@@ -445,11 +435,7 @@ def launch_labelme_on_frame(rgb_path, frame_idx):
 
     return is_valid, annotation_path, status_msg
 
-
-# ============================================================================
 # VLM query
-# ============================================================================
-
 def query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PROMPT):
     """
     Feed the raw RGB frame, its annotated overlay, and the labelme annotation
@@ -493,11 +479,7 @@ def query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PRO
 
     return True, out_path, "accepted"
 
-
-# ============================================================================
 # Bbox -> world position, and facing the chosen object
-# ============================================================================
-
 def parse_vlm_response(vlm_out_path):
     """Parse the VLM's JSON reply, tolerating markdown code fences or stray prose around it."""
     with open(vlm_out_path, "r") as f:
@@ -513,13 +495,20 @@ def parse_vlm_response(vlm_out_path):
         raise ValueError(f"no JSON object found in {vlm_out_path}")
     return json.loads(match.group(0))
 
-
 def bbox_center_pixel(coords2d):
-    """Average the VLM's 2D coordinates into a single target pixel (u, v)."""
-    pts = np.array(coords2d, dtype=np.float32)
-    u, v = pts.mean(axis=0)
-    return float(u), float(v)
+    """
+    Average the VLM's 2D coordinates into a single target pixel (u, v).
 
+    coords2d may be a single flat [u, v] pair or a list of points
+    ([[u1, v1], [u2, v2], ...]) describing a bbox/polygon; either way the
+    result is the mean pixel.
+    """
+    pts = np.array(coords2d, dtype=np.float32)
+    if pts.ndim == 1:
+        u, v = pts
+    else:
+        u, v = pts.mean(axis=0)
+    return float(u), float(v)
 
 def camera_intrinsics():
     """Pinhole intrinsics for the RGB/depth sensors (square pixels, matching hfov below)."""
@@ -527,16 +516,11 @@ def camera_intrinsics():
     f = (w / 2.0) / np.tan(np.deg2rad(HFOV_DEG) / 2.0)
     return f, f, w / 2.0, h / 2.0
 
-
 def pixel_to_world(u, v, depth_value, pose):
     """
     Back-project a pixel + depth reading into a world-space point.
 
-    Habitat's pinhole camera sits at the agent's origin (see make_sensor)
-    looking down -Z, with +X right and +Y up; depth is the planar
-    (z-axis) distance, not radial range. The camera-space point is rotated
-    into world space with the same yaw-about-Y construction used by
-    set_agent_pose, then offset by the agent's world position.
+    Habitat's pinhole camera sits at the agent's origin looking down -Z, with +X right and +Y up; depth is the planar (z-axis) distance, not radial range. The camera-space point is rotated into world space with the same yaw-about-Y construction used by set_agent_pose, then offset by the agent's world position.
     """
     fx, fy, cx, cy = camera_intrinsics()
     x_cam = (u - cx) * depth_value / fx
@@ -550,9 +534,30 @@ def pixel_to_world(u, v, depth_value, pose):
     return agent_pos + world_offset
 
 
-def object_world_position(frame_idx):
+def extract_obstacle_entries(response):
     """
-    Resolve the VLM-chosen object (from rgb_{idx}_vlm.txt) to a world position.
+    Normalize the VLM response's obstacle field into a list of entries.
+
+    Tolerates the current schema ("obstacles": [...]), a single dict under
+    that same key, and the older single-"obstacle" schema, so a stale
+    rgb_*_vlm.txt captured before the prompt grew a list still works. Any
+    null/empty entries are dropped so a missing-detection case just yields
+    zero obstacles instead of a crash.
+    """
+    entries = response.get("obstacles")
+    if entries is None:
+        legacy = response.get("obstacle")
+        entries = [legacy] if legacy else []
+    elif isinstance(entries, dict):
+        entries = [entries]
+
+    return [e for e in entries if e]
+
+
+def entry_world_position(entry, frame_idx):
+    """
+    Resolve a single VLM object entry (goal_object or one obstacle) to a
+    world position, using the depth/pose captured alongside frame_idx.
 
     (x, z) come from unprojecting the bbox center pixel using the depth
     frame captured alongside it; y is re-derived from the terrain
@@ -562,9 +567,7 @@ def object_world_position(frame_idx):
     Returns:
         (x, y, z, label)
     """
-    vlm_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
-    response = parse_vlm_response(vlm_path)
-    u, v = bbox_center_pixel(response["coordinates2Darray"])
+    u, v = bbox_center_pixel(entry["coordinates2D"])
 
     depth = load_depth_frame(frame_idx)
     h, w = depth.shape[:2]
@@ -578,10 +581,29 @@ def object_world_position(frame_idx):
     world = pixel_to_world(u, v, depth_value, pose)
     grounded_y = terrain_height_at(world[0], world[2])
 
-    print(f"[object] pixel=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
+    label = entry.get("label", "?")
+    print(f"[object] '{label}' pixel=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
           f"world=({world[0]:.2f}, {world[1]:.2f}, {world[2]:.2f})")
 
-    return float(world[0]), float(grounded_y), float(world[2]), response.get("label", "?")
+    return float(world[0]), float(grounded_y), float(world[2]), label
+
+
+def object_world_position(frame_idx):
+    """
+    Resolve the VLM-chosen goal object (from rgb_{idx}_vlm.txt) to a world
+    position. Kept as a convenience for the single-object --face CLI path;
+    the full obstacles-then-goal mission uses entry_world_position directly.
+
+    Returns:
+        (x, y, z, label)
+    """
+    vlm_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
+    response = parse_vlm_response(vlm_path)
+    goal_entry = response.get("goal_object")
+    if not goal_entry:
+        raise ValueError(f"no goal_object in {vlm_path}")
+
+    return entry_world_position(goal_entry, frame_idx)
 
 
 def yaw_to_face(agent_x, agent_z, target_x, target_z):
@@ -590,11 +612,7 @@ def yaw_to_face(agent_x, agent_z, target_x, target_z):
     dz = target_z - agent_z
     return float(np.arctan2(-dx, -dz))
 
-
-# ============================================================================
 # Interactive capture loop
-# ============================================================================
-
 class InteractiveCapture:
     """Main interactive capture and annotation class."""
 
@@ -661,7 +679,7 @@ class InteractiveCapture:
             )
             if vlm_success:
                 print(f"[info] VLM response saved: {vlm_out_path}\n")
-                self.navigate_to_object(self.frame_idx)
+                self.navigate_mission(self.frame_idx)
             else:
                 print(f"[error] VLM query failed: {vlm_status}\n")
         else:
@@ -725,15 +743,65 @@ class InteractiveCapture:
         else:
             print(f"[nav] max steps ({NAV_MAX_STEPS}) reached before arriving at '{label}'")
 
-    def navigate_to_object(self, frame_idx):
-        """Resolve the VLM-chosen object from the given frame and drive to it."""
+    def navigate_to_obstacles(self, obstacles, frame_idx):
+        """
+        Drive to each obstacle in turn. Obstacles are visited one at a time so
+        the list can safely grow beyond today's single entry: a bad entry
+        (unresolvable position, missing depth) is logged and skipped rather
+        than aborting the rest of the list or the mission.
+        """
+        for i, obstacle in enumerate(obstacles):
+            try:
+                obs_x, _, obs_z, label = entry_world_position(obstacle, frame_idx)
+            except Exception as e:
+                oid = obstacle.get("object_id", "?") if isinstance(obstacle, dict) else "?"
+                print(f"[warn] skipping obstacle {i} (object_id={oid}): could not resolve position ({e})")
+                continue
+
+            self.navigate_to_target(obs_x, obs_z, label=f"obstacle[{i}]:{label}")
+
+    def navigate_to_goal(self, goal_entry, frame_idx):
+        """Drive to the goal object, then rotate in place to square up and face it."""
+        goal_x, goal_y, goal_z, label = entry_world_position(goal_entry, frame_idx)
+        self.navigate_to_target(goal_x, goal_z, label=f"goal:{label}")
+
+        self.yaw = yaw_to_face(self.x, self.z, goal_x, goal_z)
+        self.set_agent_pose()
+        print(f"[nav] facing goal '{label}' at ({goal_x:.2f}, {goal_y:.2f}, {goal_z:.2f}), "
+              f"yaw={np.rad2deg(self.yaw):.1f}°")
+
+        return goal_x, goal_y, goal_z, label
+
+    def navigate_mission(self, frame_idx):
+        """
+        Full mission for a queried frame: resolve the VLM's goal + obstacles,
+        drive to each obstacle first, then drive to the goal and stand facing
+        it at the controller's standoff distance.
+        """
+        vlm_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
         try:
-            obj_x, _, obj_z, label = object_world_position(frame_idx)
+            response = parse_vlm_response(vlm_path)
         except Exception as e:
-            print(f"[error] could not resolve object position: {e}")
+            print(f"[error] could not parse VLM response {vlm_path}: {e}")
             return
 
-        self.navigate_to_target(obj_x, obj_z, label=label)
+        goal_entry = response.get("goal_object")
+        if not goal_entry:
+            print(f"[error] no goal_object in {vlm_path}")
+            return
+
+        obstacles = extract_obstacle_entries(response)
+        print(f"[mission] {len(obstacles)} obstacle(s) to visit before the goal")
+
+        self.navigate_to_obstacles(obstacles, frame_idx)
+
+        try:
+            self.navigate_to_goal(goal_entry, frame_idx)
+        except Exception as e:
+            print(f"[error] could not resolve/reach goal position: {e}")
+            return
+
+        print(f"[mission] complete")
 
     def close(self):
         """Cleanup."""
@@ -852,7 +920,7 @@ def run_face_on_frame(frame_idx):
 
 
 def run_goto_on_frame(frame_idx):
-    """Drive the agent to the VLM-chosen object from an already-queried frame."""
+    """Run the full obstacles-then-goal mission for an already-queried frame."""
     vlm_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
     if not os.path.exists(vlm_path):
         print(f"[error] missing file: {vlm_path}")
@@ -860,7 +928,7 @@ def run_goto_on_frame(frame_idx):
 
     capture = InteractiveCapture()
     try:
-        capture.navigate_to_object(frame_idx)
+        capture.navigate_mission(frame_idx)
     finally:
         capture.close()
 
