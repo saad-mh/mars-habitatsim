@@ -193,14 +193,49 @@ def rgb_depth_from_obs(obs):
     depth = obs["depth"]
     return rgb, depth
 
+def semantic_from_obs(obs):
+    """
+    Extract the per-pixel semantic ID image from a sensor observation.
+
+    Habitat-Sim's semantic sensor reports obj.semantic_id (see
+    SemanticMeshRegistry.register) for pixels covered by a registered
+    goal/obstacle mesh, and 0 (SEMANTIC_ID_ENVIRONMENT) for the static
+    stage and everything else - see SEMANTIC_ID_* above. Values are
+    always in that small {0, 1, 2, ...} range, so an 8-bit image is
+    lossless and keeps the file directly viewable/loadable as a label map.
+    """
+    semantic = np.asarray(obs["semantic"])
+    return semantic.astype(np.uint8)
+
+def semantic_to_masks(semantic_img):
+    """
+    Convert a per-pixel semantic ID image into binary goal/obstacle masks.
+
+    Args:
+        semantic_img: HxW array of semantic category ids (see SEMANTIC_ID_*).
+
+    Returns:
+        (goal_mask, obstacle_mask): HxW uint8 arrays, 0=background,
+        255=pixels belonging to that category. Derived straight from the
+        renderer's semantic buffer, so partial visibility/occlusion at the
+        current camera pose is reflected automatically - no bbox involved.
+    """
+    goal_mask = np.where(semantic_img == SEMANTIC_ID_GOAL, 255, 0).astype(np.uint8)
+    obstacle_mask = np.where(semantic_img == SEMANTIC_ID_OBSTACLE, 255, 0).astype(np.uint8)
+    return goal_mask, obstacle_mask
+
 def save_frame(obs, frame_idx):
-    """Save RGB and depth frames to disk."""
+    """Save RGB, depth, semantic, and derived goal/obstacle mask frames to disk."""
     os.makedirs(OUT_DIR, exist_ok=True)
 
     rgb, depth = rgb_depth_from_obs(obs)
+    semantic = semantic_from_obs(obs)
 
     rgb_path = f"{OUT_DIR}/rgb_{frame_idx:04d}.png"
     depth_path = f"{OUT_DIR}/depth_{frame_idx:04d}.png"
+    semantic_path = f"{OUT_DIR}/semantic_{frame_idx:04d}.png"
+    goal_mask_path = f"{OUT_DIR}/goal_mask_{frame_idx:04d}.png"
+    obstacle_mask_path = f"{OUT_DIR}/obstacle_mask_{frame_idx:04d}.png"
 
     Image.fromarray(rgb).save(rgb_path)
 
@@ -214,9 +249,18 @@ def save_frame(obs, frame_idx):
     depth_npy_path = f"{OUT_DIR}/depth_{frame_idx:04d}.npy"
     np.save(depth_npy_path, depth.astype(np.float32))
 
+    Image.fromarray(semantic).save(semantic_path)
+
+    goal_mask, obstacle_mask = semantic_to_masks(semantic)
+    Image.fromarray(goal_mask).save(goal_mask_path)
+    Image.fromarray(obstacle_mask).save(obstacle_mask_path)
+
     print(f"[captured] {rgb_path}")
     print(f"[captured] {depth_path}")
     print(f"[captured] {depth_npy_path}")
+    print(f"[captured] {semantic_path}")
+    print(f"[captured] {goal_mask_path}")
+    print(f"[captured] {obstacle_mask_path}")
 
     return rgb_path
 
