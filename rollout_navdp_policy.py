@@ -557,6 +557,11 @@ class VlmSelectionPixelGoal:
     as a FRACTION of the frame it was resolved on so it reprojects correctly onto the
     live rollout frame, whose resolution can differ from the capture resolution."""
 
+    # A one-shot capture-time selection, not a live re-detector: the belief should be
+    # seeded from it ONCE (dead-reckoned by odometry after), never re-queried on a
+    # cadence like --grounder stub/qwen (see the main loop's grounder-call gate).
+    one_shot = True
+
     def __init__(self, bbox_xyxy, capture_hw):
         cap_h, cap_w = capture_hw
         x1, y1, x2, y2 = bbox_xyxy
@@ -1141,7 +1146,10 @@ def main() -> None:
                 # BELIEF-tracked goal: the ghost comes from a body-frame estimate propagated by
                 # odometry. It is seeded either from an IMAGE bearing+range (no world xyz) or from
                 # the world goal at t=0; with a world goal it can also correct on sight.
-                if grounder is not None and (belief_g is None or step % max(1, int(args.grounder_every)) == 0):
+                if grounder is not None and (
+                    belief_g is None
+                    or (not getattr(grounder, "one_shot", False) and step % max(1, int(args.grounder_every)) == 0)
+                ):
                     # LANGUAGE grounds the goal: RGB + instruction -> pixel -> body point (belief)
                     pg = grounder.ground(rgb, args.instruction)
                     if pg.in_view:
