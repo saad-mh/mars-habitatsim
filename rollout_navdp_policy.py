@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -541,6 +542,25 @@ def pixel_to_body(u, v, depth_img, height, width, hfov_deg, fallback_range):
     return np.asarray([rng, -right], dtype=np.float32)  # [forward, left]
 
 
+class VlmSelectionPixelGoal:
+    """Adapts a one-shot VLM object selection (resolve_vlm_selection, run once on an
+    already-captured+annotated frame) to the .ground(rgb, instruction) grounder
+    interface used by --grounder stub/qwen, so --goal-from-vlm seeds the belief via
+    the same image-pixel path -- never a world coordinate. The bbox center is stored
+    as a FRACTION of the frame it was resolved on so it reprojects correctly onto the
+    live rollout frame, whose resolution can differ from the capture resolution."""
+
+    def __init__(self, bbox_xyxy, capture_hw):
+        cap_h, cap_w = capture_hw
+        x1, y1, x2, y2 = bbox_xyxy
+        self._u_frac = 0.5 * (x1 + x2) / cap_w
+        self._v_frac = 0.5 * (y1 + y2) / cap_h
+
+    def ground(self, rgb, instruction):
+        h, w = rgb.shape[0], rgb.shape[1]
+        return SimpleNamespace(u=self._u_frac * w, v=self._v_frac * h, in_view=True)
+
+
 def propagate_body_point(bg, action, dt, odom_noise=0.0, rng=None):
     """Move a body-frame point [forward, left] under the robot's own SE(2) motion (dead-reckoning):
     translate back by v*dt and rotate by -yaw*dt -- the same propagation the cone uses. Optional
@@ -683,8 +703,11 @@ def main() -> None:
     ap.add_argument("--goal-x", type=float, default=None, help="World goal X (required unless --goal-mesh-uv/--goal-from-vlm).")
     ap.add_argument("--goal-z", type=float, default=None, help="World goal Z (required unless --goal-mesh-uv/--goal-from-vlm).")
     ap.add_argument("--goal-from-vlm", action="store_true",
-                    help="DIRECT geometric goal (mode a), sourced from vlm_nav_interactive's VLM object "
-                         "selection on an already-captured+annotated frame, instead of --goal-x/--goal-z.")
+                    help="BELIEF-tracked goal (mode b), sourced from vlm_nav_interactive's VLM object "
+                         "selection on an already-captured+annotated frame: the selected bbox seeds the "
+                         "belief via the same grounder pixel path as --grounder stub/qwen (implies "
+                         "--belief-goal). The resolved world position is kept only as a logging/"
+                         "success-metric reference, like --goal-bearing-deg -- never fed to control.")
     ap.add_argument("--vlm-frame-idx", type=int, default=0,
                     help="Captured+annotated frame index to run the VLM selection on (with --goal-from-vlm).")
     ap.add_argument("--goal-y", type=float, default=None, help="World Y of goal marker; default terrain height + goal-height")
@@ -814,7 +837,15 @@ def main() -> None:
     )
     from rollout_habitat_policy import ActionSmoother, action_to_control, frame_to_spatial, load_model, resolve_modes, resolve_obstacle_channel
     if args.goal_from_vlm:
-        from vlm_nav_interactive import OUT_DIR as VLM_OUT_DIR, ANNOTATIONS_DIR as VLM_ANNOTATIONS_DIR, resolve_vlm_selection
+        from vlm_nav_interactive import (
+            OUT_DIR as VLM_OUT_DIR,
+            ANNOTATIONS_DIR as VLM_ANNOTATIONS_DIR,
+            RGBD_RESOLUTION as VLM_CAPTURE_HW,
+            START_X as VLM_START_X,
+            START_Z as VLM_START_Z,
+            START_YAW_DEG as VLM_START_YAW_DEG,
+            resolve_vlm_selection,
+        )
 
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -890,6 +921,31 @@ def main() -> None:
         print(f"[VLA] grounded goal: {args.grounder} every {args.grounder_every} steps, "
               f"instruction={args.instruction!r}", flush=True)
 
+    vlm_goal_mesh = None
+    if args.goal_from_vlm:
+        # BELIEF-tracked goal (mode b): resolve the VLM's object selection ONCE here and
+        # wrap its bbox as a grounder, so the belief is seeded from an image pixel (below,
+        # in the same --belief-goal branch as --grounder stub/qwen) rather than a world xyz.
+        frame_idx = args.vlm_frame_idx
+        rgb_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}.png"
+        overlay_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}_at.png"
+        annotation_path = f"{VLM_ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
+        vlm_success, vlm_result, vlm_status = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx)
+        if not vlm_success:
+            raise SystemExit(f"--goal-from-vlm: VLM selection failed: {vlm_status}")
+        _, vlm_goal_mesh, _ = vlm_result
+        grounder = VlmSelectionPixelGoal(vlm_goal_mesh["bbox"], VLM_CAPTURE_HW)
+        args.belief_goal = True
+        print(f"[VLM] goal '{vlm_goal_mesh['label']}' bbox={vlm_goal_mesh['bbox']} (capture {VLM_CAPTURE_HW}) "
+              f"seeds the belief via pixel; re-grounded every {args.grounder_every} steps", flush=True)
+        # The bbox is a FIXED pixel fraction (not a live re-detection), so it's only valid if the
+        # rollout starts from ~the pose the frame was captured at (vlm_nav_interactive's START_*).
+        if (abs(args.start_x - VLM_START_X) > 0.5 or abs(args.start_z - VLM_START_Z) > 0.5
+                or abs(args.start_yaw_deg - VLM_START_YAW_DEG) > 5.0):
+            print(f"[WARN] --start-x/z/yaw-deg ({args.start_x},{args.start_z},{args.start_yaw_deg}) "
+                  f"differ from the capture pose ({VLM_START_X},{VLM_START_Z},{VLM_START_YAW_DEG}); "
+                  "the seeded pixel may not land on the object in the first live frame.", flush=True)
+
     mesh_goal_mode = bool(args.goal_mesh_uv)
     if mesh_goal_mode:
         args.belief_goal = True   # reuse belief propagation + ghost recovery, but seed from the mask
@@ -906,18 +962,11 @@ def main() -> None:
     yaw = math.radians(float(args.start_yaw_deg))
     dt = 1.0 / float(args.hz)
     if args.goal_from_vlm:
-        # DIRECT geometric goal (mode a), sourced from a VLM object selection on an
-        # already-captured+annotated frame, rather than --goal-x/--goal-z.
-        frame_idx = args.vlm_frame_idx
-        rgb_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}.png"
-        overlay_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}_at.png"
-        annotation_path = f"{VLM_ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
-        vlm_success, vlm_result, vlm_status = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx)
-        if not vlm_success:
-            raise SystemExit(f"--goal-from-vlm: VLM selection failed: {vlm_status}")
-        _, goal_mesh, _ = vlm_result
-        goal_vx, goal_vy, goal_vz = goal_mesh["seed_world"]
-        print(f"[VLM] goal '{goal_mesh['label']}' selected -> world=({goal_vx:.2f},{goal_vy:.2f},{goal_vz:.2f})", flush=True)
+        # World position of the VLM selection, kept ONLY as the success-metric/logging
+        # reference (mirrors --goal-bearing-deg) -- control is driven by the pixel-seeded
+        # belief wired above, this world point is never read by the control path.
+        goal_vx, goal_vy, goal_vz = vlm_goal_mesh["seed_world"]
+        print(f"[VLM] goal '{vlm_goal_mesh['label']}' reference world=({goal_vx:.2f},{goal_vy:.2f},{goal_vz:.2f})", flush=True)
         goal_y = args.goal_y
         if goal_y is None:
             goal_y = terrain.local_height_max(goal_vx, goal_vz, float(args.goal_terrain_radius)) + float(args.goal_height)
