@@ -19,10 +19,17 @@ import habitat_sim
 from habitat_sim.agent import AgentConfiguration
 import quaternion
 
+import qwen_vlm_client
+
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_SCENE = HERE / "marsyard2022_tri.glb"
 DEFAULT_OBJ = HERE / "marsyard2022.obj"
+
+QWEN_STEER_PROMPT = (
+    "You are piloting a rover approaching its goal. Looking at this view, should the rover "
+    "go left, go right, or stop? Reply with exactly one word: left, right, or stop."
+)
 
 SIZE_X = 50.0
 SIZE_Z = 50.0
@@ -668,6 +675,15 @@ def main() -> None:
     ap.add_argument("--command-file", type=str, default="",
                     help="Path polled every tick for the current command (a human or a VLM writes to it). "
                     "Overrides --command. This is the LIVE inference interface.")
+    ap.add_argument("--qwen-steer", action="store_true",
+                    help="Once near the goal (same stop-dist+deadzone gate used for goal-reached), poll "
+                    "the persistent Qwen VLM server (qwen_vlm_server.py) for a live left/right/stop "
+                    "steering command instead of --command/--command-file. Feeds into the same "
+                    "command_intent path -- overrides --command/--command-file once active.")
+    ap.add_argument("--qwen-steer-hz", type=float, default=3.0,
+                    help="Poll rate (Hz) for --qwen-steer once near-goal; independent of --hz.")
+    ap.add_argument("--qwen-host", default=qwen_vlm_client.DEFAULT_HOST)
+    ap.add_argument("--qwen-port", type=int, default=qwen_vlm_client.DEFAULT_PORT)
     ap.add_argument("--vla-adapter", type=str, default="",
                     help="Path to a trained vla_adapter.pt. REGIME B: the language-conditioned POLICY "
                     "produces the maneuver (orbit override + soft cone projection off; hard gate keeps it "
@@ -1014,6 +1030,9 @@ def main() -> None:
     belief_rng = np.random.default_rng(0)
     near_obstacle_state = False  # hysteresis-latched maneuver gate (avoids flicker at the boundary)
     belief_state = False         # hysteresis-latched belief-return gate
+    qwen_cmd_txt = ""            # last command text received from --qwen-steer (persists between polls)
+    last_qwen_poll_t = 0.0
+    qwen_steer_active = False    # logs once, the tick --qwen-steer polling starts
 
     print("Mars NavDP rollout", flush=True)
     print(f"  navdp_root : {navdp_root}", flush=True)
@@ -1046,25 +1065,50 @@ def main() -> None:
 
     try:
         for step in range(int(args.max_steps)):
+            y = terrain.local_height_max(x, z, float(args.pose_terrain_radius)) + float(args.clearance)
+            position = np.asarray([x, y, z], dtype=np.float32)
+            set_agent_pose(agent, x, y, z, yaw)
+            obs = sim.get_sensor_observations()
+            rgb, depth = rgb_depth(obs)
+
             # LIVE language command (real-time inference). Read once per tick so it can drive the
             # sample below. With --vla-adapter the intent becomes the policy's text token (Regime
             # B: the POLICY executes the maneuver); without it, intent drives the orbit (Regime A).
+            goal_dist_now = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z], dtype=np.float32)))
+            near_goal = goal_dist_now <= float(args.stop_dist) + float(args.cbf_deadzone)
+
             cmd_txt = args.command
             if args.command_file:
                 try:
                     cmd_txt = Path(args.command_file).read_text(encoding="utf-8").strip() or args.command
                 except Exception:
                     pass
+            if args.qwen_steer and near_goal:
+                # Near the goal, hand steering over to the persistent Qwen VLM server, polled at
+                # qwen_steer_hz (NOT every control tick -- --hz is typically much higher). Its
+                # reply is fed straight into command_intent below, same as any live command text.
+                if not qwen_steer_active:
+                    print(f"[qwen-steer] near goal (dist={goal_dist_now:.2f}m) -- polling Qwen at {args.qwen_steer_hz:g}Hz", flush=True)
+                    qwen_steer_active = True
+                now_t = time.time()
+                if now_t - last_qwen_poll_t >= 1.0 / float(args.qwen_steer_hz):
+                    last_qwen_poll_t = now_t
+                    frame_path = str(out_dir / "qwen_steer_frame.jpg")
+                    Image.fromarray(rgb.astype(np.uint8)).convert("RGB").save(frame_path)
+                    try:
+                        qwen_cmd_txt = qwen_vlm_client.query_vlm_persistent(
+                            frame_path, prompt=QWEN_STEER_PROMPT, max_new_tokens=8,
+                            host=args.qwen_host, port=args.qwen_port,
+                        )
+                        print(f"[qwen-steer] t={now_t:.2f} step={step} -> {qwen_cmd_txt!r}", flush=True)
+                    except Exception as e:
+                        print(f"[qwen-steer] query failed: {e}", flush=True)
+                cmd_txt = qwen_cmd_txt
             intent = command_intent(cmd_txt)
             force_side = 1.0 if intent == "left" else (-1.0 if intent == "right" else None)
             vla_token = None   # set below, once the obstacle distance is known
             stop_cmd = False   # set below (gated on obstacle proximity)
 
-            y = terrain.local_height_max(x, z, float(args.pose_terrain_radius)) + float(args.clearance)
-            position = np.asarray([x, y, z], dtype=np.float32)
-            set_agent_pose(agent, x, y, z, yaw)
-            obs = sim.get_sensor_observations()
-            rgb, depth = rgb_depth(obs)
             if mesh_goal_mode:
                 # RENDERED-MASK goal: a semantic mesh (placed at t=0 from a pixel) is rendered each
                 # step; the belief is built from that mask, so the policy's goal channel IS the mask.
@@ -1207,8 +1251,7 @@ def main() -> None:
             # "stop" is a language TRIGGER, but the HALT itself is proximity-gated: engage once close
             # to the obstacle OR the goal (whichever comes first), not the instant "stop" is said.
             # Without the goal term, "stop" never fired on a goal-only run (no obstacle to be near).
-            goal_dist_now = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z], dtype=np.float32)))
-            near_goal = goal_dist_now <= float(args.stop_dist) + float(args.cbf_deadzone)
+            # (goal_dist_now / near_goal already computed above, at the top of the loop.)
             stop_cmd = (intent == "stop") and (near_obstacle or near_goal)
             if vla_adapter is not None:
                 # Hard, full-strength switch (NOT a blend): interpolating between two different
