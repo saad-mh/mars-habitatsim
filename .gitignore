@@ -3,7 +3,9 @@ mars_teleop_out*
 mars_rgbd_test_out
 mars_ht_vel_out*
 
-__pycache__
-__pycache__/*
+*__pycache__
+__pycache__/
+*.py[cod]
+*$py.class
 navdp/ckpt_last.pt
 *.pt
