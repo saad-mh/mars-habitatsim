@@ -244,8 +244,7 @@ def save_frame(obs, frame_idx):
     depth_vis = (depth_clip / 10.0 * 255.0).astype(np.uint8)
     Image.fromarray(depth_vis).save(depth_path)
 
-    # Raw metric depth, kept alongside the 8-bit visualization so bbox->world
-    # back-projection isn't limited to the 0-10m visualization clip range.
+    # Raw metric depth, kept alongside the 8-bit visualization so bbox->world back-projection isn't limited to the 0-10m visualization clip range.
     depth_npy_path = f"{OUT_DIR}/depth_{frame_idx:04d}.npy"
     np.save(depth_npy_path, depth.astype(np.float32))
 
@@ -1057,6 +1056,45 @@ def resolve_mission_meshes(frame_idx, response, radius=0.5):
     return goal_mesh, obstacle_meshes
 
 
+def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PROMPT, radius=0.5):
+    """
+    Query the VLM for its goal/obstacle object selection on an annotated
+    frame, then back-project the chosen bbox(es) through depth + camera
+    intrinsics into world-space 3D positions (with local terrain meshes).
+
+    Combines query_vlm + parse_vlm_response + resolve_mission_meshes into
+    one call with no Tk/labelme/spacebar dependency, so it's reusable
+    outside the interactive capture loop (e.g. from a NavDP rollout script).
+
+    Args:
+        rgb_path: Path to the raw RGB frame.
+        overlay_path: Path to the annotated overlay image.
+        annotation_path: Path to the validated labelme annotation JSON.
+        frame_idx: Frame index (for naming the VLM output file and loading
+            the frame's saved depth/pose).
+        prompt: Question to ask the VLM about the detected objects.
+        radius: Local terrain patch radius, in meters, for the resolved mesh(es).
+
+    Returns:
+        (success, result, status_message). On success, result is
+        (response, goal_mesh, obstacle_meshes); on failure, result is None.
+    """
+    vlm_success, vlm_out_path, vlm_status = query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt)
+    if not vlm_success:
+        return False, None, vlm_status
+
+    try:
+        response = parse_vlm_response(vlm_out_path)
+    except Exception as e:
+        return False, None, f"could not parse VLM response {vlm_out_path}: {e}"
+
+    goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response, radius=radius)
+    if goal_mesh is None:
+        return False, None, f"no goal_object in {vlm_out_path}"
+
+    return True, (response, goal_mesh, obstacle_meshes), "accepted"
+
+
 def save_mission_metadata(
     frame_idx, vlm_response, goal_mesh, obstacle_meshes, goal_target_world, semantic_paths=None
 ):
@@ -1179,12 +1217,13 @@ class InteractiveCapture:
             overlay_path = f"{OUT_DIR}/rgb_{self.frame_idx:04d}_at.png"
             draw_annotation_overlay(rgb_path, annotation_path, overlay_path)
 
-            vlm_success, vlm_out_path, vlm_status = query_vlm(
+            vlm_success, vlm_result, vlm_status = resolve_vlm_selection(
                 rgb_path, overlay_path, annotation_path, self.frame_idx
             )
             if vlm_success:
-                print(f"[info] VLM response saved: {vlm_out_path}\n")
-                self.navigate_mission(self.frame_idx)
+                response, goal_mesh, obstacle_meshes = vlm_result
+                print(f"[info] VLM response saved: {OUT_DIR}/rgb_{self.frame_idx:04d}_vlm.txt\n")
+                self.navigate_mission(self.frame_idx, response, goal_mesh, obstacle_meshes)
             else:
                 print(f"[error] VLM query failed: {vlm_status}\n")
         else:
@@ -1327,22 +1366,29 @@ class InteractiveCapture:
 
         return goal_x, goal_y, goal_z, label
 
-    def navigate_mission(self, frame_idx):
+    def navigate_mission(self, frame_idx, response=None, goal_mesh=None, obstacle_meshes=None):
         """
         Full mission for a queried frame: resolve the VLM's goal + obstacles
         (including local terrain meshes), drive to each obstacle first, then
         drive to the goal and stand facing it at the controller's standoff
         distance. Mission metadata (VLM reply, meshes, final target) is
         saved to rgb_{idx}_mission.json on completion.
+
+        response/goal_mesh/obstacle_meshes may be passed in already resolved
+        (on_spacebar does this via resolve_vlm_selection, to avoid re-parsing
+        what it just wrote); when omitted, they're parsed/resolved fresh from
+        the frame's saved rgb_*_vlm.txt, as the --goto CLI replay path does.
         """
         vlm_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
-        try:
-            response = parse_vlm_response(vlm_path)
-        except Exception as e:
-            print(f"[error] could not parse VLM response {vlm_path}: {e}")
-            return
+        if response is None:
+            try:
+                response = parse_vlm_response(vlm_path)
+            except Exception as e:
+                print(f"[error] could not parse VLM response {vlm_path}: {e}")
+                return
 
-        goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response)
+        if goal_mesh is None and obstacle_meshes is None:
+            goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response)
         if goal_mesh is None:
             print(f"[error] no goal_object in {vlm_path}")
             return
@@ -1466,21 +1512,11 @@ def run_vlm_on_frame(frame_idx, prompt=VLM_PROMPT):
     if not os.path.exists(overlay_path):
         draw_annotation_overlay(rgb_path, annotation_path, overlay_path)
 
-    success, vlm_out_path, status_msg = query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt)
+    success, result, status_msg = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, prompt)
     if not success:
-        print(f"[error] VLM query failed: {status_msg}")
+        print(f"[error] {status_msg}")
         return
-
-    try:
-        response = parse_vlm_response(vlm_out_path)
-    except Exception as e:
-        print(f"[error] could not parse VLM response {vlm_out_path}: {e}")
-        return
-
-    goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response)
-    if goal_mesh is None:
-        print(f"[error] no goal_object in {vlm_out_path}")
-        return
+    response, goal_mesh, obstacle_meshes = result
 
     pose = load_pose(frame_idx)
     capture = InteractiveCapture()
@@ -1530,14 +1566,7 @@ def run_goto_on_frame(frame_idx):
 
 def validate_semantic_masks(frame_idx):
     """
-    Sanity-check a frame's semantic pipeline output: the goal and obstacle
-    masks must be mutually exclusive (no pixel belongs to both), each
-    mask's 255 pixels must exactly match the corresponding semantic id in
-    the raw semantic render, and every pixel neither mask claims must be
-    SEMANTIC_ID_ENVIRONMENT. This is the pixel-level demonstration that
-    goal pixels only cover the selected goal region, obstacle pixels only
-    cover the selected obstacle region(s), and everything else is
-    environment.
+    Sanity-check a frame's semantic pipeline output: the goal and obstacle masks must be mutually exclusive (no pixel belongs to both), each mask's 255 pixels must exactly match the corresponding semantic id in the raw semantic render, and every pixel neither mask claims must be SEMANTIC_ID_ENVIRONMENT. This is the pixel-level demonstration that goal pixels only cover the selected goal region, obstacle pixels only cover the selected obstacle region(s), and everything else is environment.
 
     Returns:
         True if every check passes, False otherwise.

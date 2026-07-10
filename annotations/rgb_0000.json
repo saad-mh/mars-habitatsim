@@ -159,25 +159,6 @@
       "label": "rock",
       "points": [
         [
-          519.4535519125683,
-          419.78142076502735
-        ],
-        [
-          598.1420765027323,
-          378.79781420765033
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 9,
-      "label": "rock",
-      "points": [
-        [
           554.4262295081967,
           293.00546448087437
         ],
@@ -193,7 +174,7 @@
       "mask": null
     },
     {
-      "id": 10,
+      "id": 9,
       "label": "sand",
       "points": [
         [
@@ -212,7 +193,7 @@
       "mask": null
     },
     {
-      "id": 11,
+      "id": 10,
       "label": "sand",
       "points": [
         [
@@ -231,7 +212,7 @@
       "mask": null
     },
     {
-      "id": 12,
+      "id": 11,
       "label": "rock",
       "points": [
         [
@@ -250,25 +231,7 @@
       "mask": null
     },
     {
-      "id": 13,
-      "label": "rock",
-      "points": [
-        [
-          342.40437158469945,
-          205.5737704918033
-        ],
-        [
-          370.81967213114757,
-          225.79234972677597
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
+      "id": 12,
       "label": "rock",
       "points": [
         [
@@ -284,10 +247,10 @@
       "description": "",
       "shape_type": "rectangle",
       "flags": {},
-      "mask": null,
-      "id": 14
+      "mask": null
     },
     {
+      "id": 13,
       "label": "rock",
       "points": [
         [
@@ -303,10 +266,10 @@
       "description": "",
       "shape_type": "rectangle",
       "flags": {},
-      "mask": null,
-      "id": 15
+      "mask": null
     },
     {
+      "id": 14,
       "label": "rock",
       "points": [
         [
@@ -322,8 +285,7 @@
       "description": "",
       "shape_type": "rectangle",
       "flags": {},
-      "mask": null,
-      "id": 16
+      "mask": null
     }
   ],
   "imagePath": "../vlm_nav_out/rgb_0000.png",
