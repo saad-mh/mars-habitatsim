@@ -680,8 +680,13 @@ def main() -> None:
     ap.add_argument("--start-x", type=float, default=0.0)
     ap.add_argument("--start-z", type=float, default=8.0)
     ap.add_argument("--start-yaw-deg", type=float, default=0.0)
-    ap.add_argument("--goal-x", type=float, default=None, help="World goal X (required unless --goal-mesh-uv).")
-    ap.add_argument("--goal-z", type=float, default=None, help="World goal Z (required unless --goal-mesh-uv).")
+    ap.add_argument("--goal-x", type=float, default=None, help="World goal X (required unless --goal-mesh-uv/--goal-from-vlm).")
+    ap.add_argument("--goal-z", type=float, default=None, help="World goal Z (required unless --goal-mesh-uv/--goal-from-vlm).")
+    ap.add_argument("--goal-from-vlm", action="store_true",
+                    help="DIRECT geometric goal (mode a), sourced from vlm_nav_interactive's VLM object "
+                         "selection on an already-captured+annotated frame, instead of --goal-x/--goal-z.")
+    ap.add_argument("--vlm-frame-idx", type=int, default=0,
+                    help="Captured+annotated frame index to run the VLM selection on (with --goal-from-vlm).")
     ap.add_argument("--goal-y", type=float, default=None, help="World Y of goal marker; default terrain height + goal-height")
     ap.add_argument("--goal-height", type=float, default=1.2, help="Goal marker height above terrain when --goal-y is omitted")
     ap.add_argument("--goal-terrain-radius", type=float, default=0.8, help="Raise ghost goal from local max terrain height in this radius")
@@ -808,6 +813,8 @@ def main() -> None:
         project_forward_velocity_cbf,
     )
     from rollout_habitat_policy import ActionSmoother, action_to_control, frame_to_spatial, load_model, resolve_modes, resolve_obstacle_channel
+    if args.goal_from_vlm:
+        from vlm_nav_interactive import OUT_DIR as VLM_OUT_DIR, ANNOTATIONS_DIR as VLM_ANNOTATIONS_DIR, resolve_vlm_selection
 
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -898,9 +905,26 @@ def main() -> None:
     z = float(args.start_z)
     yaw = math.radians(float(args.start_yaw_deg))
     dt = 1.0 / float(args.hz)
-    if args.goal_x is None or args.goal_z is None:
+    if args.goal_from_vlm:
+        # DIRECT geometric goal (mode a), sourced from a VLM object selection on an
+        # already-captured+annotated frame, rather than --goal-x/--goal-z.
+        frame_idx = args.vlm_frame_idx
+        rgb_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}.png"
+        overlay_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}_at.png"
+        annotation_path = f"{VLM_ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
+        vlm_success, vlm_result, vlm_status = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx)
+        if not vlm_success:
+            raise SystemExit(f"--goal-from-vlm: VLM selection failed: {vlm_status}")
+        _, goal_mesh, _ = vlm_result
+        goal_vx, goal_vy, goal_vz = goal_mesh["seed_world"]
+        print(f"[VLM] goal '{goal_mesh['label']}' selected -> world=({goal_vx:.2f},{goal_vy:.2f},{goal_vz:.2f})", flush=True)
+        goal_y = args.goal_y
+        if goal_y is None:
+            goal_y = terrain.local_height_max(goal_vx, goal_vz, float(args.goal_terrain_radius)) + float(args.goal_height)
+        goal = np.asarray([goal_vx, goal_y, goal_vz], dtype=np.float32)
+    elif args.goal_x is None or args.goal_z is None:
         if not mesh_goal_mode:
-            raise SystemExit("Pass --goal-x and --goal-z, or use --goal-mesh-uv for a rendered-mask goal.")
+            raise SystemExit("Pass --goal-x and --goal-z, --goal-from-vlm, or use --goal-mesh-uv for a rendered-mask goal.")
         goal = np.zeros(3, dtype=np.float32)   # placeholder; set from the mesh centroid at step 0
     else:
         goal_y = args.goal_y
