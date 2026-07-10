@@ -9,3 +9,7 @@ __pycache__/
 *$py.class
 navdp/ckpt_last.pt
 *.pt
+
+.DS_Store
+
+*.pth
