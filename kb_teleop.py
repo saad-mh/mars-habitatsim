@@ -15,8 +15,8 @@ import quaternion
 # SETTINGS
 # ============================================================
 
-SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/marsyard2022_tri.glb"
-HEIGHTMAP = "/home/nahar/Desktop/pineapple/conversion/marsyard2022/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
+SCENE = "./marsyard2022_tri.glb"
+HEIGHTMAP = "./marsyard2022_terrain_hm.png"
 
 OUT_DIR = f"mars_teleop_out{int(time.time())}"
 

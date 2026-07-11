@@ -13,3 +13,5 @@ navdp/ckpt_last.pt
 .DS_Store
 
 *.pth
+
+.venv
