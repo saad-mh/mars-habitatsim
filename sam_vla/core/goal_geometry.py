@@ -12,30 +12,47 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 from sam_vla.core.types import GoalSpec, Observation, Pose
 
 GoalPosition = tuple[float, float, float]
 
 
-def backproject_goal_position(
-    obs: Observation, goal_spec: GoalSpec, hfov_deg: float
+def bbox_to_world(
+    obs: Observation, bbox_norm: tuple[float, float, float, float], hfov_deg: float
 ) -> GoalPosition | None:
-    """Backproject the goal bbox center into a world-frame (x, y, z) point.
+    """Backproject a normalized bbox into a world-frame (x, y, z) point.
 
-    Returns None if depth is unavailable, or the sampled depth at the goal
-    pixel is invalid (e.g. a sky/void hit).
+    Bearing/elevation come from the bbox's center pixel; range comes from the
+    MEDIAN depth over the bbox's interior, mirroring rollout_navdp_policy's
+    bbox_to_body robustness -- a single center pixel can land on a depth
+    discontinuity (a rock's silhouette edge, a gap between the object and the
+    background behind it) and seed a badly wrong range.
+
+    Returns None if depth is unavailable, or no pixel in the bbox has valid
+    depth (e.g. the bbox is entirely a sky/void hit).
     """
     if obs.depth is None:
         return None
 
     height, width = obs.depth.shape[:2]
-    x0, y0, x1, y1 = goal_spec.goal_bbox_norm
-    px = min(max(int((x0 + x1) / 2.0 * width), 0), width - 1)
-    py = min(max(int((y0 + y1) / 2.0 * height), 0), height - 1)
+    x0, y0, x1, y1 = bbox_norm
+    fx0, fx1 = x0 * width, x1 * width
+    fy0, fy1 = y0 * height, y1 * height
+    ix0, ix1 = sorted((min(max(int(fx0), 0), width - 1), min(max(int(fx1), 0), width - 1)))
+    iy0, iy1 = sorted((min(max(int(fy0), 0), height - 1), min(max(int(fy1), 0), height - 1)))
 
-    depth_m = float(obs.depth[py, px])
-    if not math.isfinite(depth_m) or depth_m <= 0.0:
+    patch = np.asarray(obs.depth)[iy0:iy1 + 1, ix0:ix1 + 1]
+    valid = patch[np.isfinite(patch) & (patch > 0.0)]
+    if valid.size == 0:
         return None
+    depth_m = float(np.median(valid))
+
+    # Bearing/elevation from the bbox's continuous center (not the rounded patch
+    # bounds above) -- mirrors bbox_to_body's `u = 0.5 * (x1 + x2)`.
+    px = 0.5 * (fx0 + fx1)
+    py = 0.5 * (fy0 + fy1)
 
     # Depth sensor reports z-depth (perpendicular to the image plane), which is
     # exactly what a pinhole model expects as z_cam.
@@ -54,6 +71,32 @@ def backproject_goal_position(
     world_y = pose.y - y_cam
 
     return (world_x, world_y, world_z)
+
+
+def backproject_goal_position(
+    obs: Observation, goal_spec: GoalSpec, hfov_deg: float
+) -> GoalPosition | None:
+    """Backproject the goal bbox into a world-frame (x, y, z) point."""
+    return bbox_to_world(obs, goal_spec.goal_bbox_norm, hfov_deg)
+
+
+def disc_mesh(
+    center: GoalPosition, radius: float, segments: int = 16, lift: float = 0.05
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flat circular fan of triangles in the x-z plane, centered at `center`
+    and lifted slightly above it so the render-only mesh doesn't z-fight
+    whatever surface it's marking. Output shape (verts, faces) mirrors
+    rollout_navdp_policy's depth_patch_mesh, so it can be handed to the same
+    _save_obj / register_semantic_mesh path to become a goal/obstacle mask.
+    """
+    cx, cy, cz = center
+    cy = float(cy) + float(lift)
+    angles = np.linspace(0.0, 2.0 * math.pi, int(segments), endpoint=False)
+    ring = [(cx + radius * math.cos(a), cy, cz + radius * math.sin(a)) for a in angles]
+    verts = np.asarray([(cx, cy, cz)] + ring, dtype=np.float64)
+    n = len(ring)
+    faces = np.asarray([(0, i + 1, (i + 1) % n + 1) for i in range(n)], dtype=np.int64)
+    return verts, faces
 
 
 def distance_to_goal(pose: Pose, goal_position: GoalPosition) -> float:

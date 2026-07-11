@@ -8,6 +8,7 @@ import habitat_sim
 import quaternion
 from habitat_sim.agent import AgentConfiguration
 
+from sam_vla.core.goal_geometry import GoalPosition, disc_mesh
 from sam_vla.core.lifecycle import ServiceRegistry
 from sam_vla.core.types import Observation, Pose
 
@@ -17,7 +18,9 @@ from rollout_navdp_policy import (
     SIZE_Z,
     SceneMappedTerrain,
     TerrainHeight,
+    _save_obj,
     make_sensor,
+    register_semantic_mesh,
     rgb_depth,
     set_agent_pose,
 )
@@ -44,6 +47,7 @@ class MarsHabitatEnv:
         randomize_spawn: bool = False,
         spawn_clearance: float = SPAWN_CLEARANCE_M,
         spawn_terrain_radius: float = SPAWN_TERRAIN_RADIUS_M,
+        with_semantic: bool = False,
     ):
         self._scene_path = Path(scene_path)
         self._heightmap_path = Path(heightmap_path)
@@ -59,6 +63,7 @@ class MarsHabitatEnv:
         self._randomize_spawn = randomize_spawn
         self._spawn_clearance = spawn_clearance
         self._spawn_terrain_radius = spawn_terrain_radius
+        self._with_semantic = with_semantic
 
     def __enter__(self) -> "MarsHabitatEnv":
         sim_cfg = habitat_sim.SimulatorConfiguration()
@@ -71,8 +76,14 @@ class MarsHabitatEnv:
         # to match the old pipeline's 10m sensor spec.
         depth_spec.far = DEPTH_MAX_RANGE_M
 
+        sensor_specs = [rgb_spec, depth_spec]
+        if self._with_semantic:
+            sensor_specs.append(
+                make_sensor("semantic", habitat_sim.SensorType.SEMANTIC, RGB_HEIGHT, RGB_WIDTH, HFOV_DEG)
+            )
+
         agent_cfg = AgentConfiguration()
-        agent_cfg.sensor_specifications = [rgb_spec, depth_spec]
+        agent_cfg.sensor_specifications = sensor_specs
 
         self._sim = habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
         self._agent = self._sim.initialize_agent(0)
@@ -91,8 +102,22 @@ class MarsHabitatEnv:
         )
         self._terrain = SceneMappedTerrain(raw_terrain, flip_x=False, flip_z=True, swap_xz=False)
 
+        if self._randomize_spawn:
+            x = random.uniform(-SIZE_X / 2.0, SIZE_X / 2.0)
+            z = random.uniform(-SIZE_Z / 2.0, SIZE_Z / 2.0)
+            yaw = random.uniform(0.0, 2.0 * 3.141592653589793)
+        else:
+            x, z, yaw = self._start_x, self._start_z, self._start_yaw
+
+        y = self.get_height_at_xz(x, z)
+        set_agent_pose(self._agent, x, y, z, yaw)
+
         self._registry.start_all()
         return self
+
+    def get_height_at_xz(self, x: float, z: float) -> float:
+        """Terrain height at (x, z), plus rover clearance, sampled from the heightmap."""
+        return self._terrain.local_height_max(x, z, self._spawn_terrain_radius) + self._spawn_clearance
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._registry.stop_all()
@@ -113,6 +138,28 @@ class MarsHabitatEnv:
     def step(self, pose: Pose) -> None:
         y = self._terrain(pose.x, pose.z)
         set_agent_pose(self._agent, pose.x, y, pose.z, pose.yaw)
+
+    def register_object_mask(
+        self,
+        world_pos: GoalPosition,
+        semantic_id: int,
+        radius: float,
+        out_dir: str,
+        name: str,
+    ):
+        """Register a small flat disc mesh at world_pos as a render-only,
+        non-collidable object carrying `semantic_id`, so the semantic sensor
+        renders a goal/obstacle mask around that point. Mirrors
+        rollout_navdp_policy's place_mesh_goal_obstacle, but seeded from an
+        already-backprojected world point (goal_geometry.bbox_to_world)
+        instead of a raw pixel + depth patch. Requires with_semantic=True.
+        """
+        verts, faces = disc_mesh(world_pos, radius)
+        mesh_dir = Path(out_dir) / "masks"
+        mesh_dir.mkdir(parents=True, exist_ok=True)
+        mesh_path = str(mesh_dir / f"{name}.obj")
+        _save_obj(mesh_path, verts, faces)
+        return register_semantic_mesh(self._sim, mesh_path, semantic_id)
 
 
 if __name__ == "__main__":

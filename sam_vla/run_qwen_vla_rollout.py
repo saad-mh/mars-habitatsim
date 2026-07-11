@@ -1,14 +1,34 @@
 import argparse
+import math
+import time, datetime
 from pathlib import Path
 
+from rollout_navdp_policy import MESH_GOAL_ID, MESH_OBST_ID
 from sam_vla.env.habitat_env import HFOV_DEG, MarsHabitatEnv
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
 from sam_vla.goal_resolution import first_frame_resolver
 from sam_vla.policy.qwen_vla_policy import QwenVlaPolicy
 from sam_vla.safety.safety_filter import filter as safety_filter_fn
-from sam_vla.core.goal_geometry import backproject_goal_position, distance_to_goal
+from sam_vla.core.goal_geometry import backproject_goal_position, bbox_to_world, distance_to_goal
 from sam_vla.core.pose_integrator import integrate_mars
 from sam_vla.logging.rollout_logger import RolloutLogger
+
+
+def register_goal_obstacle_masks(env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir):
+    """Give the chosen goal object a goal-mask mesh and every other detected
+    object an obstacle-mask mesh, each a disc of `obj_mask_radius` around its
+    bbox's backprojected world coords. The rest of the scene is untouched."""
+    if goal_position is not None:
+        env.register_object_mask(goal_position, MESH_GOAL_ID, obj_mask_radius, out_dir, "goal")
+    else:
+        print("[WARN] goal bbox had no valid depth; skipping goal mask", flush=True)
+
+    for i, obstacle_bbox in enumerate(goal_spec.obstacle_bboxes_norm):
+        obstacle_position = bbox_to_world(obs0, obstacle_bbox, hfov_deg=HFOV_DEG)
+        if obstacle_position is None:
+            print(f"[WARN] obstacle[{i}] bbox had no valid depth; skipping obstacle mask", flush=True)
+            continue
+        env.register_object_mask(obstacle_position, MESH_OBST_ID, obj_mask_radius, out_dir, f"obstacle_{i}")
 
 
 def run(
@@ -20,16 +40,33 @@ def run(
     save_video: bool = False,
     save_frames: bool = False,
     video_fps: int = 10,
+    start_x: float = 0.0,
+    start_z: float = 8.0,
+    start_yaw_deg: float = 0.0,
+    randomize_spawn: bool = False,
+    obj_mask_radius: float = 0.5,
 ) -> None:
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
     qwen_manager = QwenServerManager()
     logger = RolloutLogger()
 
-    with MarsHabitatEnv(scene_path, heightmap_path, services=[qwen_manager]) as env:
+    with MarsHabitatEnv(
+        scene_path,
+        heightmap_path,
+        services=[qwen_manager],
+        start_x=start_x,
+        start_z=start_z,
+        start_yaw=math.radians(start_yaw_deg),
+        randomize_spawn=randomize_spawn,
+        with_semantic=True,
+    ) as env:
         obs0 = env.get_observation(frame_idx=0)
         goal_spec, goal_vlm_result = first_frame_resolver.resolve_verbose(obs0.rgb)
         goal_position = backproject_goal_position(obs0, goal_spec, hfov_deg=HFOV_DEG)
         logger.log_goal_resolution(goal_spec, goal_vlm_result, goal_position)
         print(f"resolved goal_spec: {goal_spec.instruction_text} | goal_position={goal_position}")
+        register_goal_obstacle_masks(env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir)
 
         policy = QwenVlaPolicy()
 
@@ -65,12 +102,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--scene-path", required=True)
     parser.add_argument("--heightmap-path", required=True)
-    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--out-dir", default=f"vla_rollout{datetime.datetime.now().strftime('%d%m%y%H%M')}")
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--dt", type=float, default=0.1)
     parser.add_argument("--save-video", action="store_true", help="Save rollout.mp4 from logged RGB frames")
     parser.add_argument("--save-frames", action="store_true", help="Save individual PNG frames under out_dir/frames/")
     parser.add_argument("--video-fps", type=int, default=10)
+    parser.add_argument("--start-x", type=float, default=0.0, help="Rover spawn x coordinate")
+    parser.add_argument("--start-z", type=float, default=8.0, help="Rover spawn z coordinate")
+    parser.add_argument("--start-yaw", type=float, default=0.0, help="Rover spawn yaw in degrees")
+    parser.add_argument(
+        "--randomise-spawn",
+        action="store_true",
+        help="Ignore --start-x/--start-z/--start-yaw and pick a random (x, z) spawn within the "
+        "heightmap bounds, with height sampled from the heightmap",
+    )
+    parser.add_argument(
+        "--obj-mask-radius",
+        type=float,
+        default=0.5,
+        help="Radius (m) of the goal/obstacle mask mesh placed around each detected object's "
+        "backprojected world coords",
+    )
     args = parser.parse_args()
 
     run(
@@ -82,4 +135,9 @@ if __name__ == "__main__":
         save_video=args.save_video,
         save_frames=args.save_frames,
         video_fps=args.video_fps,
+        start_x=args.start_x,
+        start_z=args.start_z,
+        start_yaw_deg=args.start_yaw,
+        randomize_spawn=args.randomize_spawn,
+        obj_mask_radius=args.obj_mask_radius,
     )
