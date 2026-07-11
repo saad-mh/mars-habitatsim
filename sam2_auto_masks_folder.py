@@ -15,8 +15,14 @@ from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 DEFAULT_INPUT_DIR = "mars_teleop_out"
 DEFAULT_OUTPUT_DIR = "sam2_out"
 
+# SAM2_ROOT overrides where the separate sam2 package + checkpoints live,
+# since that install is shared across projects and isn't part of this repo.
+DEFAULT_SAM2_ROOT = os.environ.get(
+    "SAM2_ROOT", "/home/nahar/Desktop/pineapple/packages/sam2"
+)
+
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
-DEFAULT_CHECKPOINT = "/home/nahar/Desktop/pineapple/packages/sam2/checkpoints/sam2.1_hiera_tiny.pt"
+DEFAULT_CHECKPOINT = "checkpoints/sam2.1_hiera_tiny.pt"
 
 POINTS_PER_SIDE = 32
 PRED_IOU_THRESH = 0.88
@@ -98,8 +104,8 @@ def main():
 
     parser.add_argument(
         "--sam2-root",
-        default=os.path.expanduser("/home/nahar/Desktop/pineapple/packages/sam2"),
-        help="self explanatory?",
+        default=os.path.expanduser(DEFAULT_SAM2_ROOT),
+        help="Root of the sam2 package + checkpoints install. Overridable via the SAM2_ROOT env var.",
     )
 
     parser.add_argument(
@@ -212,5 +218,5 @@ if __name__ == "__main__":
     main()
 
 '''
-ausage: python sam2_auto_masks_folder.py --input mars_teleop_out1783002646 --output sam2_test_out --sam2-root ~/Desktop/pineapple/sam2 --model-cfg configs/sam2.1/sam2.1_hiera_t.yaml --checkpoint /home/nahar/Desktop/pineapple/packages/sam2/checkpoints/sam2.1_hiera_tiny.pt --max-frames 5
+ausage: python sam2_auto_masks_folder.py --input mars_teleop_out1783002646 --output sam2_test_out --sam2-root ~/Desktop/pineapple/sam2 --model-cfg configs/sam2.1/sam2.1_hiera_t.yaml --checkpoint checkpoints/sam2.1_hiera_tiny.pt --max-frames 5
 '''

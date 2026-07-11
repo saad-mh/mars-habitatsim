@@ -2,6 +2,7 @@ import os
 import shutil
 import socket
 import time
+from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw
@@ -11,8 +12,10 @@ import habitat_sim
 from habitat_sim.agent import AgentConfiguration
 import quaternion
 
-SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/marsyard2022_tri.glb"
-HEIGHTMAP = "/home/nahar/Desktop/pineapple/conversion/marsyard2022/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
+HERE = Path(__file__).resolve().parent
+
+SCENE = str(HERE / "marsyard2022_tri.glb")
+HEIGHTMAP = str(HERE / "marsyard2022_terrain_hm.png")
 
 OUT_DIR = f"mars_ht_vel_out{int(time.time())}"
 

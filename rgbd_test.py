@@ -1,12 +1,14 @@
 import os
 import numpy as np
+from pathlib import Path
 from PIL import Image
 
 import habitat_sim
 from habitat_sim.agent import AgentConfiguration
 
+HERE = Path(__file__).resolve().parent
 
-SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/marsyard2022_tri.glb"
+SCENE = str(HERE / "marsyard2022_tri.glb")
 OUT_DIR = "mars_rgbd_test_out"
 
 

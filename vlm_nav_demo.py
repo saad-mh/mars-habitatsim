@@ -8,14 +8,17 @@ import os
 import time
 import subprocess
 import numpy as np
+from pathlib import Path
 from PIL import Image
 import quaternion
 
 import habitat_sim
 from habitat_sim.agent import AgentConfiguration
 
-SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/marsyard2022_tri.glb"
-HEIGHTMAP = "/home/nahar/Desktop/pineapple/conversion/marsyard2022/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
+HERE = Path(__file__).resolve().parent
+
+SCENE = str(HERE / "marsyard2022_tri.glb")
+HEIGHTMAP = str(HERE / "marsyard2022_terrain_hm.png")
 
 OUT_DIR = f"vlm_nav_out_{int(time.time())}"
 

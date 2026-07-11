@@ -23,13 +23,16 @@ from habitat_sim.agent import AgentConfiguration
 from habitat_sim.utils.common import quat_rotate_vector
 
 from vlm_nav_demo import GoToGoalController, DT as NAV_DT, MAX_STEPS as NAV_MAX_STEPS
+from conda_env import resolve_conda_base
 
-SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/marsyard2022_tri.glb"
-HEIGHTMAP = "/home/nahar/Desktop/pineapple/conversion/marsyard2022/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
+HERE = Path(__file__).resolve().parent
 
-OUT_DIR = "vlm_nav_out"
-ANNOTATIONS_DIR = "annotations"
-MASKS_DIR = "masks"
+SCENE = str(HERE / "marsyard2022_tri.glb")
+HEIGHTMAP = str(HERE / "marsyard2022_terrain_hm.png")
+
+OUT_DIR = str(HERE / "vlm_nav_out")
+ANNOTATIONS_DIR = str(HERE / "annotations")
+MASKS_DIR = str(HERE / "masks")
 
 SIZE_X = 50.0
 SIZE_Z = 50.0
@@ -61,12 +64,13 @@ FLIP_HEIGHTMAP_Z = True
 SWAP_HEIGHTMAP_XZ = False
 
 # annotation
-LABELS_FILE = "labels.txt"
-CONDA_BASE = "/home/nahar/miniconda3"
+LABELS_FILE = str(HERE / "labels.txt")
+
+CONDA_BASE = resolve_conda_base()
 LABELME_BIN = f"{CONDA_BASE}/envs/annotate/bin/labelme"
 
 VLM_PYTHON_BIN = f"{CONDA_BASE}/envs/qwen_vlm/bin/python"
-VLM_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_query.py")
+VLM_SCRIPT = str(HERE / "vlm_query.py")
 VLM_PROMPT = """You must output ONLY valid JSON with no other text.
 
 1. Goal Object: Identify the single most scientifically significant detected object (can be rock or sand). This is your primary target.

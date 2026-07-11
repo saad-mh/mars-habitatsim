@@ -1,12 +1,14 @@
 import os
 import numpy as np
+from pathlib import Path
 from PIL import Image
 
 import habitat_sim
 from habitat_sim.agent import AgentConfiguration, ActionSpec, ActuationSpec
 
+HERE = Path(__file__).resolve().parent
 
-SCENE = "data/scene_datasets/habitat-test-scenes/skokloster-castle.glb"
+SCENE = str(HERE / "marsyard2022_tri.glb")
 OUT_DIR = "round1_outputs"
 
 

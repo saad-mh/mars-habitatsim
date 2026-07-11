@@ -2,6 +2,7 @@ import os
 import time
 import shutil
 import numpy as np
+from pathlib import Path
 from PIL import Image, ImageTk, ImageDraw
 
 import tkinter as tk
@@ -10,10 +11,10 @@ import habitat_sim
 from habitat_sim.agent import AgentConfiguration
 import quaternion
 
+HERE = Path(__file__).resolve().parent
 
-
-SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/assets/marsyard2022.glb"
-HEIGHTMAP = "/home/nahar/mars_rover_ws/leo_simulator-ros2/leo_gz_worlds/models/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
+SCENE = str(HERE / "assets" / "marsyard2022.glb")
+HEIGHTMAP = str(HERE / "marsyard2022_terrain_hm.png")
 
 OUT_DIR = f"mars_teleop_out{int(time.time())}"
 

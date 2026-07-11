@@ -13,6 +13,11 @@ import os
 import sys
 import subprocess
 import json
+from pathlib import Path
+
+from conda_env import resolve_conda_base
+
+HERE = Path(__file__).resolve().parent
 
 def check(description, condition):
     """Print a check result."""
@@ -32,13 +37,13 @@ def main():
     print("FILE CHECKS:")
     print("-" * 70)
 
-    scene = "/home/nahar/Desktop/pineapple/marsHabitat/marsyard2022_tri.glb"
+    scene = str(HERE / "marsyard2022_tri.glb")
     all_pass &= check("Scene file (marsyard2022_tri.glb)", os.path.exists(scene))
 
-    hm = "/home/nahar/Desktop/pineapple/conversion/marsyard2022/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
+    hm = str(HERE / "marsyard2022_terrain_hm.png")
     all_pass &= check("Heightmap file", os.path.exists(hm))
 
-    labels = os.path.join(os.path.dirname(__file__), "labels.txt")
+    labels = str(HERE / "labels.txt")
     all_pass &= check("Labels file (labels.txt)", os.path.exists(labels))
 
     if os.path.exists(labels):
@@ -53,10 +58,18 @@ def main():
     print("LABELME CHECKS:")
     print("-" * 70)
 
-    labelme_bin = "/home/nahar/miniconda3/envs/annotate/bin/labelme"
-    all_pass &= check("Labelme binary exists", os.path.exists(labelme_bin))
+    try:
+        conda_base = resolve_conda_base()
+        labelme_bin = f"{conda_base}/envs/annotate/bin/labelme"
+    except RuntimeError as e:
+        conda_base = None
+        labelme_bin = None
+        all_pass &= check(f"Locate conda installation ({e})", False)
 
-    if os.path.exists(labelme_bin):
+    if labelme_bin is not None:
+        all_pass &= check("Labelme binary exists", os.path.exists(labelme_bin))
+
+    if labelme_bin is not None and os.path.exists(labelme_bin):
         try:
             result = subprocess.run(
                 [labelme_bin, "--version"],
