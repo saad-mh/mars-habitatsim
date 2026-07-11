@@ -24,6 +24,16 @@ MESH_GOAL_ID = 1
 MESH_OBST_ID = 2
 
 
+def intrinsics_from_hfov(height: int, width: int, hfov_deg: float) -> dict[str, float]:
+    """Pinhole intrinsics (fx, fy, cx, cy) for a symmetric camera with the given
+    horizontal FOV -- shared by every module that needs to unproject a pixel or
+    mask through depth (belief_tracking.mask_to_body, the CBF's nearest-obstacle
+    lookup, ...), so they all agree on the same camera model as bbox_to_world below.
+    """
+    fx = (width * 0.5) / max(math.tan(math.radians(float(hfov_deg)) * 0.5), 1e-6)
+    return {"fx": fx, "fy": fx, "cx": (width - 1) * 0.5, "cy": (height - 1) * 0.5}
+
+
 def bbox_to_world(
     obs: Observation, bbox_norm: tuple[float, float, float, float], hfov_deg: float
 ) -> GoalPosition | None:
@@ -116,6 +126,15 @@ def goal_pixel_center(
     the given frame's resolution."""
     x0, y0, x1, y1 = goal_bbox_norm
     return (int(0.5 * (x0 + x1) * width), int(0.5 * (y0 + y1) * height))
+
+
+def mask_pixel_center(mask: np.ndarray) -> tuple[int, int] | None:
+    """Pixel coords of a live rendered mask's centroid (mirrors mask_to_body's
+    `u = xs.mean()` bearing pixel), or None if the mask is empty this frame."""
+    ys, xs = np.where(np.asarray(mask) > 0)
+    if xs.size == 0:
+        return None
+    return (int(xs.mean()), int(ys.mean()))
 
 
 if __name__ == "__main__":
