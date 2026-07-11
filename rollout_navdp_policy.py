@@ -23,8 +23,8 @@ import qwen_vlm_client
 
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_SCENE = HERE / "marsyard2022_tri.glb"
-DEFAULT_OBJ = HERE / "marsyard2022.obj"
+DEFAULT_SCENE = HERE / "assets/marsyard2022.glb"
+DEFAULT_OBJ = HERE / "assets/marsyard2022.obj"
 
 QWEN_STEER_PROMPT = (
     "You are piloting a rover approaching its goal. Looking at this view, should the rover "
