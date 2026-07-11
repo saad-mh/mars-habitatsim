@@ -5,8 +5,9 @@ from typing import Optional
 
 import numpy as np
 
-from sam_vla.core.goal_geometry import GoalPosition, distance_to_goal
-from sam_vla.core.types import Action, GoalSpec, Observation, Pose
+from sam_vla.core.goal_geometry import GoalPosition
+from sam_vla.core.types import Action, Detection, GoalSpec, Observation, Pose
+from sam_vla.env.sim_utils import distance_to_goal
 
 
 def _now_iso() -> str:
@@ -16,6 +17,7 @@ def _now_iso() -> str:
 class RolloutLogger:
     def __init__(self):
         self._rgb_frames = []
+        self._vis_frames = []
         self._poses = []
         self._actions = []
         self._frame_indices = []
@@ -46,7 +48,12 @@ class RolloutLogger:
         action: Action,
         pose: Pose,
         vla_result: Optional[dict] = None,
+        vis_rgb: Optional[np.ndarray] = None,
     ) -> None:
+        """vis_rgb, if given, is the goal/obstacle-overlaid version of obs.rgb
+        (see perception.semantic_overlay.overlay_semantic_masks) for the same
+        step -- used in place of the raw frame by save_frames/save_video so the
+        dumped video shows what the rover's mask-conditioned policy is seeing."""
         rgb = np.asarray(obs.rgb, dtype=np.uint8)
         pose_tuple = (pose.x, pose.y, pose.z, pose.yaw)
         action_tuple = (action.v_fwd, action.v_lat, action.yaw_rate)
@@ -59,6 +66,8 @@ class RolloutLogger:
         )
 
         self._rgb_frames.append(rgb)
+        if vis_rgb is not None:
+            self._vis_frames.append(np.asarray(vis_rgb, dtype=np.uint8))
         self._poses.append(pose_tuple)
         self._actions.append(action_tuple)
         self._frame_indices.append(obs.frame_idx)
@@ -102,29 +111,87 @@ class RolloutLogger:
             f"{npz_path}, {manifest_path}"
         )
 
+    def save_sam_first_frame(
+        self,
+        rgb: np.ndarray,
+        detections: list[Detection],
+        goal_spec: GoalSpec,
+        out_dir: str,
+    ) -> None:
+        """Save the raw first frame and a SAM-annotated copy (all detection boxes
+        in red, the VLM-chosen goal box in green) to out_dir."""
+        import cv2
+        import imageio.v3 as iio
+
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        rgb = np.asarray(rgb, dtype=np.uint8)
+        iio.imwrite(out_path / "first_frame.png", rgb)
+
+        height, width = rgb.shape[:2]
+        annotated = rgb.copy()
+        for det in detections:
+            x0, y0, x1, y1 = det.bbox_norm
+            pt0 = (int(x0 * width), int(y0 * height))
+            pt1 = (int(x1 * width), int(y1 * height))
+            cv2.rectangle(annotated, pt0, pt1, (255, 0, 0), 2)
+            label = f"{det.class_name} {det.confidence:.2f}"
+            cv2.putText(
+                annotated, label, (pt0[0], max(pt0[1] - 5, 0)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA,
+            )
+
+        gx0, gy0, gx1, gy1 = goal_spec.goal_bbox_norm
+        gpt0 = (int(gx0 * width), int(gy0 * height))
+        gpt1 = (int(gx1 * width), int(gy1 * height))
+        cv2.rectangle(annotated, gpt0, gpt1, (0, 255, 0), 3)
+        cv2.putText(
+            annotated, "GOAL", (gpt0[0], max(gpt0[1] - 5, 0)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA,
+        )
+
+        annotated_path = out_path / "first_frame_annotated.png"
+        iio.imwrite(annotated_path, annotated)
+        print(
+            f"RolloutLogger: saved first frame + SAM-annotated frame "
+            f"({len(detections)} detections) -> {out_path / 'first_frame.png'}, {annotated_path}"
+        )
+
+    def _output_frames(self) -> list:
+        """Goal/obstacle-overlaid frames if every step logged one, else the raw
+        RGB frames (e.g. for rollouts that never pass vis_rgb to log_step)."""
+        if len(self._vis_frames) == len(self._rgb_frames):
+            return self._vis_frames
+        return self._rgb_frames
+
     def save_frames(self, out_dir: str) -> None:
-        """Dump each logged RGB frame as a PNG (frame_<frame_idx>.png)."""
+        """Dump each logged frame (goal/obstacle-overlaid if available) as a
+        PNG (frame_<frame_idx>.png)."""
         import imageio.v3 as iio
 
         frames_dir = Path(out_dir) / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
 
-        for frame_idx, rgb in zip(self._frame_indices, self._rgb_frames):
+        frames = self._output_frames()
+        for frame_idx, rgb in zip(self._frame_indices, frames):
             iio.imwrite(frames_dir / f"frame_{frame_idx:06d}.png", rgb)
 
-        print(f"RolloutLogger: saved {len(self._rgb_frames)} frames -> {frames_dir}")
+        print(f"RolloutLogger: saved {len(frames)} frames -> {frames_dir}")
 
     def save_video(self, out_dir: str, fps: int = 10) -> None:
-        """Encode the logged RGB frames into rollout.mp4 (imageio + ffmpeg backend)."""
+        """Encode the logged frames (goal/obstacle-overlaid if available) into
+        rollout.mp4 (imageio + ffmpeg backend)."""
         import imageio.v3 as iio
 
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         video_path = out_path / "rollout.mp4"
 
-        iio.imwrite(video_path, np.stack(self._rgb_frames), fps=fps, codec="libx264")
+        frames = self._output_frames()
+        iio.imwrite(video_path, np.stack(frames), fps=fps, codec="libx264")
 
-        print(f"RolloutLogger: saved video ({len(self._rgb_frames)} frames @ {fps}fps) -> {video_path}")
+        print(f"RolloutLogger: saved video ({len(frames)} frames @ {fps}fps) -> {video_path}")
 
 
 if __name__ == "__main__":

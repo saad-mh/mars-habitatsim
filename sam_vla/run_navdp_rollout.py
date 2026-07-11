@@ -7,7 +7,7 @@ from sam_vla.env.habitat_env import HFOV_DEG, MarsHabitatEnv
 from sam_vla.env.sim_utils import distance_to_goal
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
 from sam_vla.goal_resolution import first_frame_resolver
-from sam_vla.policy.qwen_discrete_direction_policy import QwenDiscreteDirectionPolicy
+from sam_vla.policy.navdp_policy import NavdpPolicy
 from sam_vla.safety.safety_filter import filter as safety_filter_fn
 from sam_vla.core.goal_geometry import (
     MESH_GOAL_ID,
@@ -41,7 +41,11 @@ def register_goal_obstacle_masks(env, obs0, goal_spec, goal_position, obj_mask_r
 def run(
     scene_path: str,
     heightmap_path: str,
+    ckpt_path: str,
     out_dir: str,
+    navdp_root: str = None,
+    device: str = "cuda",
+    sample_steps: int = 20,
     max_steps: int = 500,
     dt: float = 0.1,
     save_video: bool = False,
@@ -55,6 +59,9 @@ def run(
 ) -> None:
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
+    # Still needed for the one-shot first-frame goal selection below
+    # (first_frame_resolver -> qwen_client.select_goal_verbose); the driving
+    # loop itself no longer calls the VLM per frame -- NavdpPolicy drives.
     qwen_manager = QwenServerManager()
     logger = RolloutLogger()
 
@@ -76,24 +83,37 @@ def run(
         print(f"resolved goal_spec: {goal_spec.instruction_text} | goal_position={goal_position}")
         register_goal_obstacle_masks(env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir)
 
-        policy = QwenDiscreteDirectionPolicy()
+        # <-- policy plugged in here: NavdpPolicy replaces QwenDiscreteDirectionPolicy.
+        # Same act_verbose(..., goal_spec, step) -> (Action, dict) shape as the VLA
+        # policy it swaps out; see the loop below for the call site.
+        policy = NavdpPolicy(
+            ckpt_path=ckpt_path,
+            navdp_root=navdp_root,
+            device=device,
+            sample_steps=sample_steps,
+        )
 
         for step in range(max_steps):
             obs = env.get_observation(frame_idx=step)
             semantic = env.get_semantic_frame()
-            raw_action, vla_result = policy.act_verbose(obs.rgb, semantic, goal_spec, step)
+            raw_action, vla_result = policy.act_verbose(obs, semantic, goal_spec, step)
             action = safety_filter_fn(raw_action, obs)
             new_pose = integrate_mars(obs.pose, action, dt)
             env.step(new_pose)
-            vis_rgb = overlay_semantic_masks(obs.rgb, semantic)
+            dist = (
+                distance_to_goal(new_pose, goal_position)
+                if goal_position is not None
+                else None
+            )
+            dist_txt = f"{dist:.2f}m" if dist is not None else "n/a"
+            overlay_text = (
+                f"t={step} dist={dist_txt} "
+                f"v=[{action.v_fwd:.2f},{action.v_lat:.2f}] yaw_rate={action.yaw_rate:.2f}"
+            )
+            vis_rgb = overlay_semantic_masks(obs.rgb, semantic, text=overlay_text)
             logger.log_step(obs, action, new_pose, vla_result=vla_result, vis_rgb=vis_rgb)
 
             if step % 10 == 0:
-                dist = (
-                    distance_to_goal(new_pose, goal_position)
-                    if goal_position is not None
-                    else None
-                )
                 height, width = obs.rgb.shape[:2]
                 goal_pixel = goal_pixel_center(goal_spec.goal_bbox_norm, width, height)
                 print(
@@ -114,7 +134,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--scene-path", required=True)
     parser.add_argument("--heightmap-path", required=True)
-    parser.add_argument("--out-dir", default=f"vla_rollout{datetime.datetime.now().strftime('%d%m%y%H%M')}")
+    parser.add_argument("--ckpt", required=True, help="Path to trained NavDP/S2DiT checkpoint")
+    parser.add_argument("--navdp-root", default=None, help="Path to the navdp repo (default: ./navdp or $NAVDP_ROOT)")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--sample-steps", type=int, default=20)
+    parser.add_argument("--out-dir", default=f"navdp_rollout{datetime.datetime.now().strftime('%d%m%y%H%M')}")
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--dt", type=float, default=0.1)
     parser.add_argument("--save-video", action="store_true", help="Save rollout.mp4 from logged RGB frames")
@@ -141,7 +165,11 @@ if __name__ == "__main__":
     run(
         scene_path=args.scene_path,
         heightmap_path=args.heightmap_path,
+        ckpt_path=args.ckpt,
         out_dir=args.out_dir,
+        navdp_root=args.navdp_root,
+        device=args.device,
+        sample_steps=args.sample_steps,
         max_steps=args.max_steps,
         dt=args.dt,
         save_video=args.save_video,

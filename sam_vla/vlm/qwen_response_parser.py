@@ -35,6 +35,24 @@ def parse_select_goal_response(raw_text: str) -> dict:
     return parsed
 
 
+DIRECTIONS = ("forward", "turn_left", "turn_right")
+
+
+def parse_direction_response(raw_text: str) -> dict:
+    """Parse a discrete-direction response (build_direction_prompt), validating
+    that 'direction' is one of DIRECTIONS rather than an arbitrary continuous
+    action."""
+    parsed = _load_json_object(raw_text)
+
+    direction = parsed.get("direction")
+    if not isinstance(direction, str) or direction not in DIRECTIONS:
+        raise ValueError(
+            f"Missing or invalid 'direction' in response (expected one of "
+            f"{DIRECTIONS})\nraw_text={raw_text!r}"
+        )
+    return parsed
+
+
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
@@ -72,5 +90,14 @@ if __name__ == "__main__":
     print("\n primitive input:")
     try:
         parse_drive_action_response(malformed)
+    except ValueError as e:
+        print(f"caught ValueError: {e}")
+
+    print("\n parsed direction:")
+    print(parse_direction_response('{"direction": "turn_left", "reasoning": "goal is left"}'))
+
+    print("\n invalid direction:")
+    try:
+        parse_direction_response('{"direction": "spin", "reasoning": "nope"}')
     except ValueError as e:
         print(f"caught ValueError: {e}")

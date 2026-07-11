@@ -13,8 +13,13 @@ from PIL import Image
 
 from sam_vla.vlm.qwen_config import QWEN_SERVER_HOST, QWEN_SERVER_PORT
 from sam_vla.vlm.qwen_model_runner import load_qwen_model, run_qwen_inference
-from sam_vla.vlm.qwen_prompts import build_drive_action_prompt, build_select_goal_prompt
+from sam_vla.vlm.qwen_prompts import (
+    build_direction_prompt,
+    build_drive_action_prompt,
+    build_select_goal_prompt,
+)
 from sam_vla.vlm.qwen_response_parser import (
+    parse_direction_response,
     parse_drive_action_response,
     parse_select_goal_response,
 )
@@ -78,6 +83,19 @@ def _handle_drive_action(model, processor, payload: dict) -> dict:
     }
 
 
+def _handle_drive_direction(model, processor, payload: dict) -> dict:
+    """Same shape as _handle_drive_action, but constrains the response to a
+    single discrete direction (forward/turn_left/turn_right) instead of a
+    free continuous action."""
+    image = _decode_image(payload["image_b64"])
+    instruction_text = payload["instruction_text"]
+    frame_idx = payload["frame_idx"]
+    prompt = build_direction_prompt(instruction_text, frame_idx)
+    raw_text = run_qwen_inference(model, processor, image, prompt)
+    result = parse_direction_response(raw_text)
+    return {"result": result}
+
+
 def _dispatch(model, processor, message: dict) -> dict:
     mode = message.get("mode")
     payload = message.get("payload", {})
@@ -88,6 +106,8 @@ def _dispatch(model, processor, message: dict) -> dict:
         return _handle_select_goal(model, processor, payload)
     if mode == "drive_action":
         return _handle_drive_action(model, processor, payload)
+    if mode == "drive_direction":
+        return _handle_drive_direction(model, processor, payload)
     raise ValueError(f"unknown mode: {mode!r}")
 
 

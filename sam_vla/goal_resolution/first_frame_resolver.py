@@ -30,10 +30,12 @@ def resolve(rgb: np.ndarray) -> GoalSpec:
     return qwen_client.select_goal(rgb, detections)
 
 
-def resolve_verbose(rgb: np.ndarray) -> tuple[GoalSpec, dict]:
-    """Same as resolve, but also returns the raw VLM goal-selection result dict for logging."""
+def resolve_verbose(rgb: np.ndarray) -> tuple[GoalSpec, dict, list[Detection]]:
+    """Same as resolve, but also returns the raw VLM goal-selection result dict and
+    the SAM detections used to produce it, for logging."""
     detections = _detect(rgb)
-    return qwen_client.select_goal_verbose(rgb, detections)
+    goal_spec, vlm_result = qwen_client.select_goal_verbose(rgb, detections)
+    return goal_spec, vlm_result, detections
 
 
 def resolve_from_path(image_path: str) -> GoalSpec:

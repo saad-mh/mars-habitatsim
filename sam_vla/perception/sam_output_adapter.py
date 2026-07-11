@@ -5,8 +5,12 @@ Converts sam_segmenter.segment_frame's raw pixel-space dicts into Detections.
 
 from sam_vla.core.types import Detection
 
+# bigrock is the only discrete-object class the goal/obstacle VLM selection
+# should ever see. bedrock is terrain/background segmentation (its contours
+# can span most of the frame), not a candidate rock - surfacing it here lets
+# the VLM pick a bedrock region as the "goal" or "obstacle", which is wrong.
+# Any class not in this map (bedrock included) is dropped in to_detections.
 _CLASS_MAP = {
-    "bedrock": "obstacle",
     "bigrock": "obstacle",
 }
 
@@ -16,7 +20,9 @@ def to_detections(
 ) -> list[Detection]:
     detections = []
     for raw in raw_detections:
-        class_name = _CLASS_MAP.get(raw["class_name"], raw["class_name"])
+        if raw["class_name"] not in _CLASS_MAP:
+            continue
+        class_name = _CLASS_MAP[raw["class_name"]]
         x0 = raw["x"] / image_width
         y0 = raw["y"] / image_height
         x1 = (raw["x"] + raw["width"]) / image_width

@@ -109,6 +109,15 @@ def distance_to_goal(pose: Pose, goal_position: GoalPosition) -> float:
     return math.sqrt((pose.x - gx) ** 2 + (pose.y - gy) ** 2 + (pose.z - gz) ** 2)
 
 
+def goal_pixel_center(
+    goal_bbox_norm: tuple[float, float, float, float], width: int, height: int
+) -> tuple[int, int]:
+    """Pixel coords of the (first-frame-resolved) goal bbox's center, scaled to
+    the given frame's resolution."""
+    x0, y0, x1, y1 = goal_bbox_norm
+    return (int(0.5 * (x0 + x1) * width), int(0.5 * (y0 + y1) * height))
+
+
 if __name__ == "__main__":
     import numpy as np
 

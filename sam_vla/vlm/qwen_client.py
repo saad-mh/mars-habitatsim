@@ -136,6 +136,31 @@ def drive_action_verbose(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -
     return action, result
 
 
+def _drive_direction_result(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> dict:
+    response = _send_request(
+        "drive_direction",
+        {
+            "image_b64": _encode_image(rgb),
+            "instruction_text": goal_spec.instruction_text,
+            "frame_idx": frame_idx,
+        },
+    )
+    if "error" in response:
+        raise ValueError(f"drive_direction failed: {response['error']}")
+    return response["result"]
+
+
+def drive_direction_verbose(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> tuple[str, dict]:
+    """Query the VLA for a single discrete direction (one of
+    qwen_response_parser.DIRECTIONS) instead of a free continuous action, and
+    return it alongside the raw VLM result dict for logging. `rgb` is expected
+    to already carry the goal/obstacle semantic overlay (see
+    perception.semantic_overlay.overlay_semantic_masks) so the model has the
+    same visual grounding as drive_action would otherwise infer on its own."""
+    result = _drive_direction_result(rgb, goal_spec, frame_idx)
+    return result["direction"], result
+
+
 if __name__ == "__main__":
     import sys
 
@@ -155,3 +180,6 @@ if __name__ == "__main__":
 
     action = drive_action(rgb, goal_spec, frame_idx=0)
     print("drive_action ->", action)
+
+    direction, result = drive_direction_verbose(rgb, goal_spec, frame_idx=0)
+    print("drive_direction_verbose ->", direction, result)

@@ -12,6 +12,8 @@ import numpy as np
 import quaternion
 import habitat_sim
 
+from sam_vla.core.types import Pose
+
 
 def make_sensor(uuid: str, sensor_type, height: int, width: int, hfov_deg: float):
     spec = habitat_sim.CameraSensorSpec()
@@ -47,6 +49,14 @@ def save_obj(path: str, verts: np.ndarray, faces: np.ndarray) -> None:
             f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
         for a, b, c in faces:
             f.write(f"f {a + 1} {b + 1} {c + 1}\n")
+
+
+def distance_to_goal(pose: Pose, goal_position: Tuple[float, float, float]) -> float:
+    """Planar (x-z) distance from `pose` to `goal_position`, ignoring elevation --
+    mirrors rollout_navdp_policy's `goal_dist_now` (terrain height makes the y
+    component noisy/uninformative for a ground rover)."""
+    gx, _gy, gz = goal_position
+    return float(np.linalg.norm(np.asarray([pose.x - gx, pose.z - gz], dtype=np.float32)))
 
 
 def register_semantic_mesh(sim, mesh_path: str, semantic_id: int):

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import habitat_sim
+import numpy as np
 import quaternion
 from habitat_sim.agent import AgentConfiguration
 
@@ -19,7 +20,7 @@ RGB_WIDTH = 640
 HFOV_DEG = 90.0
 DEPTH_MAX_RANGE_M = 10.0
 
-SPAWN_CLEARANCE_M = 1.4
+SPAWN_CLEARANCE_M = 1.8
 SPAWN_TERRAIN_RADIUS_M = 0.8
 
 
@@ -32,7 +33,7 @@ class MarsHabitatEnv:
         start_x: float = 0.0,
         start_z: float = 8.0,
         start_yaw: float = 0.0,
-        randomize_spawn: bool = False,
+        randomise_spawn: bool = False,
         spawn_clearance: float = SPAWN_CLEARANCE_M,
         spawn_terrain_radius: float = SPAWN_TERRAIN_RADIUS_M,
         with_semantic: bool = False,
@@ -48,7 +49,7 @@ class MarsHabitatEnv:
         self._start_x = start_x
         self._start_z = start_z
         self._start_yaw = start_yaw
-        self._randomize_spawn = randomize_spawn
+        self._randomise_spawn = randomise_spawn
         self._spawn_clearance = spawn_clearance
         self._spawn_terrain_radius = spawn_terrain_radius
         self._with_semantic = with_semantic
@@ -86,7 +87,7 @@ class MarsHabitatEnv:
         )
         self._terrain = Terrain(heightmap_grid, flip_x=False, flip_z=True, swap_xz=False)
 
-        if self._randomize_spawn:
+        if self._randomise_spawn:
             x = random.uniform(-SIZE_X / 2.0, SIZE_X / 2.0)
             z = random.uniform(-SIZE_Z / 2.0, SIZE_Z / 2.0)
             yaw = random.uniform(0.0, 2.0 * 3.141592653589793)
@@ -119,8 +120,19 @@ class MarsHabitatEnv:
         pose = Pose(x=x, y=float(state.position[1]), z=z, yaw=yaw)
         return Observation(rgb=rgb, depth=depth, pose=pose, frame_idx=frame_idx)
 
+    def get_semantic_frame(self) -> np.ndarray:
+        """Raw per-pixel semantic-id image (H, W) from the semantic sensor:
+        each pixel holds the semantic_id of whatever registered mask mesh is
+        rendered there (see register_object_mask / goal_geometry.MESH_GOAL_ID
+        / MESH_OBST_ID), 0 elsewhere. Requires with_semantic=True."""
+        obs = self._sim.get_sensor_observations()
+        return np.asarray(obs["semantic"])
+
     def step(self, pose: Pose) -> None:
-        y = self._terrain(pose.x, pose.z)
+        # Match spawn's ground offset (local-max + clearance), not a raw single-point
+        # sample, or the agent snaps to bare terrain height every step and clips into
+        # the surface.
+        y = self.get_height_at_xz(pose.x, pose.z)
         set_agent_pose(self._agent, pose.x, y, pose.z, pose.yaw)
 
     def register_object_mask(

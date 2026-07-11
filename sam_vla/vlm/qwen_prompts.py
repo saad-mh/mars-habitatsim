@@ -44,6 +44,32 @@ def build_drive_action_prompt(instruction_text: str, frame_idx: int) -> str:
     )
 
 
+def build_direction_prompt(instruction_text: str, frame_idx: int) -> str:
+    """Same intent as build_drive_action_prompt, but constrains the model to a
+    single discrete steering choice instead of a free continuous action. The
+    goal region is overlaid in green and obstacle regions in red directly on
+    the image (see perception.semantic_overlay), so the instruction leans on
+    those overlays rather than the raw scene."""
+    return (
+        "You are the driving policy for a Mars rover. The image is the "
+        f"rover's current camera frame (frame {frame_idx}). The navigation "
+        "goal is highlighted with a GREEN overlay and known obstacles are "
+        "highlighted with a RED overlay.\n\n"
+        f"Navigation instruction: {instruction_text}\n\n"
+        "Choose exactly ONE discrete direction for the rover's next move:\n"
+        '  "forward"    - drive straight ahead\n'
+        '  "turn_left"  - steer left\n'
+        '  "turn_right" - steer right\n\n'
+        "Pick whichever direction makes the most progress toward the green "
+        "goal region while steering clear of any red obstacle regions. Do "
+        "not output speeds or turn rates, only the discrete direction.\n\n"
+        "Respond with ONLY a JSON object, no other text, in this exact "
+        "format:\n"
+        '{"direction": <"forward" | "turn_left" | "turn_right">, '
+        '"reasoning": <str>}'
+    )
+
+
 if __name__ == "__main__":
     dummy_detections = [
         {"class_name": "rock", "bbox_norm": [0.12, 0.30, 0.28, 0.55], "confidence": 0.91},
@@ -56,3 +82,6 @@ if __name__ == "__main__":
     print()
     print("=== build_drive_action_prompt ===")
     print(build_drive_action_prompt("Drive toward the large rock cluster ahead.", 42))
+    print()
+    print("=== build_direction_prompt ===")
+    print(build_direction_prompt("Drive toward the large rock cluster ahead.", 42))
