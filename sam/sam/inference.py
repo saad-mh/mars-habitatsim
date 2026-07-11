@@ -117,6 +117,49 @@ def draw_bounding_boxes(image: np.ndarray, boxes: List[Dict], class_id: int) -> 
     return image
 
 
+def run_inference_on_frame(frame: np.ndarray, model: nn.Module | None = None) -> Dict[str, List[Dict]]:
+    """
+    Run SAM2 multiclass segmentation on a single BGR frame and extract
+    bedrock/bigrock bounding boxes. Same per-frame pipeline as
+    process_video's loop body (resize to IMAGE_SIZE, preprocess, argmax,
+    resize back to the frame's original size, filter to bedrock/bigrock,
+    contour -> bbox), factored out for single-image callers.
+
+    Args:
+        frame: (H, W, 3) BGR image, e.g. from cv2.imread/cv2.VideoCapture.
+        model: preloaded SAM2 model; loaded fresh via load_best_model() if None.
+
+    Returns:
+        {'bedrock': [...], 'bigrock': [...]} bounding box dicts (see
+        extract_bounding_boxes).
+    """
+    if model is None:
+        model = load_best_model()
+        model.eval()
+
+    original_shape = frame.shape
+    height, width = original_shape[:2]
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_resized = cv2.resize(frame_rgb, (IMAGE_SIZE, IMAGE_SIZE))
+    frame_bgr_resized = cv2.cvtColor(frame_resized, cv2.COLOR_RGB2BGR)
+
+    img_tensor = preprocess_image_for_model(frame_bgr_resized)
+
+    with torch.no_grad():
+        inp = img_tensor.unsqueeze(0).to(DEVICE)
+        logits = model(inp)
+        pred = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.int64)
+
+    pred_resized = cv2.resize(pred, (width, height), interpolation=cv2.INTER_NEAREST)
+    filtered_mask = create_filtered_mask(pred_resized, original_shape)
+
+    return {
+        'bedrock': extract_bounding_boxes(filtered_mask, BEDROCK_CLASS),
+        'bigrock': extract_bounding_boxes(filtered_mask, BIGROCK_CLASS),
+    }
+
+
 def process_video(
     video_path: str,
     output_dir: str,
@@ -158,7 +201,7 @@ def process_video(
     print()
     
     # Load model
-    print("Loading SAM2 model...")
+    print("Loading SAM2 model.")
     model = load_best_model()
     model.eval()
     print("Model loaded successfully.\n")
