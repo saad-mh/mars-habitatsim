@@ -20,5 +20,5 @@ marsyard2022_tri.glb
 .DS_Store
 
 *.pth
-
+*.md
 .venv
