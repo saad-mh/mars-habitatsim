@@ -6,9 +6,9 @@ import habitat_sim
 from habitat_sim.agent import AgentConfiguration
 
 
-SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/marsyard2022_tri.glb"
+SCENE = "/home/nahar/Desktop/pineapple/marsHabitat/assets/marsyard2022.glb"
 
-HEIGHTMAP = "/home/nahar/Desktop/pineapple/conversion/marsyard2022/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
+HEIGHTMAP = "/home/nahar/mars_rover_ws/leo_simulator-ros2/leo_gz_worlds/models/marsyard2022_terrain/dem/marsyard2022_terrain_hm.png"
 
 OUT_DIR = "mars_follow_terrain_out"
 
