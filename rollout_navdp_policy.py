@@ -724,13 +724,24 @@ def main() -> None:
     ap.add_argument("--goal-x", type=float, default=None, help="World goal X (required unless --goal-mesh-uv/--goal-from-vlm).")
     ap.add_argument("--goal-z", type=float, default=None, help="World goal Z (required unless --goal-mesh-uv/--goal-from-vlm).")
     ap.add_argument("--goal-from-vlm", action="store_true",
-                    help="BELIEF-tracked goal (mode b), sourced from vlm_nav_interactive's VLM object "
-                         "selection on an already-captured+annotated frame: the selected bbox seeds the "
+                    help="BELIEF-tracked goal (mode b): resolve a VLM object selection and seed the "
                          "belief via the same grounder pixel path as --grounder stub/qwen (implies "
-                         "--belief-goal). The resolved world position is kept only as a logging/"
-                         "success-metric reference, like --goal-bearing-deg -- never fed to control.")
+                         "--belief-goal). DEFAULT: the frame is captured LIVE from this rollout's own "
+                         "start pose and auto-annotated with SAM -- no pre-existing files needed. Pass "
+                         "--manual-annotate to instead use a pre-existing, already-annotated frame from "
+                         "vlm_nav_interactive's capture session. The resolved world position is kept "
+                         "only as a logging/success-metric reference, like --goal-bearing-deg -- never "
+                         "fed to control.")
+    ap.add_argument("--manual-annotate", action="store_true",
+                    help="With --goal-from-vlm: use a pre-existing, manually labelme-annotated frame "
+                         "(vlm_nav_interactive's OUT_DIR/ANNOTATIONS_DIR, keyed by --vlm-frame-idx) "
+                         "instead of the default live-capture+SAM path. Warns if --start-x/z/yaw-deg "
+                         "differ from the pose that frame was captured at, since the annotated bbox is "
+                         "a fixed pixel fraction only valid for that pose.")
     ap.add_argument("--vlm-frame-idx", type=int, default=0,
-                    help="Captured+annotated frame index to run the VLM selection on (with --goal-from-vlm).")
+                    help="Frame index for --goal-from-vlm. With --manual-annotate, selects the "
+                         "pre-captured/annotated frame to load; by default (SAM live-capture), it "
+                         "just names the live-captured frame's output/annotation files.")
     ap.add_argument("--goal-y", type=float, default=None, help="World Y of goal marker; default terrain height + goal-height")
     ap.add_argument("--goal-height", type=float, default=1.2, help="Goal marker height above terrain when --goal-y is omitted")
     ap.add_argument("--goal-terrain-radius", type=float, default=0.8, help="Raise ghost goal from local max terrain height in this radius")
@@ -866,6 +877,7 @@ def main() -> None:
             START_Z as VLM_START_Z,
             START_YAW_DEG as VLM_START_YAW_DEG,
             resolve_vlm_selection,
+            save_pose as vlm_save_pose,
         )
 
     out_dir = Path(args.out).expanduser().resolve()
@@ -942,31 +954,6 @@ def main() -> None:
         print(f"[VLA] grounded goal: {args.grounder} every {args.grounder_every} steps, "
               f"instruction={args.instruction!r}", flush=True)
 
-    vlm_goal_mesh = None
-    if args.goal_from_vlm:
-        # BELIEF-tracked goal (mode b): resolve the VLM's object selection ONCE here and
-        # wrap its bbox as a grounder, so the belief is seeded from an image pixel (below,
-        # in the same --belief-goal branch as --grounder stub/qwen) rather than a world xyz.
-        frame_idx = args.vlm_frame_idx
-        rgb_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}.png"
-        overlay_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}_at.png"
-        annotation_path = f"{VLM_ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
-        vlm_success, vlm_result, vlm_status = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx)
-        if not vlm_success:
-            raise SystemExit(f"--goal-from-vlm: VLM selection failed: {vlm_status}")
-        _, vlm_goal_mesh, _ = vlm_result
-        grounder = VlmSelectionPixelGoal(vlm_goal_mesh["bbox"], VLM_CAPTURE_HW)
-        args.belief_goal = True
-        print(f"[VLM] goal '{vlm_goal_mesh['label']}' bbox={vlm_goal_mesh['bbox']} (capture {VLM_CAPTURE_HW}) "
-              f"seeds the belief via pixel; re-grounded every {args.grounder_every} steps", flush=True)
-        # The bbox is a FIXED pixel fraction (not a live re-detection), so it's only valid if the
-        # rollout starts from ~the pose the frame was captured at (vlm_nav_interactive's START_*).
-        if (abs(args.start_x - VLM_START_X) > 0.5 or abs(args.start_z - VLM_START_Z) > 0.5
-                or abs(args.start_yaw_deg - VLM_START_YAW_DEG) > 5.0):
-            print(f"[WARN] --start-x/z/yaw-deg ({args.start_x},{args.start_z},{args.start_yaw_deg}) "
-                  f"differ from the capture pose ({VLM_START_X},{VLM_START_Z},{VLM_START_YAW_DEG}); "
-                  "the seeded pixel may not land on the object in the first live frame.", flush=True)
-
     mesh_goal_mode = bool(args.goal_mesh_uv)
     if mesh_goal_mode:
         args.belief_goal = True   # reuse belief propagation + ghost recovery, but seed from the mask
@@ -982,6 +969,61 @@ def main() -> None:
     z = float(args.start_z)
     yaw = math.radians(float(args.start_yaw_deg))
     dt = 1.0 / float(args.hz)
+
+    vlm_goal_mesh = None
+    if args.goal_from_vlm:
+        # BELIEF-tracked goal (mode b): resolve the VLM's object selection ONCE here and
+        # wrap its bbox as a grounder, so the belief is seeded from an image pixel (below,
+        # in the same --belief-goal branch as --grounder stub/qwen) rather than a world xyz.
+        frame_idx = args.vlm_frame_idx
+        rgb_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}.png"
+        overlay_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}_at.png"
+        annotation_path = f"{VLM_ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
+
+        if not args.manual_annotate:
+            # DEFAULT: capture the actual live first frame (RGB + depth + pose) at THIS rollout's
+            # own start pose -- run after sim/agent exist so it's a real render, not an assumption
+            # that vlm_nav_interactive.py already produced these files on disk. SAM then annotates
+            # it in place of a human labelme session; resolve_vlm_selection below is unchanged and
+            # can't tell the difference between the two annotation sources.
+            y0 = terrain.local_height_max(x, z, float(args.pose_terrain_radius)) + float(args.clearance)
+            set_agent_pose(agent, x, y0, z, yaw)
+            obs0 = sim.get_sensor_observations()
+            rgb0, depth0 = rgb_depth(obs0)
+            os.makedirs(VLM_OUT_DIR, exist_ok=True)
+            Image.fromarray(rgb0).save(rgb_path)
+            np.save(f"{VLM_OUT_DIR}/depth_{frame_idx:04d}.npy", depth0.astype(np.float32))
+            depth_vis = (np.clip(depth0, 0.0, 10.0) / 10.0 * 255.0).astype(np.uint8)
+            Image.fromarray(depth_vis).save(f"{VLM_OUT_DIR}/depth_{frame_idx:04d}.png")
+            vlm_save_pose(frame_idx, x, y0, z, yaw)
+
+            from sam_annotation_adapter import sam_frame_to_annotation
+            annotation_path, sam_valid, sam_status = sam_frame_to_annotation(rgb_path, annotation_path)
+            if not sam_valid:
+                raise SystemExit(f"--goal-from-vlm: SAM annotation invalid: {sam_status}")
+            print(f"[SAM] live-captured frame {frame_idx} at this rollout's start pose "
+                  f"({x:.2f},{z:.2f},{math.degrees(yaw):.1f}deg) -> {annotation_path}", flush=True)
+
+        vlm_success, vlm_result, vlm_status = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx)
+        if not vlm_success:
+            raise SystemExit(f"--goal-from-vlm: VLM selection failed: {vlm_status}")
+        _, vlm_goal_mesh, _ = vlm_result
+        grounder = VlmSelectionPixelGoal(vlm_goal_mesh["bbox"], VLM_CAPTURE_HW)
+        args.belief_goal = True
+        print(f"[VLM] goal '{vlm_goal_mesh['label']}' bbox={vlm_goal_mesh['bbox']} (capture {VLM_CAPTURE_HW}) "
+              f"seeds the belief via pixel; re-grounded every {args.grounder_every} steps", flush=True)
+
+        if args.manual_annotate:
+            # The bbox is a FIXED pixel fraction from an OFFLINE labelme session (not a live
+            # re-detection), so it's only valid if the rollout starts from ~the pose that frame
+            # was captured at. Doesn't apply to the default SAM path above: that frame IS this
+            # rollout's own start pose, by construction, so it can't be stale.
+            if (abs(args.start_x - VLM_START_X) > 0.5 or abs(args.start_z - VLM_START_Z) > 0.5
+                    or abs(args.start_yaw_deg - VLM_START_YAW_DEG) > 5.0):
+                print(f"[WARN] --start-x/z/yaw-deg ({args.start_x},{args.start_z},{args.start_yaw_deg}) "
+                      f"differ from the capture pose ({VLM_START_X},{VLM_START_Z},{VLM_START_YAW_DEG}); "
+                      "the seeded pixel may not land on the object in the first live frame.", flush=True)
+
     if args.goal_from_vlm:
         # World position of the VLM selection, kept ONLY as the success-metric/logging
         # reference (mirrors --goal-bearing-deg) -- control is driven by the pixel-seeded

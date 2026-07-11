@@ -8,6 +8,7 @@ Features:
 - Save sample predictions vs ground truth with colored overlays
 - Run inference on a single image and save/show multiclass segmentation
 """
+from __future__ import annotations
 
 import os
 import json
