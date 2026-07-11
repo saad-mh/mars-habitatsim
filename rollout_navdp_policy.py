@@ -549,6 +549,27 @@ def pixel_to_body(u, v, depth_img, height, width, hfov_deg, fallback_range):
     return np.asarray([rng, -right], dtype=np.float32)  # [forward, left]
 
 
+def bbox_to_body(bbox_xyxy, depth_img, height, width, hfov_deg, fallback_range):
+    """Body-frame point [forward, left] from a VLM bbox: bearing from the bbox's center column,
+    range from the MEDIAN depth over the bbox's interior. Mirrors bbox_to_world_seed's
+    median-over-samples robustness (vlm_nav_interactive.py) but stays image-only -- no world
+    pose needed, so it doesn't break the belief-only "language decides WHERE" design.
+    pixel_to_body's single center pixel is fragile: it can land on a depth discontinuity (a
+    rock's silhouette edge, or a gap between the rock and the background) and seed a badly
+    wrong range that then dead-reckons, uncorrected, for the rest of the episode -- the ghost
+    stays glued to that wrong point and drifts off-screen as the rover moves past it."""
+    intr = intrinsics_from_hfov(height, width, hfov_deg)
+    x1, y1, x2, y2 = bbox_xyxy
+    iu1, iu2 = int(np.clip(min(x1, x2), 0, width - 1)), int(np.clip(max(x1, x2), 0, width - 1))
+    iv1, iv2 = int(np.clip(min(y1, y2), 0, height - 1)), int(np.clip(max(y1, y2), 0, height - 1))
+    patch = np.asarray(depth_img)[iv1:iv2 + 1, iu1:iu2 + 1]
+    valid = patch[np.isfinite(patch) & (patch > 0.1)]
+    rng = float(np.median(valid)) if valid.size > 0 else float(fallback_range)
+    u = 0.5 * (x1 + x2)
+    right = (u - intr["cx"]) * rng / max(intr["fx"], 1e-6)
+    return np.asarray([rng, -right], dtype=np.float32)  # [forward, left]
+
+
 class VlmSelectionPixelGoal:
     """Adapts a one-shot VLM object selection (resolve_vlm_selection, run once on an
     already-captured+annotated frame) to the .ground(rgb, instruction) grounder
@@ -567,10 +588,13 @@ class VlmSelectionPixelGoal:
         x1, y1, x2, y2 = bbox_xyxy
         self._u_frac = 0.5 * (x1 + x2) / cap_w
         self._v_frac = 0.5 * (y1 + y2) / cap_h
+        self._x1_frac, self._y1_frac = x1 / cap_w, y1 / cap_h
+        self._x2_frac, self._y2_frac = x2 / cap_w, y2 / cap_h
 
     def ground(self, rgb, instruction):
         h, w = rgb.shape[0], rgb.shape[1]
-        return SimpleNamespace(u=self._u_frac * w, v=self._v_frac * h, in_view=True)
+        bbox = (self._x1_frac * w, self._y1_frac * h, self._x2_frac * w, self._y2_frac * h)
+        return SimpleNamespace(u=self._u_frac * w, v=self._v_frac * h, in_view=True, bbox=bbox)
 
 
 def propagate_body_point(bg, action, dt, odom_noise=0.0, rng=None):
@@ -876,7 +900,9 @@ def main() -> None:
             START_X as VLM_START_X,
             START_Z as VLM_START_Z,
             START_YAW_DEG as VLM_START_YAW_DEG,
+            draw_annotation_overlay,
             resolve_vlm_selection,
+            save_mission_metadata,
             save_pose as vlm_save_pose,
         )
 
@@ -1004,14 +1030,41 @@ def main() -> None:
             print(f"[SAM] live-captured frame {frame_idx} at this rollout's start pose "
                   f"({x:.2f},{z:.2f},{math.degrees(yaw):.1f}deg) -> {annotation_path}", flush=True)
 
+        # ANNOTATED FRAME FOR REFERENCE: draw the (SAM- or labelme-) annotation's
+        # labeled boxes onto the raw frame and save it to overlay_path. resolve_vlm_selection()
+        # doesn't do this itself (it only forwards overlay_path to query_vlm, which never
+        # generates it -- see query_vlm's commented-out --overlay arg); the interactive
+        # run_vlm_on_frame() draws it before calling resolve_vlm_selection, so mirror that here.
+        draw_annotation_overlay(rgb_path, annotation_path, overlay_path)
+
         vlm_success, vlm_result, vlm_status = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx)
         if not vlm_success:
             raise SystemExit(f"--goal-from-vlm: VLM selection failed: {vlm_status}")
-        _, vlm_goal_mesh, _ = vlm_result
+        vlm_response, vlm_goal_mesh, vlm_obstacle_meshes = vlm_result
         grounder = VlmSelectionPixelGoal(vlm_goal_mesh["bbox"], VLM_CAPTURE_HW)
         args.belief_goal = True
         print(f"[VLM] goal '{vlm_goal_mesh['label']}' bbox={vlm_goal_mesh['bbox']} (capture {VLM_CAPTURE_HW}) "
               f"seeds the belief via pixel; re-grounded every {args.grounder_every} steps", flush=True)
+
+        # OBSTACLE: the VLM's prompt (VLM_PROMPT in vlm_nav_interactive.py) already restricts
+        # it to exactly one "rock" obstacle, chosen only from SAM's bigrock detections (bedrock
+        # is dropped upstream in sam_annotation_adapter.py, so it's never a candidate). Wire its
+        # resolved world seed into --ghost-obstacle-x/y/z so the CBF/orbit avoidance below --
+        # already fully wired for any ghost obstacle -- actually drives around it, unless the
+        # caller passed an explicit ghost obstacle of their own.
+        if vlm_obstacle_meshes and args.ghost_obstacle_x is None and args.ghost_obstacle_z is None:
+            vlm_obstacle_mesh = vlm_obstacle_meshes[0]
+            obs_vx, obs_vy, obs_vz = vlm_obstacle_mesh["seed_world"]
+            args.ghost_obstacle_x = obs_vx
+            args.ghost_obstacle_z = obs_vz
+            # y is left to the existing terrain-height + --ghost-obstacle-height computation
+            # below (unless the caller passed --ghost-obstacle-y explicitly), same pattern as
+            # the goal's y a few lines up -- seed_world's y sits at the rock's own surface, not
+            # the elevated marker height the rest of this script expects for a ghost obstacle.
+            print(f"[VLM] obstacle '{vlm_obstacle_mesh['label']}' bbox={vlm_obstacle_mesh['bbox']} "
+                  f"world=({obs_vx:.2f},{obs_vy:.2f},{obs_vz:.2f}) -> driving around it (ghost obstacle)", flush=True)
+        elif not vlm_obstacle_meshes:
+            print("[VLM] no obstacle resolved from the VLM's selection; proceeding without one", flush=True)
 
         if args.manual_annotate:
             # The bbox is a FIXED pixel fraction from an OFFLINE labelme session (not a live
@@ -1034,6 +1087,13 @@ def main() -> None:
         if goal_y is None:
             goal_y = terrain.local_height_max(goal_vx, goal_vz, float(args.goal_terrain_radius)) + float(args.goal_height)
         goal = np.asarray([goal_vx, goal_y, goal_vz], dtype=np.float32)
+
+        # MISSION RECORD: first frame (rgb_path), its SAM-annotated overlay (overlay_path),
+        # the annotation JSON (annotation_path), and the raw VLM prompt/response
+        # (rgb_{idx}_vlm_prompt.txt / rgb_{idx}_vlm.txt, written by vlm_query.py) are already
+        # on disk under VLM_OUT_DIR/VLM_ANNOTATIONS_DIR; this adds one consolidated JSON tying
+        # the VLM's parsed goal+obstacle choice to their resolved world positions/meshes.
+        save_mission_metadata(frame_idx, vlm_response, vlm_goal_mesh, vlm_obstacle_meshes, goal_target_world=goal)
     elif args.goal_x is None or args.goal_z is None:
         if not mesh_goal_mode:
             raise SystemExit("Pass --goal-x and --goal-z, --goal-from-vlm, or use --goal-mesh-uv for a rendered-mask goal.")
@@ -1195,8 +1255,15 @@ def main() -> None:
                     # LANGUAGE grounds the goal: RGB + instruction -> pixel -> body point (belief)
                     pg = grounder.ground(rgb, args.instruction)
                     if pg.in_view:
-                        belief_g = pixel_to_body(pg.u, pg.v, depth, rgb.shape[0], rgb.shape[1],
-                                                 args.hfov_deg, args.goal_range)
+                        bbox = getattr(pg, "bbox", None)
+                        if bbox is not None:
+                            # Robust: median depth over the whole VLM bbox, not one pixel that
+                            # can land on a discontinuity (see bbox_to_body's docstring).
+                            belief_g = bbox_to_body(bbox, depth, rgb.shape[0], rgb.shape[1],
+                                                    args.hfov_deg, args.goal_range)
+                        else:
+                            belief_g = pixel_to_body(pg.u, pg.v, depth, rgb.shape[0], rgb.shape[1],
+                                                     args.hfov_deg, args.goal_range)
                 elif belief_g is None:
                     if args.goal_bearing_deg is not None:
                         _b = math.radians(float(args.goal_bearing_deg))  # + = right of forward

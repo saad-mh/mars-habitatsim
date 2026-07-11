@@ -53,6 +53,10 @@ def main():
 
     text_prompt = build_prompt(args.prompt, args.annotation)
 
+    prompt_out = args.out.rsplit(".", 1)[0] + "_prompt.txt"
+    with open(prompt_out, "w") as f:
+        f.write(text_prompt)
+
     print(f"[vlm] loading {MODEL_ID}")
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model = AutoModelForImageTextToText.from_pretrained(
@@ -86,7 +90,7 @@ def main():
 
     print("[vlm] running inference")
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=256)
+        generated_ids = model.generate(**inputs, max_new_tokens=640)
 
     generated_ids_trimmed = [
         out_ids[len(in_ids):]
