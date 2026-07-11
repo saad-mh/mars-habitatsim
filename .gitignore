@@ -11,6 +11,7 @@ navdp/ckpt_last.pt
 *.pt
 
 vla_rollout*
+mars_belief_demo*
 
 assets/marsyard2022.obj
 assets/marsyard2022.glb

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from typing import List, Optional
 
@@ -26,9 +27,24 @@ RGB_WIDTH = 640
 HFOV_DEG = 90.0
 DEPTH_MAX_RANGE_M = 10.0
 
+# Mirrors rollout_navdp_policy.py's --clearance / --pose-terrain-radius defaults.
+SPAWN_CLEARANCE_M = 1.4
+SPAWN_TERRAIN_RADIUS_M = 0.8
+
 
 class MarsHabitatEnv:
-    def __init__(self, scene_path: str, heightmap_path: str, services: list = None):
+    def __init__(
+        self,
+        scene_path: str,
+        heightmap_path: str,
+        services: list = None,
+        start_x: float = 0.0,
+        start_z: float = 8.0,
+        start_yaw: float = 0.0,
+        randomize_spawn: bool = False,
+        spawn_clearance: float = SPAWN_CLEARANCE_M,
+        spawn_terrain_radius: float = SPAWN_TERRAIN_RADIUS_M,
+    ):
         self._scene_path = Path(scene_path)
         self._heightmap_path = Path(heightmap_path)
         self._registry = ServiceRegistry()
@@ -37,6 +53,12 @@ class MarsHabitatEnv:
         self._sim = None
         self._agent = None
         self._terrain = None
+        self._start_x = start_x
+        self._start_z = start_z
+        self._start_yaw = start_yaw
+        self._randomize_spawn = randomize_spawn
+        self._spawn_clearance = spawn_clearance
+        self._spawn_terrain_radius = spawn_terrain_radius
 
     def __enter__(self) -> "MarsHabitatEnv":
         sim_cfg = habitat_sim.SimulatorConfiguration()

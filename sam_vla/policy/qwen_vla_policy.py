@@ -10,6 +10,10 @@ class QwenVlaPolicy:  # implements NavigationPolicy
     def act(self, obs: Observation, goal_spec: GoalSpec) -> Action:
         return qwen_client.drive_action(obs.rgb, goal_spec, obs.frame_idx)
 
+    def act_verbose(self, obs: Observation, goal_spec: GoalSpec) -> tuple[Action, dict]:
+        """Same as act, but also returns the raw VLA result dict for logging."""
+        return qwen_client.drive_action_verbose(obs.rgb, goal_spec, obs.frame_idx)
+
 
 if __name__ == "__main__":
     import numpy as np

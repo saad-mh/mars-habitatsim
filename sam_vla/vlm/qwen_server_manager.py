@@ -10,12 +10,37 @@ import struct
 import subprocess
 import time
 
-from sam_vla.vlm.qwen_server import QWEN_SERVER_PORT
+from sam_vla.vlm.qwen_config import QWEN_SERVER_PORT
 
 _HEADER_SIZE = 4
 _HEALTH_CHECK_RETRY_INTERVAL = 1.0
 _START_TIMEOUT = 30.0
 _STOP_TIMEOUT = 5.0
+
+# qwen_server needs transformers + the Qwen2.5-VL stack, which live in the
+# qwen_vlm conda env, not the habitat env this manager runs in. Resolve that
+# env's interpreter directly rather than relying on "python" from PATH.
+_QWEN_VLM_CONDA_ENV = "qwen_vlm"
+
+
+def _resolve_qwen_vlm_python() -> str:
+    override = os.environ.get("QWEN_VLM_PYTHON")
+    if override:
+        return override
+
+    conda_info = subprocess.run(
+        ["conda", "info", "--base"], capture_output=True, text=True, check=True
+    ).stdout
+    # Some conda installs print unrelated warnings (e.g. a broken
+    # anaconda-anon-usage plugin) to stdout before the actual base path.
+    conda_base = next(line.strip() for line in conda_info.splitlines() if line.startswith("/"))
+    candidate = os.path.join(conda_base, "envs", _QWEN_VLM_CONDA_ENV, "bin", "python")
+    if not os.path.exists(candidate):
+        raise RuntimeError(
+            f"could not find python for conda env '{_QWEN_VLM_CONDA_ENV}' at {candidate}; "
+            "set QWEN_VLM_PYTHON to override"
+        )
+    return candidate
 
 
 class QwenServerManager:
@@ -49,7 +74,8 @@ class QwenServerManager:
 
         print(f"[QwenServerManager] no server on port {self.port}, spawning subprocess")
         self._process = subprocess.Popen(
-            ["python", "-m", "sam_vla.vlm.qwen_server"],
+            [_resolve_qwen_vlm_python(), "-m", "sam_vla.vlm.qwen_server"],
+            cwd=os.getcwd(),
         )
         self._owns_process = True
 

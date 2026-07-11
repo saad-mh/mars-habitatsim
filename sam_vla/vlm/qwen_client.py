@@ -11,7 +11,7 @@ import struct
 import numpy as np
 
 from sam_vla.core.types import Action, Detection, GoalSpec
-from sam_vla.vlm.qwen_server import QWEN_SERVER_PORT
+from sam_vla.vlm.qwen_config import QWEN_SERVER_PORT
 
 _HOST = "127.0.0.1"
 _HEADER_SIZE = 4
@@ -56,7 +56,7 @@ def _recv_exact(conn: socket.socket, num_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def select_goal(rgb: np.ndarray, detections: list[Detection]) -> GoalSpec:
+def _select_goal_result(rgb: np.ndarray, detections: list[Detection]) -> dict:
     detections_json = [
         {
             "class_name": d.class_name,
@@ -71,8 +71,10 @@ def select_goal(rgb: np.ndarray, detections: list[Detection]) -> GoalSpec:
     )
     if "error" in response:
         raise ValueError(f"select_goal failed: {response['error']}")
+    return response["result"]
 
-    result = response["result"]
+
+def _goal_spec_from_result(result: dict, detections: list[Detection]) -> GoalSpec:
     goal_index = result["goal_index"]
     reasoning = result.get("reasoning", "")
 
@@ -89,7 +91,18 @@ def select_goal(rgb: np.ndarray, detections: list[Detection]) -> GoalSpec:
     )
 
 
-def drive_action(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> Action:
+def select_goal(rgb: np.ndarray, detections: list[Detection]) -> GoalSpec:
+    result = _select_goal_result(rgb, detections)
+    return _goal_spec_from_result(result, detections)
+
+
+def select_goal_verbose(rgb: np.ndarray, detections: list[Detection]) -> tuple[GoalSpec, dict]:
+    """Same as select_goal, but also returns the raw VLM result dict (goal_index, reasoning) for logging."""
+    result = _select_goal_result(rgb, detections)
+    return _goal_spec_from_result(result, detections), result
+
+
+def _drive_action_result(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> dict:
     response = _send_request(
         "drive_action",
         {
@@ -100,13 +113,27 @@ def drive_action(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> Action
     )
     if "error" in response:
         raise ValueError(f"drive_action failed: {response['error']}")
+    return response["result"]
 
-    result = response["result"]
+
+def drive_action(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> Action:
+    result = _drive_action_result(rgb, goal_spec, frame_idx)
     return Action(
         v_fwd=result["v_fwd"],
         v_lat=result["v_lat"],
         yaw_rate=result["yaw_rate"],
     )
+
+
+def drive_action_verbose(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> tuple[Action, dict]:
+    """Same as drive_action, but also returns the raw VLM result dict for logging."""
+    result = _drive_action_result(rgb, goal_spec, frame_idx)
+    action = Action(
+        v_fwd=result["v_fwd"],
+        v_lat=result["v_lat"],
+        yaw_rate=result["yaw_rate"],
+    )
+    return action, result
 
 
 if __name__ == "__main__":
