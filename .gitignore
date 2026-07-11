@@ -16,3 +16,9 @@ assets/marsyard2022.obj
 assets/marsyard2022.glb
 marsyard2022.obj
 marsyard2022_tri.glb
+
+.DS_Store
+
+*.pth
+
+.venv
