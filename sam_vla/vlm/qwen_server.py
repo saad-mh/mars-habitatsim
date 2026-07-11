@@ -11,15 +11,13 @@ import struct
 import numpy as np
 from PIL import Image
 
+from sam_vla.vlm.qwen_config import QWEN_SERVER_HOST, QWEN_SERVER_PORT
 from sam_vla.vlm.qwen_model_runner import load_qwen_model, run_qwen_inference
 from sam_vla.vlm.qwen_prompts import build_drive_action_prompt, build_select_goal_prompt
 from sam_vla.vlm.qwen_response_parser import (
     parse_drive_action_response,
     parse_select_goal_response,
 )
-
-QWEN_SERVER_HOST = "127.0.0.1"
-QWEN_SERVER_PORT = 8765
 
 _HEADER_SIZE = 4
 

@@ -10,7 +10,7 @@ __pycache__/
 navdp/ckpt_last.pt
 *.pt
 
-mars_belief_demo*
+vla_rollout*
 
 assets/marsyard2022.obj
 assets/marsyard2022.glb
