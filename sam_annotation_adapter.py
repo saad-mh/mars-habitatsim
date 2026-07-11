@@ -15,18 +15,15 @@ Label mapping (SAM classes -> pipeline vocabulary):
                       VLM_PROMPT hardcodes "Every obstacle's label must be
                       'rock'", so bigrock is the only sensible match for
                       an obstacle the rover drives around.
-  bedrock -> "sand"  Terrain/background surface, not a discrete object.
-                      It is not a natural fit for either pipeline label,
-                      but the task calls for the conservative choice
-                      (include rather than silently drop data) when the
-                      mapping is ambiguous, so it is kept and mapped to
-                      "sand" - the pipeline's other non-"rock" label,
-                      analogous to how "sand" already denotes traversable
-                      terrain rather than a selectable obstacle. Qwen
-                      still sees it as a labeled shape and can pick it as
-                      goal_object if warranted; VLM_PROMPT's "must be
-                      rock" requirement only constrains *obstacles*, so a
-                      "sand"-labeled shape can never be miscast as one.
+  bedrock             Terrain/background surface segmentation, not a
+                      discrete object (its contours can span most of the
+                      frame). The mission is defined as picking one goal
+                      and one obstacle from two actual rocks, so bedrock
+                      is dropped entirely rather than surfaced as a
+                      candidate shape - otherwise the VLM has no real
+                      rock to pick from and either selects a bedrock
+                      region as the goal or mislabels one as "rock" to
+                      satisfy the obstacle schema.
 
 The vlm_nav_interactive imports (assign_object_ids, validate_annotation_json,
 run_vlm_on_frame) are done lazily inside sam_frame_to_annotation() /
@@ -58,7 +55,6 @@ from inference import run_inference_on_frame  # noqa: E402
 
 SAM_LABEL_MAP = {
     "bigrock": "rock",
-    "bedrock": "sand",
 }
 
 LABELME_VERSION = "5.4.1"
@@ -68,10 +64,11 @@ def sam_boxes_to_shapes(sam_boxes):
     """
     Convert run_inference_on_frame()'s {'bedrock': [...], 'bigrock': [...]}
     output into a list of labelme-style shape dicts (no "id" yet - that's
-    assigned by assign_object_ids() once the shapes are on disk).
+    assigned by assign_object_ids() once the shapes are on disk). bedrock
+    is ignored - it's terrain/background, not a selectable rock.
     """
     shapes = []
-    for class_name in ("bedrock", "bigrock"):
+    for class_name in ("bigrock",):
         label = SAM_LABEL_MAP[class_name]
         for box in sam_boxes.get(class_name, []):
             x, y, w, h = box["x"], box["y"], box["width"], box["height"]
@@ -131,6 +128,16 @@ def sam_frame_to_annotation(image_path, annotation_out_path, model=None):
     assign_object_ids(str(annotation_out_path))
 
     is_valid, status = validate_annotation_json(str(annotation_out_path))
+    if is_valid and len(sam_boxes.get("bigrock", [])) < 2:
+        # The mission needs two distinct rocks (one goal, one obstacle).
+        # Fewer than that and the VLM has no real rock to pick from -- it
+        # will either pick nothing or hallucinate a "rock" label to satisfy
+        # VLM_PROMPT's schema, so fail loudly here instead.
+        is_valid = False
+        status = (
+            f"only {len(sam_boxes.get('bigrock', []))} bigrock detection(s) "
+            "in frame, need >=2 for goal+obstacle"
+        )
     return str(annotation_out_path), is_valid, status
 
 

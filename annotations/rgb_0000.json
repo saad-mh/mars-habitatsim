@@ -1,295 +1,61 @@
 {
-  "version": "6.3.1",
+  "version": "5.4.1",
   "flags": {},
   "shapes": [
     {
-      "id": 0,
-      "label": "sand",
-      "points": [
-        [
-          304.1530054644809,
-          235.62841530054646
-        ],
-        [
-          334.75409836065575,
-          247.65027322404373
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 1,
-      "label": "sand",
-      "points": [
-        [
-          290.49180327868856,
-          267.32240437158475
-        ],
-        [
-          332.0218579234973,
-          248.74316939890713
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 2,
-      "label": "sand",
-      "points": [
-        [
-          368.08743169398906,
-          267.32240437158475
-        ],
-        [
-          340.76502732240436,
-          249.8360655737705
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 3,
-      "label": "sand",
-      "points": [
-        [
-          303.0601092896175,
-          291.912568306011
-        ],
-        [
-          342.40437158469945,
-          268.4153005464481
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 4,
       "label": "rock",
       "points": [
         [
-          20.000000000000014,
-          299.016393442623
+          437,
+          368
         ],
         [
-          40.218579234972694,
-          284.80874316939895
+          447,
+          373
         ]
       ],
       "group_id": null,
-      "description": "",
       "shape_type": "rectangle",
       "flags": {},
-      "mask": null
+      "id": 0
     },
     {
-      "id": 5,
       "label": "rock",
       "points": [
         [
-          50.601092896174876,
-          288.63387978142083
+          52,
+          353
         ],
         [
-          73.00546448087432,
-          282.62295081967216
+          64,
+          360
         ]
       ],
       "group_id": null,
-      "description": "",
       "shape_type": "rectangle",
       "flags": {},
-      "mask": null
+      "id": 1
     },
     {
-      "id": 6,
       "label": "rock",
       "points": [
         [
-          487.75956284153006,
-          313.224043715847
+          305,
+          342
         ],
         [
-          469.1803278688525,
-          293.5519125683061
+          313,
+          346
         ]
       ],
       "group_id": null,
-      "description": "",
       "shape_type": "rectangle",
       "flags": {},
-      "mask": null
-    },
-    {
-      "id": 7,
-      "label": "rock",
-      "points": [
-        [
-          437.48633879781426,
-          311.0382513661203
-        ],
-        [
-          406.3387978142077,
-          294.09836065573774
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 8,
-      "label": "rock",
-      "points": [
-        [
-          554.4262295081967,
-          293.00546448087437
-        ],
-        [
-          575.7377049180328,
-          284.80874316939895
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 9,
-      "label": "sand",
-      "points": [
-        [
-          274.6448087431694,
-          262.4043715846995
-        ],
-        [
-          216.17486338797818,
-          243.27868852459017
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 10,
-      "label": "sand",
-      "points": [
-        [
-          137.4863387978142,
-          266.2295081967213
-        ],
-        [
-          210.71038251366122,
-          252.56830601092898
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 11,
-      "label": "rock",
-      "points": [
-        [
-          110.7103825136612,
-          286.44808743169403
-        ],
-        [
-          139.672131147541,
-          296.8306010928962
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 12,
-      "label": "rock",
-      "points": [
-        [
-          459.33747412008285,
-          292.8985507246377
-        ],
-        [
-          475.48654244306414,
-          305.94202898550725
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 13,
-      "label": "rock",
-      "points": [
-        [
-          137.18426501035196,
-          242.1739130434783
-        ],
-        [
-          143.8095238095238,
-          249.00621118012424
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
-    },
-    {
-      "id": 14,
-      "label": "rock",
-      "points": [
-        [
-          20.41407867494823,
-          310.4968944099379
-        ],
-        [
-          0.0,
-          297.45456636760986
-        ]
-      ],
-      "group_id": null,
-      "description": "",
-      "shape_type": "rectangle",
-      "flags": {},
-      "mask": null
+      "id": 2
     }
   ],
-  "imagePath": "../vlm_nav_out/rgb_0000.png",
+  "imagePath": "rgb_0000.png",
   "imageData": null,
-  "imageHeight": 480,
-  "imageWidth": 640
+  "imageHeight": 720,
+  "imageWidth": 720
 }
