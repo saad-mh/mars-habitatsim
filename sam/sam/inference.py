@@ -117,6 +117,70 @@ def draw_bounding_boxes(image: np.ndarray, boxes: List[Dict], class_id: int) -> 
     return image
 
 
+def run_inference_on_frame(
+    image,
+    model: nn.Module = None,
+) -> Dict[str, List[Dict]]:
+    """
+    Run SAM2 segmentation on a single in-memory frame and extract bedrock/
+    bigrock bounding boxes, without requiring a video file.
+
+    Mirrors process_video()'s per-frame body (resize -> preprocess -> model
+    -> resize prediction back to original resolution -> filter classes ->
+    extract boxes) but returns the boxes directly instead of accumulating
+    them alongside video I/O.
+
+    Args:
+        image: path to an image file (str/Path), or an already-loaded
+            (H, W, 3) uint8 BGR np.ndarray (OpenCV convention, matching
+            every other entry point in this module - e.g. a raw RGB array
+            from elsewhere must be converted to BGR before being passed
+            in here).
+        model: preloaded model, as returned by load_best_model(). Loaded
+            fresh via load_best_model() if not given.
+
+    Returns:
+        {'bedrock': [...], 'bigrock': [...]}, each a list of box dicts
+        with the same keys process_video() emits per frame ('x', 'y',
+        'width', 'height', 'area', 'class_id', 'class_name').
+    """
+    if isinstance(image, (str, Path)):
+        image_path = Path(image)
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        frame = cv2.imread(str(image_path))
+        if frame is None:
+            raise ValueError(f"Failed to read image: {image_path}")
+    else:
+        frame = image
+
+    if model is None:
+        model = load_best_model()
+    model.eval()
+
+    height, width = frame.shape[:2]
+    original_shape = frame.shape
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_resized = cv2.resize(frame_rgb, (IMAGE_SIZE, IMAGE_SIZE))
+    frame_bgr_resized = cv2.cvtColor(frame_resized, cv2.COLOR_RGB2BGR)
+
+    img_tensor = preprocess_image_for_model(frame_bgr_resized)
+
+    with torch.no_grad():
+        inp = img_tensor.unsqueeze(0).to(DEVICE)
+        logits = model(inp)
+        pred = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.int64)
+
+    pred_resized = cv2.resize(pred, (width, height), interpolation=cv2.INTER_NEAREST)
+    filtered_mask = create_filtered_mask(pred_resized, original_shape)
+
+    bedrock_boxes = extract_bounding_boxes(filtered_mask, BEDROCK_CLASS)
+    bigrock_boxes = extract_bounding_boxes(filtered_mask, BIGROCK_CLASS)
+
+    return {"bedrock": bedrock_boxes, "bigrock": bigrock_boxes}
+
+
 def process_video(
     video_path: str,
     output_dir: str,
