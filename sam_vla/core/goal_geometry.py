@@ -18,6 +18,11 @@ from sam_vla.core.types import GoalSpec, Observation, Pose
 
 GoalPosition = tuple[float, float, float]
 
+# Semantic ids painted onto goal/obstacle mask meshes (see disc_mesh + the
+# env's register_object_mask), so the semantic sensor can tell them apart.
+MESH_GOAL_ID = 1
+MESH_OBST_ID = 2
+
 
 def bbox_to_world(
     obs: Observation, bbox_norm: tuple[float, float, float, float], hfov_deg: float

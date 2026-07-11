@@ -11,26 +11,14 @@ from habitat_sim.agent import AgentConfiguration
 from sam_vla.core.goal_geometry import GoalPosition, disc_mesh
 from sam_vla.core.lifecycle import ServiceRegistry
 from sam_vla.core.types import Observation, Pose
-
-from rollout_navdp_policy import (
-    SIZE_X,
-    SIZE_Y,
-    SIZE_Z,
-    SceneMappedTerrain,
-    TerrainHeight,
-    _save_obj,
-    make_sensor,
-    register_semantic_mesh,
-    rgb_depth,
-    set_agent_pose,
-)
+from sam_vla.env.terrain import SIZE_X, SIZE_Y, SIZE_Z, HeightmapGrid, Terrain
+from sam_vla.env.sim_utils import make_sensor, register_semantic_mesh, rgb_depth, save_obj, set_agent_pose
 
 RGB_HEIGHT = 480
 RGB_WIDTH = 640
 HFOV_DEG = 90.0
 DEPTH_MAX_RANGE_M = 10.0
 
-# Mirrors rollout_navdp_policy.py's --clearance / --pose-terrain-radius defaults.
 SPAWN_CLEARANCE_M = 1.4
 SPAWN_TERRAIN_RADIUS_M = 0.8
 
@@ -72,8 +60,7 @@ class MarsHabitatEnv:
 
         rgb_spec = make_sensor("rgb", habitat_sim.SensorType.COLOR, RGB_HEIGHT, RGB_WIDTH, HFOV_DEG)
         depth_spec = make_sensor("depth", habitat_sim.SensorType.DEPTH, RGB_HEIGHT, RGB_WIDTH, HFOV_DEG)
-        # rollout_navdp_policy.make_sensor doesn't set a far clip; cap depth range here
-        # to match the old pipeline's 10m sensor spec.
+        # make_sensor doesn't set a far clip; cap depth range here to a sane sensor spec.
         depth_spec.far = DEPTH_MAX_RANGE_M
 
         sensor_specs = [rgb_spec, depth_spec]
@@ -88,11 +75,8 @@ class MarsHabitatEnv:
         self._sim = habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
         self._agent = self._sim.initialize_agent(0)
 
-        raw_terrain = TerrainHeight(
-            mode="heightmap",
-            heightmap=self._heightmap_path.expanduser().resolve(),
-            obj=None,
-            flat_y=0.0,
+        heightmap_grid = HeightmapGrid(
+            self._heightmap_path.expanduser().resolve(),
             size_x=SIZE_X,
             size_z=SIZE_Z,
             size_y=SIZE_Y,
@@ -100,7 +84,7 @@ class MarsHabitatEnv:
             flip_z=True,
             swap_xz=False,
         )
-        self._terrain = SceneMappedTerrain(raw_terrain, flip_x=False, flip_z=True, swap_xz=False)
+        self._terrain = Terrain(heightmap_grid, flip_x=False, flip_z=True, swap_xz=False)
 
         if self._randomize_spawn:
             x = random.uniform(-SIZE_X / 2.0, SIZE_X / 2.0)
@@ -149,16 +133,15 @@ class MarsHabitatEnv:
     ):
         """Register a small flat disc mesh at world_pos as a render-only,
         non-collidable object carrying `semantic_id`, so the semantic sensor
-        renders a goal/obstacle mask around that point. Mirrors
-        rollout_navdp_policy's place_mesh_goal_obstacle, but seeded from an
+        renders a goal/obstacle mask around that point. Seeded from an
         already-backprojected world point (goal_geometry.bbox_to_world)
-        instead of a raw pixel + depth patch. Requires with_semantic=True.
+        rather than a raw pixel + depth patch. Requires with_semantic=True.
         """
         verts, faces = disc_mesh(world_pos, radius)
         mesh_dir = Path(out_dir) / "masks"
         mesh_dir.mkdir(parents=True, exist_ok=True)
         mesh_path = str(mesh_dir / f"{name}.obj")
-        _save_obj(mesh_path, verts, faces)
+        save_obj(mesh_path, verts, faces)
         return register_semantic_mesh(self._sim, mesh_path, semantic_id)
 
 

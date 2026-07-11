@@ -3,13 +3,18 @@ import math
 import time, datetime
 from pathlib import Path
 
-from rollout_navdp_policy import MESH_GOAL_ID, MESH_OBST_ID
 from sam_vla.env.habitat_env import HFOV_DEG, MarsHabitatEnv
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
 from sam_vla.goal_resolution import first_frame_resolver
 from sam_vla.policy.qwen_vla_policy import QwenVlaPolicy
 from sam_vla.safety.safety_filter import filter as safety_filter_fn
-from sam_vla.core.goal_geometry import backproject_goal_position, bbox_to_world, distance_to_goal
+from sam_vla.core.goal_geometry import (
+    MESH_GOAL_ID,
+    MESH_OBST_ID,
+    backproject_goal_position,
+    bbox_to_world,
+    distance_to_goal,
+)
 from sam_vla.core.pose_integrator import integrate_mars
 from sam_vla.logging.rollout_logger import RolloutLogger
 
