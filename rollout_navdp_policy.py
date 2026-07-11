@@ -350,11 +350,22 @@ def pixel_to_world(u, v, d, position, yaw, intr):
 
 
 def mask_to_body(mask, depth_img, height, width, hfov_deg, fallback_range, min_px=1):
-    """Body-frame goal point [forward, left] from a rendered mask centroid + depth (belief from mask)."""
+    """Body-frame goal point [forward, left] from a rendered mask: bearing from the mask's centroid
+    column, range from the MEDIAN depth over all mask pixels. Mirrors bbox_to_body's robustness --
+    a single centroid pixel (the old behavior here) can land on a depth discontinuity (a rock's
+    silhouette edge, a gap between the mesh and the background behind it) and seed a badly wrong
+    range that then dead-reckons, uncorrected, for the rest of the episode (mesh_goal_mode seeds
+    belief_g ONCE and never re-corrects it -- see the caller)."""
     ys, xs = np.where(np.asarray(mask) > 0)
     if xs.size < min_px:
         return None
-    return pixel_to_body(float(xs.mean()), float(ys.mean()), depth_img, height, width, hfov_deg, fallback_range)
+    intr = intrinsics_from_hfov(height, width, hfov_deg)
+    patch = np.asarray(depth_img)[ys, xs]
+    valid = patch[np.isfinite(patch) & (patch > 0.1)]
+    rng = float(np.median(valid)) if valid.size > 0 else float(fallback_range)
+    u = float(xs.mean())
+    right = (u - intr["cx"]) * rng / max(intr["fx"], 1e-6)
+    return np.asarray([rng, -right], dtype=np.float32)  # [forward, left]
 
 
 def belief_feat(belief, r_scale=10.0):
@@ -988,7 +999,7 @@ def main() -> None:
         print(f"[MASK] rendered-mask goal at pixel {args.goal_mesh_uv}"
               + (f" + obstacle mesh at {args.obstacle_mesh_uv}" if args.obstacle_mesh_uv else ""), flush=True)
 
-    sim = make_sim(Path(args.scene), args.height, args.width, args.hfov_deg, with_semantic=mesh_goal_mode)
+    sim = make_sim(Path(args.scene), args.height, args.width, args.hfov_deg, with_semantic=(mesh_goal_mode or args.goal_from_vlm))
     agent = sim.initialize_agent(0)
 
     x = float(args.start_x)
@@ -997,10 +1008,14 @@ def main() -> None:
     dt = 1.0 / float(args.hz)
 
     vlm_goal_mesh = None
+    vlm_mesh_tracking = False   # True once the VLM's resolved goal mesh is registered with the
+                                 # semantic sensor below, so the main loop tracks it from the live
+                                 # per-frame mask instead of one-shot pixel + odometry dead-reckoning.
     if args.goal_from_vlm:
-        # BELIEF-tracked goal (mode b): resolve the VLM's object selection ONCE here and
-        # wrap its bbox as a grounder, so the belief is seeded from an image pixel (below,
-        # in the same --belief-goal branch as --grounder stub/qwen) rather than a world xyz.
+        # SEMANTIC-MASK-tracked goal: resolve the VLM's object selection ONCE here, register its
+        # already-saved mesh (selected_bbox_to_object_mesh's on-disk .obj) with the semantic sensor,
+        # and re-render that mesh's mask every step (see MESH_GOAL_ID handling in the main loop) --
+        # mirrors --goal-mesh-uv's rendered-mask tracking instead of dead-reckoning by odometry alone.
         frame_idx = args.vlm_frame_idx
         rgb_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}.png"
         overlay_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}_at.png"
@@ -1041,29 +1056,39 @@ def main() -> None:
         if not vlm_success:
             raise SystemExit(f"--goal-from-vlm: VLM selection failed: {vlm_status}")
         vlm_response, vlm_goal_mesh, vlm_obstacle_meshes = vlm_result
+        register_semantic_mesh(sim, vlm_goal_mesh["mesh_path"], MESH_GOAL_ID)
+        vlm_mesh_tracking = True
+        # Kept only as an inert fallback (unused once vlm_mesh_tracking routes through the
+        # MESH_GOAL_ID branch below) in case the goal mesh ever fails to register.
         grounder = VlmSelectionPixelGoal(vlm_goal_mesh["bbox"], VLM_CAPTURE_HW)
         args.belief_goal = True
-        print(f"[VLM] goal '{vlm_goal_mesh['label']}' bbox={vlm_goal_mesh['bbox']} (capture {VLM_CAPTURE_HW}) "
-              f"seeds the belief via pixel; re-grounded every {args.grounder_every} steps", flush=True)
+        print(f"[VLM] goal '{vlm_goal_mesh['label']}' mesh={vlm_goal_mesh['mesh_path']} registered as "
+              f"MESH_GOAL_ID; belief re-derived from the live rendered mask every step (no dead-reckoning "
+              f"while in view)", flush=True)
 
         # OBSTACLE: the VLM's prompt (VLM_PROMPT in vlm_nav_interactive.py) already restricts
         # it to exactly one "rock" obstacle, chosen only from SAM's bigrock detections (bedrock
-        # is dropped upstream in sam_annotation_adapter.py, so it's never a candidate). Wire its
-        # resolved world seed into --ghost-obstacle-x/y/z so the CBF/orbit avoidance below --
-        # already fully wired for any ghost obstacle -- actually drives around it, unless the
-        # caller passed an explicit ghost obstacle of their own.
-        if vlm_obstacle_meshes and args.ghost_obstacle_x is None and args.ghost_obstacle_z is None:
+        # is dropped upstream in sam_annotation_adapter.py, so it's never a candidate). Register
+        # its mesh too (MESH_OBST_ID) so the obstacle mask the policy sees, and the mask-based CBF
+        # fallback, are also ground-truth per frame. ALSO wire its resolved world seed into
+        # --ghost-obstacle-x/y/z so the CBF/orbit avoidance's cone-mode math (which prefers a
+        # stable world point over the mask to avoid abeam-pass flicker -- see ctrl_op below) still
+        # has one, unless the caller passed an explicit ghost obstacle of their own.
+        if vlm_obstacle_meshes:
             vlm_obstacle_mesh = vlm_obstacle_meshes[0]
-            obs_vx, obs_vy, obs_vz = vlm_obstacle_mesh["seed_world"]
-            args.ghost_obstacle_x = obs_vx
-            args.ghost_obstacle_z = obs_vz
-            # y is left to the existing terrain-height + --ghost-obstacle-height computation
-            # below (unless the caller passed --ghost-obstacle-y explicitly), same pattern as
-            # the goal's y a few lines up -- seed_world's y sits at the rock's own surface, not
-            # the elevated marker height the rest of this script expects for a ghost obstacle.
-            print(f"[VLM] obstacle '{vlm_obstacle_mesh['label']}' bbox={vlm_obstacle_mesh['bbox']} "
-                  f"world=({obs_vx:.2f},{obs_vy:.2f},{obs_vz:.2f}) -> driving around it (ghost obstacle)", flush=True)
-        elif not vlm_obstacle_meshes:
+            register_semantic_mesh(sim, vlm_obstacle_mesh["mesh_path"], MESH_OBST_ID)
+            if args.ghost_obstacle_x is None and args.ghost_obstacle_z is None:
+                obs_vx, obs_vy, obs_vz = vlm_obstacle_mesh["seed_world"]
+                args.ghost_obstacle_x = obs_vx
+                args.ghost_obstacle_z = obs_vz
+                # y is left to the existing terrain-height + --ghost-obstacle-height computation
+                # below (unless the caller passed --ghost-obstacle-y explicitly), same pattern as
+                # the goal's y a few lines up -- seed_world's y sits at the rock's own surface, not
+                # the elevated marker height the rest of this script expects for a ghost obstacle.
+                print(f"[VLM] obstacle '{vlm_obstacle_mesh['label']}' bbox={vlm_obstacle_mesh['bbox']} "
+                      f"mesh={vlm_obstacle_mesh['mesh_path']} registered as MESH_OBST_ID; ghost world="
+                      f"({obs_vx:.2f},{obs_vy:.2f},{obs_vz:.2f}) -> driving around it", flush=True)
+        else:
             print("[VLM] no obstacle resolved from the VLM's selection; proceeding without one", flush=True)
 
         if args.manual_annotate:
@@ -1133,6 +1158,8 @@ def main() -> None:
     hard_gate_fired = 0
     escape_active = 0
     vla_count = 0               # counter for --vla-dump paired-sample writing
+    mesh_tracking_mode = mesh_goal_mode or vlm_mesh_tracking  # goal (+ obstacle, if resolved) tracked
+                                 # from the live rendered semantic mask each step, not dead-reckoned
     belief_g = None             # body-frame [forward, left] belief estimate of the goal (--belief-goal)
     belief_rng = np.random.default_rng(0)
     near_obstacle_state = False  # hysteresis-latched maneuver gate (avoids flicker at the boundary)
@@ -1216,10 +1243,13 @@ def main() -> None:
             vla_token = None   # set below, once the obstacle distance is known
             stop_cmd = False   # set below (gated on obstacle proximity)
 
-            if mesh_goal_mode:
-                # RENDERED-MASK goal: a semantic mesh (placed at t=0 from a pixel) is rendered each
-                # step; the belief is built from that mask, so the policy's goal channel IS the mask.
-                if step == 0:
+            if mesh_tracking_mode:
+                # RENDERED-MASK goal: a semantic mesh (placed at t=0 from a pixel, or registered
+                # up-front from the VLM's resolved selection) is rendered each step; the belief is
+                # RE-DERIVED from that live mask every step it's visible, so tracking follows the
+                # mask's ground truth instead of dead-reckoning by odometry alone (which drifts) --
+                # dead-reckoning only bridges the gap while the mask briefly drops out of view.
+                if mesh_goal_mode and step == 0:
                     _gw, _ow = place_mesh_goal_obstacle(sim, depth, position, yaw, intr, args, out_dir)
                     if _gw is not None:
                         goal[:] = np.asarray(_gw, dtype=np.float32)
@@ -1228,8 +1258,7 @@ def main() -> None:
                 _sem = semantic_from_obs(obs)
                 _gm = np.where(_sem == MESH_GOAL_ID, 255, 0).astype(np.uint8)
                 if int(_gm.sum()) >= int(args.lost_goal_min_px):
-                    if belief_g is None:   # seed ONCE from the mask, then dead-reckon (stable distance)
-                        belief_g = mask_to_body(_gm, depth, rgb.shape[0], rgb.shape[1], args.hfov_deg, float(args.goal_range))
+                    belief_g = mask_to_body(_gm, depth, rgb.shape[0], rgb.shape[1], args.hfov_deg, float(args.goal_range))
                     _ys, _xs = np.where(_gm > 0)
                     goal_mask = _gm
                     goal_info = {
@@ -1313,8 +1342,11 @@ def main() -> None:
                 ghost_obstacle_point = obstacle_point_from_world(ghost_obstacle, position, yaw)
                 obstacle_mask = np.maximum(obstacle_mask, ghost_obstacle_mask).astype(np.uint8)
 
-            if mesh_goal_mode:
+            if mesh_tracking_mode:
                 # obstacle = ONLY the rendered obstacle-mesh pixels (semantic id), never the ground.
+                # All-zero if no obstacle mesh was registered (no --obstacle-mesh-uv / no VLM obstacle
+                # resolved), same as before -- this only ever ADDS ground-truth precision, never
+                # removes the "no obstacle" case.
                 obstacle_mask = np.where(_sem == MESH_OBST_ID, 255, 0).astype(np.uint8)
             spatial = frame_to_spatial(depth, goal_mask, image_size, obstacle_mask, include_obstacle_channel=use_obstacle_channel).to(device)
             obstacle_map = obstacle_builder.build(depth) if args.obstacle_mode == "depth" else np.zeros((96, 96), dtype=np.float32)
