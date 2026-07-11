@@ -117,28 +117,49 @@ def draw_bounding_boxes(image: np.ndarray, boxes: List[Dict], class_id: int) -> 
     return image
 
 
-def run_inference_on_frame(frame: np.ndarray, model: nn.Module | None = None) -> Dict[str, List[Dict]]:
+def run_inference_on_frame(
+    image,
+    model: nn.Module = None,
+) -> Dict[str, List[Dict]]:
     """
-    Run SAM2 multiclass segmentation on a single BGR frame and extract
-    bedrock/bigrock bounding boxes. Same per-frame pipeline as
-    process_video's loop body (resize to IMAGE_SIZE, preprocess, argmax,
-    resize back to the frame's original size, filter to bedrock/bigrock,
-    contour -> bbox), factored out for single-image callers.
+    Run SAM2 segmentation on a single in-memory frame and extract bedrock/
+    bigrock bounding boxes, without requiring a video file.
+
+    Mirrors process_video()'s per-frame body (resize -> preprocess -> model
+    -> resize prediction back to original resolution -> filter classes ->
+    extract boxes) but returns the boxes directly instead of accumulating
+    them alongside video I/O.
 
     Args:
-        frame: (H, W, 3) BGR image, e.g. from cv2.imread/cv2.VideoCapture.
-        model: preloaded SAM2 model; loaded fresh via load_best_model() if None.
+        image: path to an image file (str/Path), or an already-loaded
+            (H, W, 3) uint8 BGR np.ndarray (OpenCV convention, matching
+            every other entry point in this module - e.g. a raw RGB array
+            from elsewhere must be converted to BGR before being passed
+            in here).
+        model: preloaded model, as returned by load_best_model(). Loaded
+            fresh via load_best_model() if not given.
 
     Returns:
-        {'bedrock': [...], 'bigrock': [...]} bounding box dicts (see
-        extract_bounding_boxes).
+        {'bedrock': [...], 'bigrock': [...]}, each a list of box dicts
+        with the same keys process_video() emits per frame ('x', 'y',
+        'width', 'height', 'area', 'class_id', 'class_name').
     """
+    if isinstance(image, (str, Path)):
+        image_path = Path(image)
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        frame = cv2.imread(str(image_path))
+        if frame is None:
+            raise ValueError(f"Failed to read image: {image_path}")
+    else:
+        frame = image
+
     if model is None:
         model = load_best_model()
-        model.eval()
+    model.eval()
 
+    height, width = frame.shape[:2]
     original_shape = frame.shape
-    height, width = original_shape[:2]
 
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     frame_resized = cv2.resize(frame_rgb, (IMAGE_SIZE, IMAGE_SIZE))
@@ -154,10 +175,10 @@ def run_inference_on_frame(frame: np.ndarray, model: nn.Module | None = None) ->
     pred_resized = cv2.resize(pred, (width, height), interpolation=cv2.INTER_NEAREST)
     filtered_mask = create_filtered_mask(pred_resized, original_shape)
 
-    return {
-        'bedrock': extract_bounding_boxes(filtered_mask, BEDROCK_CLASS),
-        'bigrock': extract_bounding_boxes(filtered_mask, BIGROCK_CLASS),
-    }
+    bedrock_boxes = extract_bounding_boxes(filtered_mask, BEDROCK_CLASS)
+    bigrock_boxes = extract_bounding_boxes(filtered_mask, BIGROCK_CLASS)
+
+    return {"bedrock": bedrock_boxes, "bigrock": bigrock_boxes}
 
 
 def process_video(
