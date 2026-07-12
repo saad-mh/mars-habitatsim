@@ -106,7 +106,7 @@ class Terrain:
     """Wraps a `HeightmapGrid` with a second, scene-level axis mapping
     (its own flip/swap) between the rover's world (x, z) and the grid's."""
 
-    def __init__(self, grid: HeightmapGrid, *, flip_x: bool = False, flip_z: bool = True, swap_xz: bool = False):
+    def __init__(self, grid: HeightmapGrid, *, flip_x: bool = False, flip_z: bool = False, swap_xz: bool = False):
         self._grid = grid
         self.flip_x = bool(flip_x)
         self.flip_z = bool(flip_z)

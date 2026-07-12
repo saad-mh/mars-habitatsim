@@ -14,6 +14,7 @@ from sam_vla.core.lifecycle import ServiceRegistry
 from sam_vla.core.types import Observation, Pose
 from sam_vla.env.terrain import SIZE_X, SIZE_Y, SIZE_Z, HeightmapGrid, Terrain
 from sam_vla.env.sim_utils import make_sensor, register_semantic_mesh, rgb_depth, save_obj, set_agent_pose
+from sam_vla.env.rock_generation import RockSpec, load_rock_field, register_rocks
 
 RGB_HEIGHT = 480
 RGB_WIDTH = 640
@@ -37,6 +38,7 @@ class MarsHabitatEnv:
         spawn_clearance: float = SPAWN_CLEARANCE_M,
         spawn_terrain_radius: float = SPAWN_TERRAIN_RADIUS_M,
         with_semantic: bool = False,
+        rock_field_path: Optional[str] = None,
     ):
         self._scene_path = Path(scene_path)
         self._heightmap_path = Path(heightmap_path)
@@ -53,6 +55,8 @@ class MarsHabitatEnv:
         self._spawn_clearance = spawn_clearance
         self._spawn_terrain_radius = spawn_terrain_radius
         self._with_semantic = with_semantic
+        self._rock_field_path = Path(rock_field_path) if rock_field_path else None
+        self.rocks: List[RockSpec] = []
 
     def __enter__(self) -> "MarsHabitatEnv":
         sim_cfg = habitat_sim.SimulatorConfiguration()
@@ -85,7 +89,7 @@ class MarsHabitatEnv:
             flip_z=True,
             swap_xz=False,
         )
-        self._terrain = Terrain(heightmap_grid, flip_x=False, flip_z=True, swap_xz=False)
+        self._terrain = Terrain(heightmap_grid, flip_x=False, flip_z=False, swap_xz=False)
 
         if self._randomise_spawn:
             x = random.uniform(-SIZE_X / 2.0, SIZE_X / 2.0)
@@ -96,6 +100,10 @@ class MarsHabitatEnv:
 
         y = self.get_height_at_xz(x, z)
         set_agent_pose(self._agent, x, y, z, yaw)
+
+        if self._rock_field_path is not None:
+            self.rocks, _rock_config = load_rock_field(self._rock_field_path)
+            register_rocks(self._sim, self.rocks)
 
         self._registry.start_all()
         return self

@@ -20,6 +20,7 @@ from habitat_sim.agent import AgentConfiguration
 import quaternion
 
 import qwen_vlm_client
+from sam_vla.env.rock_generation import load_rock_field, register_rocks
 
 
 HERE = Path(__file__).resolve().parent
@@ -688,6 +689,11 @@ def main() -> None:
     ap.add_argument("--navdp-root", default=None, help="Path to the navdp_sam repo containing model_s2_dit.py")
     ap.add_argument("--ckpt", required=True, help="Path to trained NavDP/S2DiT checkpoint")
     ap.add_argument("--scene", default=str(DEFAULT_SCENE))
+    ap.add_argument("--rock-field", default=None,
+                    help="Path to a rock_field.json produced by generate_rock_env.py. Loads that fixed, "
+                    "already-placed rock layout into the scene (visible in RGB before any goal/obstacle "
+                    "resolution runs) instead of an empty terrain -- use the same path across ablation "
+                    "runs to keep the obstacle layout identical.")
     ap.add_argument("--out", default="mars_navdp_rollout")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--weights", choices=["model", "ema"], default="model")
@@ -1001,6 +1007,11 @@ def main() -> None:
 
     sim = make_sim(Path(args.scene), args.height, args.width, args.hfov_deg, with_semantic=(mesh_goal_mode or args.goal_from_vlm))
     agent = sim.initialize_agent(0)
+
+    if args.rock_field:
+        rocks, _rock_config = load_rock_field(Path(args.rock_field))
+        register_rocks(sim, rocks)
+        print(f"[ROCKS] loaded {len(rocks)} rocks from {args.rock_field}", flush=True)
 
     x = float(args.start_x)
     z = float(args.start_z)

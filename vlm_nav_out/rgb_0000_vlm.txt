@@ -1,30 +1,16 @@
-```json
 {
   "goal_object": {
-    "object_id": 0,
+    "object_id": 2,
     "label": "rock",
-    "coordinates2D": [317, 477],
-    "reasoning": "This rock is the most scientifically significant as it appears to be a potential sample for analysis."
+    "coordinates2D": [520, 401],
+    "reasoning": "This rock is the most prominent and likely to be the primary target due to its size and position."
   },
   "obstacles": [
     {
       "object_id": 1,
       "label": "rock",
-      "coordinates2D": [212, 385],
-      "reasoning": "This rock is the next most significant obstacle as it is close to the goal and could potentially block the path if not avoided."
-    },
-    {
-      "object_id": 2,
-      "label": "rock",
-      "coordinates2D": [446, 371],
-      "reasoning": "This rock is another potential obstacle due to its proximity to the goal."
-    },
-    {
-      "object_id": 3,
-      "label": "rock",
-      "coordinates2D": [495, 351],
-      "reasoning": "This rock is also a potential obstacle due to its proximity to the goal."
+      "coordinates2D": [279, 692],
+      "reasoning": "This rock is close to the goal object and should be driven around before proceeding."
     }
   ]
 }
-```

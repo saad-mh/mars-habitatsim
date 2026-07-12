@@ -2,41 +2,23 @@
   "frame_id": 0,
   "vlm_response": {
     "goal_object": {
-      "object_id": 0,
+      "object_id": 2,
       "label": "rock",
       "coordinates2D": [
-        317,
-        477
+        520,
+        401
       ],
-      "reasoning": "This rock is the most scientifically significant as it appears to be a potential sample for analysis."
+      "reasoning": "This rock is the most prominent and likely to be the primary target due to its size and position."
     },
     "obstacles": [
       {
         "object_id": 1,
         "label": "rock",
         "coordinates2D": [
-          212,
-          385
+          279,
+          692
         ],
-        "reasoning": "This rock is the next most significant obstacle as it is close to the goal and could potentially block the path if not avoided."
-      },
-      {
-        "object_id": 2,
-        "label": "rock",
-        "coordinates2D": [
-          446,
-          371
-        ],
-        "reasoning": "This rock is another potential obstacle due to its proximity to the goal."
-      },
-      {
-        "object_id": 3,
-        "label": "rock",
-        "coordinates2D": [
-          495,
-          351
-        ],
-        "reasoning": "This rock is also a potential obstacle due to its proximity to the goal."
+        "reasoning": "This rock is close to the goal object and should be driven around before proceeding."
       }
     ]
   },
@@ -44,15 +26,15 @@
     "role": "goal",
     "label": "rock",
     "bbox": [
-      317.0,
-      477.0,
-      317.0,
-      477.0
+      520.0,
+      401.0,
+      520.0,
+      401.0
     ],
     "seed_world": [
-      14.436,
-      0.339,
-      11.8
+      -11.559,
+      0.036,
+      7.665
     ],
     "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_goal_rock_r0.50.obj",
     "radius": 0.5,
@@ -66,59 +48,17 @@
       "role": "obstacle",
       "label": "rock",
       "bbox": [
-        212.0,
-        385.0,
-        212.0,
-        385.0
+        279.0,
+        692.0,
+        279.0,
+        692.0
       ],
       "seed_world": [
-        3.385,
-        0.036,
-        8.373
+        -2.798,
+        -0.058,
+        8.608
       ],
       "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_obstacle_rock_r0.50.obj",
-      "radius": 0.5,
-      "num_vertices": 877,
-      "num_faces": 1624,
-      "semantic_id": 2,
-      "mask_path": null
-    },
-    {
-      "role": "obstacle1",
-      "label": "rock",
-      "bbox": [
-        446.0,
-        371.0,
-        446.0,
-        371.0
-      ],
-      "seed_world": [
-        6.484,
-        0.471,
-        -4.941
-      ],
-      "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_obstacle1_rock_r0.50.obj",
-      "radius": 0.5,
-      "num_vertices": 877,
-      "num_faces": 1624,
-      "semantic_id": 2,
-      "mask_path": null
-    },
-    {
-      "role": "obstacle2",
-      "label": "rock",
-      "bbox": [
-        495.0,
-        351.0,
-        495.0,
-        351.0
-      ],
-      "seed_world": [
-        16.5,
-        -0.037,
-        13.5
-      ],
-      "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_obstacle2_rock_r0.50.obj",
       "radius": 0.5,
       "num_vertices": 877,
       "num_faces": 1624,
@@ -127,9 +67,9 @@
     }
   ],
   "goal_target_world": [
-    14.435999870300293,
-    1.5389289855957031,
-    11.800000190734863
+    -11.559000015258789,
+    1.4065929651260376,
+    7.664999961853027
   ],
   "semantic_render_path": null
 }

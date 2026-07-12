@@ -59,6 +59,7 @@ def run(
     start_z: float = 8.0,
     start_yaw_deg: float = 0.0,
     randomise_spawn: bool = False,
+    rock_field_path: str = None,
     obj_mask_radius: float = 0.5,
     cbf: bool = False,
     cbf_d_safe: float = 0.75,
@@ -100,6 +101,7 @@ def run(
         start_yaw=math.radians(start_yaw_deg),
         randomise_spawn=randomise_spawn,
         with_semantic=True,
+        rock_field_path=rock_field_path,
     ) as env:
         obs0 = env.get_observation(frame_idx=0)
         goal_spec, goal_vlm_result, sam_detections = first_frame_resolver.resolve_verbose(obs0.rgb)
@@ -244,6 +246,13 @@ if __name__ == "__main__":
         "heightmap bounds, with height sampled from the heightmap",
     )
     parser.add_argument(
+        "--rock-field",
+        default=None,
+        help="Path to a rock_field.json produced by generate_rock_env.py. Loads that fixed, "
+        "already-placed rock layout into the scene instead of an empty terrain -- use the same "
+        "path across ablation runs to keep the obstacle layout identical.",
+    )
+    parser.add_argument(
         "--obj-mask-radius",
         type=float,
         default=0.5,
@@ -291,6 +300,7 @@ if __name__ == "__main__":
         start_z=args.start_z,
         start_yaw_deg=args.start_yaw,
         randomise_spawn=args.randomise_spawn,
+        rock_field_path=args.rock_field,
         obj_mask_radius=args.obj_mask_radius,
         cbf=args.cbf,
         cbf_d_safe=args.cbf_d_safe,
