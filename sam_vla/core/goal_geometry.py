@@ -24,6 +24,11 @@ GoalPosition = tuple[float, float, float]
 MESH_GOAL_ID = 1
 MESH_OBST_ID = 2
 
+# Semantic id for procedurally generated rock obstacles (sam_vla.env.rock_generation),
+# registered into the scene before goal/obstacle roles are assigned by SAM/VLM --
+# distinct from MESH_GOAL_ID/MESH_OBST_ID, which mark the *chosen* goal/obstacles.
+ROCK_SEMANTIC_ID = 3
+
 
 def intrinsics_from_hfov(height: int, width: int, hfov_deg: float) -> dict[str, float]:
     """Pinhole intrinsics (fx, fy, cx, cy) for a symmetric camera with the given

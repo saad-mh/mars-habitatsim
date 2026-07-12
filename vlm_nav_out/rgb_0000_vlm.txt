@@ -1,41 +1,29 @@
 ```json
 {
   "goal_object": {
-    "object_id": 5,
+    "object_id": 0,
     "label": "rock",
-    "coordinates2D": [415, 344],
-    "reasoning": "This rock is the most prominent and central object in the scene, likely serving as a landmark for navigation."
+    "coordinates2D": [317, 477],
+    "reasoning": "This rock is the most scientifically significant as it appears to be a potential sample for analysis."
   },
   "obstacles": [
     {
       "object_id": 1,
       "label": "rock",
-      "coordinates2D": [166, 415],
-      "reasoning": "This rock is located near the center of the scene and could obstruct the path if not avoided."
+      "coordinates2D": [212, 385],
+      "reasoning": "This rock is the next most significant obstacle as it is close to the goal and could potentially block the path if not avoided."
     },
     {
       "object_id": 2,
       "label": "rock",
-      "coordinates2D": [294, 412],
-      "reasoning": "This rock is positioned slightly to the left and could be a potential obstacle if the rover needs to navigate around it."
+      "coordinates2D": [446, 371],
+      "reasoning": "This rock is another potential obstacle due to its proximity to the goal."
     },
     {
       "object_id": 3,
       "label": "rock",
-      "coordinates2D": [211, 408],
-      "reasoning": "This rock is located near the bottom right corner and could be a potential obstacle if the rover needs to navigate around it."
-    },
-    {
-      "object_id": 4,
-      "label": "rock",
-      "coordinates2D": [94, 360],
-      "reasoning": "This rock is positioned near the bottom left corner and could be a potential obstacle if the rover needs to navigate around it."
-    },
-    {
-      "object_id": 6,
-      "label": "rock",
-      "coordinates2D": [303, 344],
-      "reasoning": "This rock is positioned near the top left corner and could be a potential obstacle if the rover needs to navigate around it."
+      "coordinates2D": [495, 351],
+      "reasoning": "This rock is also a potential obstacle due to its proximity to the goal."
     }
   ]
 }
