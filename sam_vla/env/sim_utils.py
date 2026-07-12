@@ -6,7 +6,7 @@ semantic sensor picks up).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import quaternion
@@ -43,12 +43,36 @@ def rgb_depth(obs: Dict[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
     return rgb.astype(np.uint8), depth.astype(np.float32)
 
 
-def save_obj(path: str, verts: np.ndarray, faces: np.ndarray) -> None:
+def save_obj(
+    path: str, verts: np.ndarray, faces: np.ndarray, diffuse_rgb: Optional[Tuple[float, float, float]] = None
+) -> None:
+    """Write an .obj mesh. If `diffuse_rgb` is given, also write a companion .mtl
+    with that diffuse color and zero specular (matte, non-shiny) -- the same
+    `Ks 0.000 0.000 0.000` convention the marsyard ground material uses -- and
+    reference it from the .obj so importers pick it up instead of falling back
+    to a shiny default gray material."""
+    path = Path(path)
     with open(path, "w") as f:
+        if diffuse_rgb is not None:
+            mtl_name = path.with_suffix(".mtl").name
+            f.write(f"mtllib {mtl_name}\n")
+            f.write("usemtl rock_mat\n")
         for x, y, z in verts:
             f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
         for a, b, c in faces:
             f.write(f"f {a + 1} {b + 1} {c + 1}\n")
+
+    if diffuse_rgb is not None:
+        r, g, b = diffuse_rgb
+        mtl_path = path.with_suffix(".mtl")
+        with open(mtl_path, "w") as f:
+            f.write("newmtl rock_mat\n")
+            f.write(f"Ka {r:.3f} {g:.3f} {b:.3f}\n")
+            f.write(f"Kd {r:.3f} {g:.3f} {b:.3f}\n")
+            f.write("Ks 0.000 0.000 0.000\n")
+            f.write("Ns 1.0\n")
+            f.write("d 1.0\n")
+            f.write("illum 1\n")
 
 
 def distance_to_goal(pose: Pose, goal_position: Tuple[float, float, float]) -> float:

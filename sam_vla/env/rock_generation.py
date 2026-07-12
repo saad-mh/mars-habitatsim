@@ -87,6 +87,16 @@ def _make_rock_mesh(
     return verts, np.asarray(faces, dtype=np.int64)
 
 
+_ROCK_BASE_RGB = (0.9411, 0.8196, 0.72549)
+_ROCK_COLOR_JITTER = 0.0  # per-channel +/- jitter so rocks aren't a flat, uniform color
+
+
+def _rock_diffuse_color(rng: random.Random) -> Tuple[float, float, float]:
+    return tuple(
+        min(1.0, max(0.0, c + rng.uniform(-_ROCK_COLOR_JITTER, _ROCK_COLOR_JITTER))) for c in _ROCK_BASE_RGB
+    )
+
+
 def _too_close(x: float, z: float, r: float, placed: Sequence[Tuple[float, float, float]], min_spacing: float) -> bool:
     for px, pz, pr in placed:
         if math.hypot(x - px, z - pz) < (r + pr + min_spacing):
@@ -151,7 +161,7 @@ def generate_rock_field(config: RockFieldConfig, terrain: Terrain, out_dir: Path
         world[:, 2] += z
 
         mesh_path = mesh_dir / f"rock_{i:03d}.obj"
-        save_obj(str(mesh_path), world, faces)
+        save_obj(str(mesh_path), world, faces, diffuse_rgb=_rock_diffuse_color(rng))
 
         placed.append((x, z, radius))
         rocks.append(RockSpec(id=i, x=x, y=y, z=z, yaw=yaw, radius=radius, mesh_path=str(mesh_path)))

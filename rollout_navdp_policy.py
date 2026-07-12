@@ -27,8 +27,7 @@ DEFAULT_SCENE = HERE / "assets/marsyard2022.glb"
 DEFAULT_OBJ = HERE / "assets/marsyard2022.obj"
 
 QWEN_STEER_PROMPT = (
-    "You are piloting a rover approaching its goal. Looking at this view, should the rover "
-    "go left, go right, or stop? Reply with exactly one word: left, right, or stop."
+    "You are piloting a rover approaching its goal. Looking at this view, should the rover go left, go right, or stop? Reply with exactly one word: right, left, or stop."
 )
 
 SIZE_X = 50.0
