@@ -1,0 +1,131 @@
+You must output ONLY valid JSON with no other text.
+
+1. Goal Object: Identify the single most scientifically significant detected object (can be rock or sand). This is your primary target.
+2. Obstacles: Select only 1 rock object from the remaining detected objects (not the goal object) that the rover must drive to/around before it heads to the goal. For now, select exactly one, but the field must always be a JSON list so more can be added later without changing this format.
+
+Output format:
+{
+  "goal_object": {
+    "object_id": <int>,
+    "label": <string>,
+    "coordinates2D": <array>,
+    "reasoning": <string>
+  },
+  "obstacles": [
+    {
+      "object_id": <int>,
+      "label": <string>,
+      "coordinates2D": <array>,
+      "reasoning": <string>
+    }
+  ]
+}
+
+Requirements:
+- No obstacle may share an object_id with the goal_object
+- Every obstacle's label must be "rock"
+- "obstacles" must always be a JSON array (never a bare object), even when it holds a single entry
+- Output ONLY JSON, no preamble or explanation
+- If no valid obstacle is detected, output "obstacles": []
+
+The first image is the raw camera frame. The second image is the same frame with detected object bounding boxes overlaid, each tagged with its object id.Detected objects (id, label, bounding box points in pixels):
+[
+  {
+    "id": 0,
+    "label": "rock",
+    "points": [
+      [
+        407,
+        417
+      ],
+      [
+        418,
+        422
+      ]
+    ]
+  },
+  {
+    "id": 1,
+    "label": "rock",
+    "points": [
+      [
+        166,
+        415
+      ],
+      [
+        197,
+        432
+      ]
+    ]
+  },
+  {
+    "id": 2,
+    "label": "rock",
+    "points": [
+      [
+        294,
+        412
+      ],
+      [
+        311,
+        425
+      ]
+    ]
+  },
+  {
+    "id": 3,
+    "label": "rock",
+    "points": [
+      [
+        211,
+        408
+      ],
+      [
+        244,
+        427
+      ]
+    ]
+  },
+  {
+    "id": 4,
+    "label": "rock",
+    "points": [
+      [
+        94,
+        360
+      ],
+      [
+        101,
+        367
+      ]
+    ]
+  },
+  {
+    "id": 5,
+    "label": "rock",
+    "points": [
+      [
+        415,
+        344
+      ],
+      [
+        443,
+        368
+      ]
+    ]
+  },
+  {
+    "id": 6,
+    "label": "rock",
+    "points": [
+      [
+        303,
+        344
+      ],
+      [
+        349,
+        377
+      ]
+    ]
+  }
+]

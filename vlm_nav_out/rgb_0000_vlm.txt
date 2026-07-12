@@ -1,0 +1,42 @@
+```json
+{
+  "goal_object": {
+    "object_id": 5,
+    "label": "rock",
+    "coordinates2D": [415, 344],
+    "reasoning": "This rock is the most prominent and central object in the scene, likely serving as a landmark for navigation."
+  },
+  "obstacles": [
+    {
+      "object_id": 1,
+      "label": "rock",
+      "coordinates2D": [166, 415],
+      "reasoning": "This rock is located near the center of the scene and could obstruct the path if not avoided."
+    },
+    {
+      "object_id": 2,
+      "label": "rock",
+      "coordinates2D": [294, 412],
+      "reasoning": "This rock is positioned slightly to the left and could be a potential obstacle if the rover needs to navigate around it."
+    },
+    {
+      "object_id": 3,
+      "label": "rock",
+      "coordinates2D": [211, 408],
+      "reasoning": "This rock is located near the bottom right corner and could be a potential obstacle if the rover needs to navigate around it."
+    },
+    {
+      "object_id": 4,
+      "label": "rock",
+      "coordinates2D": [94, 360],
+      "reasoning": "This rock is positioned near the bottom left corner and could be a potential obstacle if the rover needs to navigate around it."
+    },
+    {
+      "object_id": 6,
+      "label": "rock",
+      "coordinates2D": [303, 344],
+      "reasoning": "This rock is positioned near the top left corner and could be a potential obstacle if the rover needs to navigate around it."
+    }
+  ]
+}
+```

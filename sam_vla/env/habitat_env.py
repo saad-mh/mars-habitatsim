@@ -9,7 +9,7 @@ import numpy as np
 import quaternion
 from habitat_sim.agent import AgentConfiguration
 
-from sam_vla.core.goal_geometry import GoalPosition, disc_mesh
+from sam_vla.core.goal_geometry import GoalPosition, terrain_patch_mesh
 from sam_vla.core.lifecycle import ServiceRegistry
 from sam_vla.core.types import Observation, Pose
 from sam_vla.env.terrain import SIZE_X, SIZE_Y, SIZE_Z, HeightmapGrid, Terrain
@@ -143,13 +143,16 @@ class MarsHabitatEnv:
         out_dir: str,
         name: str,
     ):
-        """Register a small flat disc mesh at world_pos as a render-only,
-        non-collidable object carrying `semantic_id`, so the semantic sensor
-        renders a goal/obstacle mask around that point. Seeded from an
-        already-backprojected world point (goal_geometry.bbox_to_world)
-        rather than a raw pixel + depth patch. Requires with_semantic=True.
+        """Register a small terrain-following patch mesh at world_pos as a
+        render-only, non-collidable object carrying `semantic_id`, so the
+        semantic sensor renders a goal/obstacle mask around that point.
+        Seeded from an already-backprojected world point
+        (goal_geometry.bbox_to_world) rather than a raw pixel + depth patch;
+        the patch itself is resampled from the terrain heightmap (self._terrain)
+        so it hugs the ground instead of sitting on one flat plane. Requires
+        with_semantic=True.
         """
-        verts, faces = disc_mesh(world_pos, radius)
+        verts, faces = terrain_patch_mesh(world_pos, radius, self._terrain)
         mesh_dir = Path(out_dir) / "masks"
         mesh_dir.mkdir(parents=True, exist_ok=True)
         mesh_path = str(mesh_dir / f"{name}.obj")

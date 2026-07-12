@@ -11,6 +11,7 @@ already commits to (heading = (cos_yaw, sin_yaw) in the x-z plane).
 from __future__ import annotations
 
 import math
+from typing import Callable
 
 import numpy as np
 
@@ -112,6 +113,56 @@ def disc_mesh(
     n = len(ring)
     faces = np.asarray([(0, i + 1, (i + 1) % n + 1) for i in range(n)], dtype=np.int64)
     return verts, faces
+
+
+def terrain_patch_mesh(
+    center: GoalPosition,
+    radius: float,
+    terrain_height_at: Callable[[float, float], float],
+    resolution: float = 0.03,
+    lift: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Terrain-following circular patch of triangles, resampled from the heightmap on
+    an (x, z) grid at `resolution` spacing -- each vertex's y comes from
+    `terrain_height_at`, so the mesh follows the ground under it instead of sitting on
+    one flat plane. Ported from vlm_nav_interactive.make_local_height_patch_mesh, which
+    rollout_navdp_policy's --goal-from-vlm path uses to mark VLM-selected goal/obstacle
+    objects; disc_mesh's constant-y disc plays the same role here but comes out visibly
+    flat -- and floating off the surface wherever the yard's terrain isn't level under
+    `center` -- which is what register_object_mask was using before this replaced it.
+    `center`'s own y is ignored (only x, z anchor the patch); grid cells are only
+    triangulated when all four corners fall inside the disc, so the boundary comes out
+    a (stairstepped) circle rather than a square, matching disc_mesh's footprint.
+    """
+    cx, _cy, cz = center
+    n = max(int(math.ceil(float(radius) / float(resolution))), 1)
+    offsets = np.arange(-n, n + 1) * float(resolution)
+
+    index_grid = -np.ones((len(offsets), len(offsets)), dtype=int)
+    verts = []
+    for j, dz in enumerate(offsets):
+        for i, dx in enumerate(offsets):
+            if dx * dx + dz * dz > radius * radius:
+                continue
+            wx = cx + dx
+            wz = cz + dz
+            wy = float(terrain_height_at(wx, wz)) + float(lift)
+            index_grid[j, i] = len(verts)
+            verts.append((wx, wy, wz))
+
+    faces = []
+    for j in range(len(offsets) - 1):
+        for i in range(len(offsets) - 1):
+            v00, v10 = index_grid[j, i], index_grid[j, i + 1]
+            v01, v11 = index_grid[j + 1, i], index_grid[j + 1, i + 1]
+            if v00 < 0 or v10 < 0 or v01 < 0 or v11 < 0:
+                continue
+            faces.append((v00, v01, v11))
+            faces.append((v00, v11, v10))
+
+    verts_arr = np.asarray(verts, dtype=np.float64) if verts else np.empty((0, 3), dtype=np.float64)
+    faces_arr = np.asarray(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
+    return verts_arr, faces_arr
 
 
 def distance_to_goal(pose: Pose, goal_position: GoalPosition) -> float:
