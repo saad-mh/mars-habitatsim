@@ -426,8 +426,7 @@ class MarsCameraApp:
         draw = ImageDraw.Draw(img)
 
         status = status_override or (
-            f"x={self.x:.2f} y={self.y:.2f} z={self.z:.2f} "
-            f"yaw={np.rad2deg(self.yaw):.1f}  clearance={self.clearance:.2f}"
+            f"x={self.x:.2f}  z={self.z:.2f}  yaw={np.rad2deg(self.yaw):.1f}"
         )
 
         draw.rectangle([0, 0, img.width, 24], fill=(0, 0, 0))

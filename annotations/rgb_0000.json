@@ -1,0 +1,129 @@
+{
+  "version": "5.4.1",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "rock",
+      "points": [
+        [
+          407,
+          417
+        ],
+        [
+          418,
+          422
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "rectangle",
+      "flags": {},
+      "id": 0
+    },
+    {
+      "label": "rock",
+      "points": [
+        [
+          166,
+          415
+        ],
+        [
+          197,
+          432
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "rectangle",
+      "flags": {},
+      "id": 1
+    },
+    {
+      "label": "rock",
+      "points": [
+        [
+          294,
+          412
+        ],
+        [
+          311,
+          425
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "rectangle",
+      "flags": {},
+      "id": 2
+    },
+    {
+      "label": "rock",
+      "points": [
+        [
+          211,
+          408
+        ],
+        [
+          244,
+          427
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "rectangle",
+      "flags": {},
+      "id": 3
+    },
+    {
+      "label": "rock",
+      "points": [
+        [
+          94,
+          360
+        ],
+        [
+          101,
+          367
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "rectangle",
+      "flags": {},
+      "id": 4
+    },
+    {
+      "label": "rock",
+      "points": [
+        [
+          415,
+          344
+        ],
+        [
+          443,
+          368
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "rectangle",
+      "flags": {},
+      "id": 5
+    },
+    {
+      "label": "rock",
+      "points": [
+        [
+          303,
+          344
+        ],
+        [
+          349,
+          377
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "rectangle",
+      "flags": {},
+      "id": 6
+    }
+  ],
+  "imagePath": "rgb_0000.png",
+  "imageData": null,
+  "imageHeight": 720,
+  "imageWidth": 720
+}
