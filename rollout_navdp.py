@@ -21,6 +21,7 @@ import quaternion
 
 import qwen_vlm_client
 from sam_vla.env.rock_generation import load_rock_field, register_rocks
+from sam_vla.logging.episode_logger import EpisodeLogger, make_run_id
 
 
 HERE = Path(__file__).resolve().parent
@@ -694,6 +695,12 @@ def main() -> None:
                     "resolution runs) instead of an empty terrain -- use the same path across ablation "
                     "runs to keep the obstacle layout identical.")
     ap.add_argument("--out", default="mars_navdp_rollout")
+    ap.add_argument("--log-root", default="logs",
+                    help="Root dir for structured per-episode ablation logs (config/frames/obstacles/"
+                         "qwen_queries/cbf_events/summary); a timestamped run_id subdir is created "
+                         "under it every rollout, separate from --out.")
+    ap.add_argument("--log-save-frames", action="store_true",
+                    help="Also dump each step's raw RGB frame under the log run dir's frames/ folder.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--weights", choices=["model", "ema"], default="model")
     # Compatibility knobs matching scripts/rollout_habitat_policy.py.
@@ -1007,6 +1014,7 @@ def main() -> None:
     sim = make_sim(Path(args.scene), args.height, args.width, args.hfov_deg, with_semantic=(mesh_goal_mode or args.goal_from_vlm))
     agent = sim.initialize_agent(0)
 
+    rocks, _rock_config = [], None
     if args.rock_field:
         rocks, _rock_config = load_rock_field(Path(args.rock_field))
         register_rocks(sim, rocks)
@@ -1017,6 +1025,8 @@ def main() -> None:
     yaw = math.radians(float(args.start_yaw_deg))
     dt = 1.0 / float(args.hz)
 
+    cbf_obstacle_id = "obstacle"  # identifies the single obstacle the live CBF math tracks, for
+                                   # cbf_events.jsonl -- refined below once VLM/ghost obstacle resolve
     vlm_goal_mesh = None
     vlm_mesh_tracking = False   # True once the VLM's resolved goal mesh is registered with the
                                  # semantic sensor below, so the main loop tracks it from the live
@@ -1085,6 +1095,7 @@ def main() -> None:
         # stable world point over the mask to avoid abeam-pass flicker -- see ctrl_op below) still
         # has one, unless the caller passed an explicit ghost obstacle of their own.
         if vlm_obstacle_meshes:
+            cbf_obstacle_id = "vlm_obstacle"
             vlm_obstacle_mesh = vlm_obstacle_meshes[0]
             register_semantic_mesh(sim, vlm_obstacle_mesh["mesh_path"], MESH_OBST_ID)
             if args.ghost_obstacle_x is None and args.ghost_obstacle_z is None:
@@ -1150,6 +1161,55 @@ def main() -> None:
             [float(args.ghost_obstacle_x), float(obstacle_y), float(args.ghost_obstacle_z)],
             dtype=np.float32,
         )
+        if cbf_obstacle_id == "obstacle":
+            cbf_obstacle_id = "ghost"
+
+    # Structured per-episode ablation logs (separate from the --out npz/manifest dump above):
+    # config.json / obstacles.json up front, frames.jsonl / qwen_queries.jsonl / cbf_events.jsonl
+    # appended to every step, summary.json once at the end. See sam_vla/logging/episode_logger.py.
+    goal_mode = "vlm" if args.goal_from_vlm else ("uv" if args.goal_mesh_uv else "coord")
+    steering_mode = "nudge" if args.qwen_steer else "none"
+    log_config = {
+        "scene_glb": str(Path(args.scene).expanduser().resolve()),
+        "goal_mode": goal_mode,
+        "goal_coord": [float(args.goal_x), float(args.goal_z)] if (args.goal_x is not None and args.goal_z is not None) else None,
+        "steering_mode": steering_mode,
+        "cbf_enabled": bool(args.cbf),
+        "obstacle_count": len(rocks) if rocks else (1 if ghost_obstacle is not None else 0),
+        "obstacle_seed": _rock_config.seed if _rock_config is not None else None,
+        "obstacle_distance_threshold_X": float(args.cbf_d_safe),
+        "goal_distance_threshold_Y": float(args.stop_dist),
+        "max_steps": int(args.max_steps),
+        "agent_height_offset": float(args.clearance),
+    }
+    run_id = make_run_id(log_config)
+    episode_logger = EpisodeLogger(run_id, log_config, log_root=args.log_root, save_frames=args.log_save_frames)
+    if rocks:
+        obstacle_records = [
+            {
+                "id": f"rock_{r.id:03d}",
+                "position": [float(r.x), float(r.y), float(r.z)],
+                "orientation": [float(v) for v in yaw_quat_xyzw(float(r.yaw))],
+                "radius": float(r.radius),
+                "is_goal": False,
+            }
+            for r in rocks
+        ]
+        episode_logger.write_obstacles(obstacle_records, goal_id=("vlm_goal" if args.goal_from_vlm else None))
+    elif ghost_obstacle is not None:
+        episode_logger.write_obstacles(
+            [{
+                "id": "ghost",
+                "position": [float(ghost_obstacle[0]), float(ghost_obstacle[1]), float(ghost_obstacle[2])],
+                "orientation": [0.0, 0.0, 0.0, 1.0],
+                "radius": float(args.ghost_obstacle_world_radius),
+                "is_goal": False,
+            }],
+            goal_id=("vlm_goal" if args.goal_from_vlm else None),
+        )
+    else:
+        episode_logger.write_obstacles([], goal_id=("vlm_goal" if args.goal_from_vlm else None))
+    termination_reason = "timeout"
 
     rows = {k: [] for k in [
         "rgb", "depth", "goal_mask", "obstacle_mask", "seg_masks", "pose", "proprio",
@@ -1239,12 +1299,19 @@ def main() -> None:
                     last_qwen_poll_t = now_t
                     frame_path = str(out_dir / "qwen_steer_frame.jpg")
                     Image.fromarray(rgb.astype(np.uint8)).convert("RGB").save(frame_path)
+                    query_t0 = time.perf_counter()
                     try:
                         qwen_cmd_txt = qwen_vlm_client.query_vlm_persistent(
                             frame_path, prompt=QWEN_STEER_PROMPT, max_new_tokens=8,
                             host=args.qwen_host, port=args.qwen_port,
                         )
                         print(f"[qwen-steer] t={now_t:.2f} step={step} -> {qwen_cmd_txt!r}", flush=True)
+                        episode_logger.log_qwen_query(
+                            step=step, query_type="action_suggestion", trigger="goal_proximity",
+                            input_data={"goal_belief": {"range": goal_dist_now}, "frame": frame_path},
+                            output_data={"action": qwen_cmd_txt},
+                            latency_ms=(time.perf_counter() - query_t0) * 1000.0,
+                        )
                     except Exception as e:
                         print(f"[qwen-steer] query failed: {e}", flush=True)
                 cmd_txt = qwen_cmd_txt
@@ -1646,8 +1713,14 @@ def main() -> None:
                 yaw_cmd = float(np.clip(
                     float(args.cbf_pursuit_kp) * psi, -float(args.max_yaw_rate), float(args.max_yaw_rate),
                 ))
+                nominal_action_orbit = [float(v) for v in action_3d]
                 action_3d = np.asarray([float(args.cbf_goaround_forward), 0.0, yaw_cmd], dtype=np.float32)
                 escape_active += 1
+                episode_logger.log_cbf_event(
+                    step=step, obstacle_id=cbf_obstacle_id, distance=float(L),
+                    nominal_action=nominal_action_orbit, overridden_action=[float(v) for v in action_3d],
+                    mode="orbit",
+                )
             elif around_side is not None:
                 around_side = None  # rock no longer blocks the goal ray -> release the side
 
@@ -1669,6 +1742,7 @@ def main() -> None:
                 if cone_clears and float(action_3d[0]) > 0.0:
                     pass  # turned enough that forward motion misses the obstacle -> let it drive
                 else:
+                    nominal_action_gate = [float(v) for v in action_3d]
                     action_3d, _gated = project_forward_velocity_cbf(
                         action_3d,
                         ctrl_op,
@@ -1680,6 +1754,11 @@ def main() -> None:
                     )
                     if _gated:
                         hard_gate_fired += 1
+                        episode_logger.log_cbf_event(
+                            step=step, obstacle_id=cbf_obstacle_id, distance=float(math.hypot(p_fwd, p_lat)),
+                            nominal_action=nominal_action_gate, overridden_action=[float(v) for v in action_3d],
+                            mode="brake",
+                        )
 
             # VLA counterfactual data: at blocked steps, save the NEUTRAL-goal observation the
             # policy sees, plus ALL FOUR instruction targets on that SAME observation:
@@ -1758,6 +1837,29 @@ def main() -> None:
             rows["belief_fwd"].append(bf)
             rows["belief_left"].append(bl)
 
+            if rocks:
+                distances_to_obstacles = {
+                    f"rock_{r.id:03d}": float(math.hypot(pose[0] - r.x, pose[2] - r.z)) for r in rocks
+                }
+            elif ghost_obstacle is not None:
+                distances_to_obstacles = {cbf_obstacle_id: float(obstacle_info["range"])}
+            else:
+                distances_to_obstacles = {}
+            episode_logger.log_frame(
+                step=step,
+                position=[float(pose[0]), float(pose[1]), float(pose[2])],
+                orientation=[float(pose[3]), float(pose[4]), float(pose[5]), float(pose[6])],
+                action={"v_fwd": float(action_3d[0]), "v_lat": float(action_3d[1]), "yaw_rate": float(action_3d[2])},
+                distances_to_obstacles=distances_to_obstacles,
+                cbf_active=bool(avoiding),
+                goal_belief={
+                    "range": goal_dist,
+                    "bearing": math.degrees(planar_goal_bearing(position, yaw, goal)),
+                    "source": "observed" if int(goal_mask.sum()) >= int(args.lost_goal_min_px) else "dead_reckoned",
+                },
+            )
+            episode_logger.log_rendered_frame(step, rgb)
+
             if step % max(int(args.save_every), 1) == 0:
                 lost_txt = " LOST" if int(goal_mask.sum()) < int(args.lost_goal_min_px) else ""
                 text = f"t={step} dist={goal_dist:.2f} obs={int(obstacle_mask.sum())} v={action_3d[0]:.2f} yaw={math.degrees(yaw):.1f}{lost_txt}"
@@ -1784,10 +1886,17 @@ def main() -> None:
             belief_dist = float(np.hypot(belief_g[0], belief_g[1])) if belief_g is not None else float("nan")
             if goal_dist <= float(args.stop_dist):
                 print(f"Reached goal at step {step} dist={goal_dist:.2f}m (belief={belief_dist:.2f})", flush=True)
+                termination_reason = "goal_reached"
                 break
             if stop_cmd:   # language "stop" already halted (action zeroed above) -- end the rollout,
                 print(f"Stopped by language command at step {step} dist={goal_dist:.2f}m", flush=True)
+                termination_reason = "qwen_stop"
                 break
+    except BaseException:
+        # Make sure the structured logs are flushed and closed even if the rollout crashes
+        # mid-episode -- the happy-path finalize() call below is skipped once this re-raises.
+        episode_logger.finalize({"success": False, "termination_reason": "exception"})
+        raise
     finally:
         sim.close()
 
@@ -1797,6 +1906,10 @@ def main() -> None:
         flush=True,
     )
     success = bool(rows["goal_distance"] and rows["goal_distance"][-1] <= float(args.stop_dist))
+    episode_logger.finalize({
+        "success": success,
+        "termination_reason": termination_reason,
+    })
     npz_path = out_dir / "rollout.npz"
     np.savez_compressed(
         npz_path,

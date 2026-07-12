@@ -1,9 +1,9 @@
 ```json
 {
   "goal_object": {
-    "object_id": 2,
+    "object_id": 0,
     "label": "rock",
-    "coordinates2D": [521, 401],
+    "coordinates2D": [224, 711],
     "reasoning": "This rock is the most scientifically significant as it appears to be a potential sample for analysis."
   },
   "obstacles": [
@@ -11,7 +11,25 @@
       "object_id": 1,
       "label": "rock",
       "coordinates2D": [278, 692],
-      "reasoning": "This rock is the next most significant obstacle as it is close to the goal and requires careful navigation around it."
+      "reasoning": "This rock is the next most significant obstacle as it is close to the goal and could potentially block the path if not avoided."
+    },
+    {
+      "object_id": 2,
+      "label": "rock",
+      "coordinates2D": [517, 401],
+      "reasoning": "This rock is another significant obstacle due to its proximity to the goal and the need to navigate around it."
+    },
+    {
+      "object_id": 3,
+      "label": "rock",
+      "coordinates2D": [425, 372],
+      "reasoning": "This rock is also a significant obstacle as it is close to the goal and could obstruct the rover's path."
+    },
+    {
+      "object_id": 4,
+      "label": "rock",
+      "coordinates2D": [315, 364],
+      "reasoning": "This rock is another obstacle that needs to be avoided to reach the goal."
     }
   ]
 }

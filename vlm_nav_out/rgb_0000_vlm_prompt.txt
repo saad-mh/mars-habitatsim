@@ -35,11 +35,11 @@ The first image is the raw camera frame. The second image is the same frame with
     "label": "rock",
     "points": [
       [
-        225,
+        224,
         711
       ],
       [
-        250,
+        252,
         718
       ]
     ]
@@ -53,7 +53,7 @@ The first image is the raw camera frame. The second image is the same frame with
         692
       ],
       [
-        323,
+        321,
         717
       ]
     ]
@@ -63,12 +63,12 @@ The first image is the raw camera frame. The second image is the same frame with
     "label": "rock",
     "points": [
       [
-        521,
+        517,
         401
       ],
       [
         571,
-        440
+        441
       ]
     ]
   },
@@ -77,12 +77,12 @@ The first image is the raw camera frame. The second image is the same frame with
     "label": "rock",
     "points": [
       [
-        214,
-        391
+        425,
+        372
       ],
       [
-        244,
-        406
+        462,
+        403
       ]
     ]
   },
@@ -91,26 +91,12 @@ The first image is the raw camera frame. The second image is the same frame with
     "label": "rock",
     "points": [
       [
-        426,
-        372
-      ],
-      [
-        461,
-        402
-      ]
-    ]
-  },
-  {
-    "id": 5,
-    "label": "rock",
-    "points": [
-      [
         315,
-        370
+        364
       ],
       [
         385,
-        401
+        400
       ]
     ]
   }
