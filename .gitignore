@@ -24,3 +24,5 @@ marsyard2022_tri.glb
 *.pth
 *.md
 .venv
+
+logs

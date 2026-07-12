@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import time
+import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional, Sequence, Tuple
@@ -694,7 +695,8 @@ def main() -> None:
                     "already-placed rock layout into the scene (visible in RGB before any goal/obstacle "
                     "resolution runs) instead of an empty terrain -- use the same path across ablation "
                     "runs to keep the obstacle layout identical.")
-    ap.add_argument("--out", default="mars_navdp_rollout")
+    ap.add_argument("--out", default=f"navdp_rollout{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    help="Output directory for the rollout results.")
     ap.add_argument("--log-root", default="logs",
                     help="Root dir for structured per-episode ablation logs (config/frames/obstacles/"
                          "qwen_queries/cbf_events/summary); a timestamped run_id subdir is created "
