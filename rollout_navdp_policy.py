@@ -977,7 +977,7 @@ def main() -> None:
     ap.add_argument("--navdp-root", default=None, help="Path to the navdp_sam repo containing model_s2_dit.py")
     ap.add_argument("--ckpt", required=True, help="Path to trained NavDP/S2DiT checkpoint")
     ap.add_argument("--scene", default=str(DEFAULT_SCENE))
-    ap.add_argument("--out", default="mars_navdp_rollout")
+    ap.add_argument("--out", default=f"rollouts/navdp_rollout{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Output dir for rollout frame")
     ap.add_argument("--log-root", default="logs",
                     help="Root dir for structured per-episode ablation logs (config/frames/obstacles/"
                          "qwen_queries/cbf_events/summary); a timestamped run_id subdir is created "
@@ -1377,9 +1377,9 @@ def main() -> None:
               f"MESH_GOAL_ID; belief re-derived from the live rendered mask every step (no dead-reckoning "
               f"while in view)", flush=True)
 
-        # OBSTACLE: the VLM's prompt asks for exactly one "rock" obstacle, but Qwen routinely
-        # returns several -- register ALL of them under MESH_OBST_ID so the rendered obstacle mask
-        # the policy/CBF/DWA see is the union of every flagged rock's footprint, not just the
+        # OBSTACLE: the VLM's prompt now asks for exactly one goal and marks every OTHER detected
+        # object as an obstacle -- register ALL of them under MESH_OBST_ID so the rendered obstacle
+        # mask the policy/CBF/DWA see is the union of every flagged object's footprint, not just the
         # first. ALSO wire the first one's resolved world seed into --ghost-obstacle-x/y/z so the
         # CBF/orbit avoidance's cone-mode math (which prefers a single stable world point over the
         # mask to avoid abeam-pass flicker) still has one, unless the caller passed an explicit

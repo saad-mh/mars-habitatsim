@@ -73,8 +73,8 @@ VLM_PYTHON_BIN = f"{CONDA_BASE}/envs/qwen_vlm/bin/python"
 VLM_SCRIPT = str(HERE / "vlm_query.py")
 VLM_PROMPT = """You must output ONLY valid JSON with no other text.
 
-1. Goal Object: Identify the single most scientifically significant detected object (can be rock or sand). This is your primary target.
-2. Obstacles: Select only 1 rock object from the remaining detected objects (not the goal object) that the rover must drive to/around before it heads to the goal. For now, select exactly one, but the field must always be a JSON list so more can be added later without changing this format.
+1. Goal Object: Identify the single most scientifically significant detected object (can be rock or sand). This is your primary target. Select exactly ONE.
+2. Obstacles: every OTHER detected object (i.e. every detected object except the one you picked as the goal) is an obstacle the rover must drive to/around before it heads to the goal. List ALL of them, not a subset.
 
 Output format:
 {
@@ -95,11 +95,12 @@ Output format:
 }
 
 Requirements:
+- Exactly one goal_object, chosen from the detected objects
+- "obstacles" must contain every detected object except the goal_object -- none may be omitted
 - No obstacle may share an object_id with the goal_object
-- Every obstacle's label must be "rock"
 - "obstacles" must always be a JSON array (never a bare object), even when it holds a single entry
 - Output ONLY JSON, no preamble or explanation
-- If no valid obstacle is detected, output "obstacles": []"""
+- If there are no other detected objects besides the goal, output "obstacles": []"""
 
 """VLM_PROMPT = "Identify the most scientifically significant test subject among the detected objects. Output strictly in JSON format with keys: 'object_id', 'label', 'coordinates2Darray', 'reasoning'."""
 
