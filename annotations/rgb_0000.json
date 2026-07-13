@@ -6,12 +6,12 @@
       "label": "rock",
       "points": [
         [
-          225,
-          711
+          386,
+          410
         ],
         [
-          249,
-          718
+          413,
+          427
         ]
       ],
       "group_id": null,
@@ -23,12 +23,12 @@
       "label": "rock",
       "points": [
         [
-          279,
-          692
+          182,
+          383
         ],
         [
-          323,
-          717
+          198,
+          403
         ]
       ],
       "group_id": null,
@@ -40,69 +40,18 @@
       "label": "rock",
       "points": [
         [
-          518,
-          412
+          292,
+          373
         ],
         [
-          548,
-          440
+          337,
+          402
         ]
       ],
       "group_id": null,
       "shape_type": "rectangle",
       "flags": {},
       "id": 2
-    },
-    {
-      "label": "rock",
-      "points": [
-        [
-          221,
-          389
-        ],
-        [
-          245,
-          403
-        ]
-      ],
-      "group_id": null,
-      "shape_type": "rectangle",
-      "flags": {},
-      "id": 3
-    },
-    {
-      "label": "rock",
-      "points": [
-        [
-          312,
-          379
-        ],
-        [
-          339,
-          398
-        ]
-      ],
-      "group_id": null,
-      "shape_type": "rectangle",
-      "flags": {},
-      "id": 4
-    },
-    {
-      "label": "rock",
-      "points": [
-        [
-          424,
-          373
-        ],
-        [
-          467,
-          404
-        ]
-      ],
-      "group_id": null,
-      "shape_type": "rectangle",
-      "flags": {},
-      "id": 5
     }
   ],
   "imagePath": "rgb_0000.png",

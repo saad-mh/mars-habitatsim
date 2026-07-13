@@ -1,35 +1,41 @@
 ```json
 {
   "goal_object": {
-    "object_id": 2,
+    "object_id": 0,
     "label": "rock",
-    "coordinates2D": [518, 412],
-    "reasoning": "This rock is the most prominent and central object in the image, suggesting it could be of scientific interest."
+    "coordinates2D": [42, 443],
+    "reasoning": "This rock is the most scientifically significant object as it appears to be a potential sample for analysis."
   },
   "obstacles": [
     {
       "object_id": 1,
       "label": "rock",
-      "coordinates2D": [279, 692],
-      "reasoning": "This rock is located near the center of the image and is relatively close to the goal object."
+      "coordinates2D": [568, 436],
+      "reasoning": "This rock is the next most significant obstacle as it is located in the path of the rover and needs to be driven around."
+    },
+    {
+      "object_id": 2,
+      "label": "rock",
+      "coordinates2D": [159, 397],
+      "reasoning": "This rock is another potential obstacle that needs to be driven around."
     },
     {
       "object_id": 3,
       "label": "rock",
-      "coordinates2D": [221, 389],
-      "reasoning": "This rock is positioned towards the bottom left of the image and is relatively close to the goal object."
+      "coordinates2D": [207, 387],
+      "reasoning": "This rock is another obstacle that needs to be driven around."
     },
     {
       "object_id": 4,
       "label": "rock",
-      "coordinates2D": [312, 379],
-      "reasoning": "This rock is located towards the bottom right of the image and is relatively close to the goal object."
+      "coordinates2D": [311, 379],
+      "reasoning": "This rock is another obstacle that needs to be driven around."
     },
     {
       "object_id": 5,
       "label": "rock",
-      "coordinates2D": [424, 373],
-      "reasoning": "This rock is positioned towards the top right of the image and is relatively close to the goal object."
+      "coordinates2D": [432, 376],
+      "reasoning": "This rock is another obstacle that needs to be driven around."
     }
   ]
 }

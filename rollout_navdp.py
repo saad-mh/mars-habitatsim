@@ -49,7 +49,9 @@ You are controlling a rover moving toward a navigation goal.
 
 Scene definition:
 - The bright neon-green highlighted region is the navigation goal.
-- Large beige rocks are obstacles.
+- Any bright red highlighted region is an obstacle to drive around.
+- Large beige rocks with no red highlight may still be obstacles; treat them
+  as such even if unhighlighted.
 - The black region is background and must be ignored.
 
 A separate image-processing function has already measured the goal-mask
@@ -1555,6 +1557,18 @@ def main() -> None:
                         iterations=2,
                     ) > 0
                     steer_img[gm_display] = steer_img[gm_display] * 0.5 + np.asarray([0.0, 255.0, 0.0]) * 0.5
+                    # obstacle_mask suffers the same rendered-mesh z-fighting sparseness as goal_mask
+                    # in --goal-from-vlm mode (both come from MESH_GOAL_ID/MESH_OBST_ID semantic
+                    # renders), so close it the same way before compositing. Applied after the goal
+                    # tint so an obstacle wins any pixel where the two masks overlap, matching
+                    # overlay_frame's ordering.
+                    om_display = cv2.morphologyEx(
+                        (obstacle_mask > 0).astype(np.uint8) * 255,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+                        iterations=2,
+                    ) > 0
+                    steer_img[om_display] = steer_img[om_display] * 0.5 + np.asarray([255.0, 0.0, 0.0]) * 0.5
                     Image.fromarray(np.clip(steer_img, 0, 255).astype(np.uint8)).convert("RGB").save(frame_path)
                     steer_prompt = qwen_steer_prompt(goal_ratio["frame_fraction"] * 100.0)
                     query_t0 = time.perf_counter()

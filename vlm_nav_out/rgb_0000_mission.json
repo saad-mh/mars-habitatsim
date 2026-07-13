@@ -2,50 +2,59 @@
   "frame_id": 0,
   "vlm_response": {
     "goal_object": {
-      "object_id": 2,
+      "object_id": 0,
       "label": "rock",
       "coordinates2D": [
-        518,
-        412
+        42,
+        443
       ],
-      "reasoning": "This rock is the most prominent and central object in the image, suggesting it could be of scientific interest."
+      "reasoning": "This rock is the most scientifically significant object as it appears to be a potential sample for analysis."
     },
     "obstacles": [
       {
         "object_id": 1,
         "label": "rock",
         "coordinates2D": [
-          279,
-          692
+          568,
+          436
         ],
-        "reasoning": "This rock is located near the center of the image and is relatively close to the goal object."
+        "reasoning": "This rock is the next most significant obstacle as it is located in the path of the rover and needs to be driven around."
+      },
+      {
+        "object_id": 2,
+        "label": "rock",
+        "coordinates2D": [
+          159,
+          397
+        ],
+        "reasoning": "This rock is another potential obstacle that needs to be driven around."
       },
       {
         "object_id": 3,
         "label": "rock",
         "coordinates2D": [
-          221,
-          389
+          207,
+          387
         ],
-        "reasoning": "This rock is positioned towards the bottom left of the image and is relatively close to the goal object."
+        "reasoning": "This rock is another obstacle that needs to be driven around."
       },
       {
         "object_id": 4,
         "label": "rock",
         "coordinates2D": [
-          312,
+          311,
           379
         ],
-        "reasoning": "This rock is located towards the bottom right of the image and is relatively close to the goal object."
+        "reasoning": "This rock is another obstacle that needs to be driven around."
       },
       {
         "object_id": 5,
         "label": "rock",
         "coordinates2D": [
-          424,
-          373
+          432,
+          376
         ],
-        "reasoning": "This rock is positioned towards the top right of the image and is relatively close to the goal object."
+        "reasoning": "This rock is another obstacle that needs to be driven around."
       }
     ]
   },
@@ -53,15 +62,15 @@
     "role": "goal",
     "label": "rock",
     "bbox": [
-      518.0,
-      412.0,
-      518.0,
-      412.0
+      42.0,
+      443.0,
+      42.0,
+      443.0
     ],
     "seed_world": [
-      -9.406,
-      -0.077,
-      7.774
+      -4.231,
+      -0.001,
+      13.523
     ],
     "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_goal_rock_r0.50.obj",
     "radius": 0.5,
@@ -75,15 +84,15 @@
       "role": "obstacle",
       "label": "rock",
       "bbox": [
-        279.0,
-        692.0,
-        279.0,
-        692.0
+        568.0,
+        436.0,
+        568.0,
+        436.0
       ],
       "seed_world": [
-        -2.798,
+        -8.383,
         -0.058,
-        8.608
+        7.697
       ],
       "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_obstacle_rock_r0.50.obj",
       "radius": 0.5,
@@ -96,15 +105,15 @@
       "role": "obstacle1",
       "label": "rock",
       "bbox": [
-        221.0,
-        389.0,
-        221.0,
-        389.0
+        159.0,
+        397.0,
+        159.0,
+        397.0
       ],
       "seed_world": [
-        -10.633,
-        -0.117,
-        17.32
+        -10.016,
+        -0.361,
+        19.946
       ],
       "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_obstacle1_rock_r0.50.obj",
       "radius": 0.5,
@@ -117,15 +126,15 @@
       "role": "obstacle2",
       "label": "rock",
       "bbox": [
-        312.0,
-        379.0,
-        312.0,
-        379.0
+        207.0,
+        387.0,
+        207.0,
+        387.0
       ],
       "seed_world": [
-        -13.499,
-        0.736,
-        15.028
+        -2.5,
+        -0.153,
+        8.5
       ],
       "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_obstacle2_rock_r0.50.obj",
       "radius": 0.5,
@@ -138,17 +147,38 @@
       "role": "obstacle3",
       "label": "rock",
       "bbox": [
-        424.0,
-        373.0,
-        424.0,
-        373.0
+        311.0,
+        379.0,
+        311.0,
+        379.0
       ],
       "seed_world": [
-        -15.82,
-        -0.379,
-        10.937
+        -2.5,
+        -0.153,
+        8.5
       ],
       "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_obstacle3_rock_r0.50.obj",
+      "radius": 0.5,
+      "num_vertices": 877,
+      "num_faces": 1624,
+      "semantic_id": 2,
+      "mask_path": null
+    },
+    {
+      "role": "obstacle4",
+      "label": "rock",
+      "bbox": [
+        432.0,
+        376.0,
+        432.0,
+        376.0
+      ],
+      "seed_world": [
+        -16.015,
+        -0.385,
+        11.056
+      ],
+      "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_obstacle4_rock_r0.50.obj",
       "radius": 0.5,
       "num_vertices": 877,
       "num_faces": 1624,
@@ -157,9 +187,9 @@
     }
   ],
   "goal_target_world": [
-    -9.406000137329102,
-    1.217542052268982,
-    7.77400016784668
+    -4.230999946594238,
+    1.3309730291366577,
+    13.52299976348877
   ],
   "semantic_render_path": null
 }
