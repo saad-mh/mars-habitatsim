@@ -1071,6 +1071,10 @@ def main() -> None:
     ap.add_argument("--replan-every", type=int, default=1, help="Sample a fresh diffusion chunk every N control ticks.")
     ap.add_argument("--save-every", type=int, default=1)
     ap.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--keep-frame-pngs", action=argparse.BooleanOptionalAction, default=True,
+                    help="Write each saved step's frame_*.png/mask_*.png under out_dir/frames/. "
+                         "The video is built from in-memory frames regardless, so --no-keep-frame-pngs "
+                         "skips these per-step PNGs entirely (saving disk) without affecting rollout.mp4.")
     args = ap.parse_args()
 
     navdp_root = resolve_navdp_root(args.navdp_root)
@@ -1103,7 +1107,8 @@ def main() -> None:
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     frame_dir = out_dir / "frames"
-    frame_dir.mkdir(parents=True, exist_ok=True)
+    if args.keep_frame_pngs:
+        frame_dir.mkdir(parents=True, exist_ok=True)
 
     raw_terrain = TerrainHeight(
         mode=args.terrain_height_mode,
@@ -1722,12 +1727,13 @@ def main() -> None:
             elif near_obstacle_exit:
                 near_obstacle_state = False
             near_obstacle = near_obstacle_state
-            # "stop" is a language TRIGGER, but the HALT itself is proximity-gated: engage once close
-            # to the obstacle OR the goal (whichever comes first), not the instant "stop" is said.
-            # Without the goal term, "stop" never fired on a goal-only run (no obstacle to be near).
+            # "stop" is a language TRIGGER, but the HALT itself is proximity-gated: engage only once
+            # close to the GOAL, never merely because an obstacle is close. A "stop" verdict issued
+            # while near an obstacle (but not the goal) is deliberately dropped -- near-obstacle
+            # proximity still gates left/right (force_side / around_side, below), just not stop.
             # (goal_dist_now / near_goal already computed above, at the top of the loop.)
             near_goal_visual = goal_ratio["frame_fraction"] >= float(args.qwen_stop_frame_fraction)
-            stop_cmd = (intent == "stop") and (near_obstacle or near_goal or near_goal_visual)
+            stop_cmd = (intent == "stop") and (near_goal or near_goal_visual)
             if vla_adapter is not None:
                 # Hard, full-strength switch (NOT a blend): interpolating between two different
                 # instruction tokens landed off the trained manifold -- the adapter only ever
@@ -2159,13 +2165,14 @@ def main() -> None:
                 lost_txt = " LOST" if int(goal_mask.sum()) < int(args.lost_goal_min_px) else ""
                 text = f"t={step} dist={goal_dist:.2f} obs={int(obstacle_mask.sum())} v={action_3d[0]:.2f} yaw={math.degrees(yaw):.1f}{lost_txt}"
                 frame = overlay_frame(rgb, goal_mask, obstacle_mask, text)
-                frame.save(frame_dir / f"frame_{step:04d}.png")
                 video_frames.append(frame)
-                # binary mask: goal=white, obstacle=red, background=black
-                mimg = np.zeros((goal_mask.shape[0], goal_mask.shape[1], 3), dtype=np.uint8)
-                mimg[goal_mask > 0] = (255, 255, 255)
-                mimg[obstacle_mask > 0] = (255, 0, 0)
-                Image.fromarray(mimg).save(frame_dir / f"mask_{step:04d}.png")
+                if args.keep_frame_pngs:
+                    frame.save(frame_dir / f"frame_{step:04d}.png")
+                    # binary mask: goal=white, obstacle=red, background=black
+                    mimg = np.zeros((goal_mask.shape[0], goal_mask.shape[1], 3), dtype=np.uint8)
+                    mimg[goal_mask > 0] = (255, 255, 255)
+                    mimg[obstacle_mask > 0] = (255, 0, 0)
+                    Image.fromarray(mimg).save(frame_dir / f"mask_{step:04d}.png")
 
             if step % 10 == 0:
                 print(

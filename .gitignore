@@ -21,6 +21,8 @@ assets/marsyard2022.glb
 marsyard2022.obj
 marsyard2022_tri.glb
 
+annotations
+
 .DS_Store
 
 *.pth
