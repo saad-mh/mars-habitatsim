@@ -11,7 +11,25 @@
       "object_id": 1,
       "label": "rock",
       "coordinates2D": [279, 692],
-      "reasoning": "This rock is located near the center of the image and is likely to be encountered by the rover as it moves towards the goal object."
+      "reasoning": "This rock is located near the center of the image and is relatively close to the goal object."
+    },
+    {
+      "object_id": 3,
+      "label": "rock",
+      "coordinates2D": [221, 389],
+      "reasoning": "This rock is positioned towards the bottom left of the image and is relatively close to the goal object."
+    },
+    {
+      "object_id": 4,
+      "label": "rock",
+      "coordinates2D": [312, 379],
+      "reasoning": "This rock is located towards the bottom right of the image and is relatively close to the goal object."
+    },
+    {
+      "object_id": 5,
+      "label": "rock",
+      "coordinates2D": [424, 373],
+      "reasoning": "This rock is positioned towards the top right of the image and is relatively close to the goal object."
     }
   ]
 }

@@ -1289,38 +1289,6 @@ def main() -> None:
                     cmd_txt = Path(args.command_file).read_text(encoding="utf-8").strip() or args.command
                 except Exception:
                     pass
-            if args.qwen_steer and near_goal:
-                # Near the goal, hand steering over to the persistent Qwen VLM server, polled at
-                # qwen_steer_hz (NOT every control tick -- --hz is typically much higher). Its
-                # reply is fed straight into command_intent below, same as any live command text.
-                if not qwen_steer_active:
-                    print(f"[qwen-steer] near goal (dist={goal_dist_now:.2f}m) -- polling Qwen at {args.qwen_steer_hz:g}Hz", flush=True)
-                    qwen_steer_active = True
-                now_t = time.time()
-                if now_t - last_qwen_poll_t >= 1.0 / float(args.qwen_steer_hz):
-                    last_qwen_poll_t = now_t
-                    frame_path = str(out_dir / "qwen_steer_frame.jpg")
-                    Image.fromarray(rgb.astype(np.uint8)).convert("RGB").save(frame_path)
-                    query_t0 = time.perf_counter()
-                    try:
-                        qwen_cmd_txt = qwen_vlm_client.query_vlm_persistent(
-                            frame_path, prompt=QWEN_STEER_PROMPT, max_new_tokens=8,
-                            host=args.qwen_host, port=args.qwen_port,
-                        )
-                        print(f"[qwen-steer] t={now_t:.2f} step={step} -> {qwen_cmd_txt!r}", flush=True)
-                        episode_logger.log_qwen_query(
-                            step=step, query_type="action_suggestion", trigger="goal_proximity",
-                            input_data={"goal_belief": {"range": goal_dist_now}, "frame": frame_path},
-                            output_data={"action": qwen_cmd_txt},
-                            latency_ms=(time.perf_counter() - query_t0) * 1000.0,
-                        )
-                    except Exception as e:
-                        print(f"[qwen-steer] query failed: {e}", flush=True)
-                cmd_txt = qwen_cmd_txt
-            intent = command_intent(cmd_txt)
-            force_side = 1.0 if intent == "left" else (-1.0 if intent == "right" else None)
-            vla_token = None   # set below, once the obstacle distance is known
-            stop_cmd = False   # set below (gated on obstacle proximity)
 
             if mesh_tracking_mode:
                 # RENDERED-MASK goal: a semantic mesh (placed at t=0 from a pixel, or registered
@@ -1427,6 +1395,47 @@ def main() -> None:
                 # resolved), same as before -- this only ever ADDS ground-truth precision, never
                 # removes the "no obstacle" case.
                 obstacle_mask = np.where(_sem == MESH_OBST_ID, 255, 0).astype(np.uint8)
+
+            if args.qwen_steer:
+                # Near the goal, hand steering over to the persistent Qwen VLM server, polled at
+                # qwen_steer_hz (NOT every control tick -- --hz is typically much higher). Its
+                # reply is fed straight into command_intent below, same as any live command text.
+                # Runs AFTER goal_mask/obstacle_mask are finalized for THIS step so the frame sent
+                # to the VLM is this tick's rgb (never a stale/reused frame) with the current goal
+                # mask composited on top -- without that overlay the model has no way to tell which
+                # object in frame the prompt's "goal obstacle" refers to.
+                if not qwen_steer_active:
+                    print(f"[qwen-steer] near goal (dist={goal_dist_now:.2f}m) -- polling Qwen at {args.qwen_steer_hz:g}Hz", flush=True)
+                    qwen_steer_active = True
+                now_t = time.time()
+                if now_t - last_qwen_poll_t >= 1.0 / float(args.qwen_steer_hz):
+                    last_qwen_poll_t = now_t
+                    frame_path = str(out_dir / "qwen_steer_frame.jpg")
+                    steer_img = rgb.astype(np.float32).copy()
+                    gm = goal_mask > 0
+                    steer_img[gm] = steer_img[gm] * 0.5 + np.asarray([0.0, 255.0, 0.0]) * 0.5
+                    Image.fromarray(np.clip(steer_img, 0, 255).astype(np.uint8)).convert("RGB").save(frame_path)
+                    query_t0 = time.perf_counter()
+                    try:
+                        qwen_cmd_txt = qwen_vlm_client.query_vlm_persistent(
+                            frame_path, prompt=QWEN_STEER_PROMPT, max_new_tokens=8,
+                            host=args.qwen_host, port=args.qwen_port,
+                        )
+                        print(f"[qwen-steer] t={now_t:.2f} step={step} -> {qwen_cmd_txt!r}", flush=True)
+                        episode_logger.log_qwen_query(
+                            step=step, query_type="action_suggestion", trigger="goal_proximity",
+                            input_data={"goal_belief": {"range": goal_dist_now}, "frame": frame_path},
+                            output_data={"action": qwen_cmd_txt},
+                            latency_ms=(time.perf_counter() - query_t0) * 1000.0,
+                        )
+                    except Exception as e:
+                        print(f"[qwen-steer] query failed: {e}", flush=True)
+                cmd_txt = qwen_cmd_txt
+            intent = command_intent(cmd_txt)
+            force_side = 1.0 if intent == "left" else (-1.0 if intent == "right" else None)
+            vla_token = None   # set below, once the obstacle distance is known
+            stop_cmd = False   # set below (gated on obstacle proximity)
+
             spatial = frame_to_spatial(depth, goal_mask, image_size, obstacle_mask, include_obstacle_channel=use_obstacle_channel).to(device)
             obstacle_map = obstacle_builder.build(depth) if args.obstacle_mode == "depth" else np.zeros((96, 96), dtype=np.float32)
             obstacle_map = paint_obstacle_map_point(
