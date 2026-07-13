@@ -29,9 +29,59 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_SCENE = HERE / "assets/marsyard2022.glb"
 DEFAULT_OBJ = HERE / "assets/marsyard2022.obj"
 
-QWEN_STEER_PROMPT = (
-    "You are piloting a rover approaching its goal. Looking at this view, should the rover go left, go right, or stop? If the goal obstacle 5\\% of the entire image, reply stop. Else reply with left or right. Reply with exactly one word: right, left, or stop."
-)
+def qwen_steer_prompt(frame_fraction_pct: float) -> str:
+    """Steering prompt for --qwen-steer. Feeds the VLM the MEASURED goal/frame pixel ratio
+    (from goal_pixel_ratio(), computed on the same mask composited into the frame it's shown)
+    instead of asking it to eyeball the 5%-of-frame stop threshold itself, and instead of
+    proximity-by-distance (belief_g can be noisy/collapsed near the goal, the pixel ratio can't)."""
+    return f"""
+You are controlling a rover moving toward a navigation goal.
+
+The bright neon-green highlighted region is the goal.
+Large beige rocks are obstacles.
+The black region is background and must be ignored.
+
+Analyze the image internally using the following sequence. Do not output your
+reasoning.
+
+Step 1: Locate the green goal region.
+- Estimate its horizontal center.
+- Determine whether it is left, right, or approximately centered.
+- Determine whether it touches or enters the bottom 20 percent of the image.
+
+Step 2: Determine proximity.
+The green goal region's measured coverage of the full image is {frame_fraction_pct:.2f} percent
+(measured, not an estimate).
+
+The goal is considered reached if ANY condition is true:
+- the green goal occupies at least 2 percent of the complete image;
+- the green goal touches the bottom edge or substantially enters the bottom
+  10 percent of the image.
+
+Step 3: Select the action using strict priority.
+
+Priority 1 — STOP:
+If the goal is reached according to any condition above, choose stop.
+Do not choose left or right after a stop condition is satisfied.
+
+Priority 2 — STEER:
+If stopping is not required:
+- choose left when the safe path toward the goal is on the left;
+- choose right when the safe path toward the goal is on the right;
+- when the goal is centered, choose the side with more obstacle-free space.
+
+Important:
+- The stop decision has absolute priority over steering.
+- A close, large green region near the bottom means stop.
+- Do not continue steering merely because the goal is slightly left or right
+  when a stop condition is already true.
+- Perform the analysis silently.
+
+Output exactly one lowercase word and nothing else:
+left
+right
+stop
+"""
 
 SIZE_X = 50.0
 SIZE_Z = 50.0
@@ -467,6 +517,24 @@ def draw_circle_mask(height: int, width: int, u: float, v: float, radius: int) -
     yy, xx = np.ogrid[:height, :width]
     mask = (xx - float(u)) ** 2 + (yy - float(v)) ** 2 <= float(radius) ** 2
     return mask.astype(np.uint8)
+
+
+def goal_pixel_ratio(goal_mask: np.ndarray) -> Dict[str, float]:
+    """Fraction of the current frame occupied by goal-object pixels vs. the rest of the image.
+
+    Feeds qwen_steer_prompt() the measured "goal obstacle % of the entire image" value so the
+    VLM is told the ratio instead of eyeballing it; callers can also threshold `frame_fraction`
+    directly instead of (or alongside) the VLM's answer.
+    """
+    total_px = int(goal_mask.shape[0] * goal_mask.shape[1])
+    goal_px = int(np.count_nonzero(goal_mask))
+    rest_px = total_px - goal_px
+    return {
+        "goal_px": goal_px,
+        "rest_px": rest_px,
+        "frame_fraction": goal_px / total_px if total_px > 0 else 0.0,
+        "goal_to_rest_ratio": goal_px / rest_px if rest_px > 0 else float("inf"),
+    }
 
 
 def project_goal_mask(
@@ -1218,6 +1286,7 @@ def main() -> None:
         "action_3d", "pred_chunk", "goal_visible_pixels", "goal_u", "goal_v", "goal_distance",
         "obstacle_visible_pixels", "obstacle_u", "obstacle_v", "obstacle_distance",
         "belief_fwd", "belief_left",   # body-frame belief_g each tick (nan if not tracking) -> lets
+        "goal_frame_fraction",         # goal_px / total_px this tick, from goal_pixel_ratio()
     ]}                                 # a post-hoc script measure belief ACCURACY vs the true goal
     video_frames = []
     prev_obstacle_point = None
@@ -1396,6 +1465,8 @@ def main() -> None:
                 # removes the "no obstacle" case.
                 obstacle_mask = np.where(_sem == MESH_OBST_ID, 255, 0).astype(np.uint8)
 
+            goal_ratio = goal_pixel_ratio(goal_mask)
+
             if args.qwen_steer:
                 # Near the goal, hand steering over to the persistent Qwen VLM server, polled at
                 # qwen_steer_hz (NOT every control tick -- --hz is typically much higher). Its
@@ -1415,16 +1486,21 @@ def main() -> None:
                     gm = goal_mask > 0
                     steer_img[gm] = steer_img[gm] * 0.5 + np.asarray([0.0, 255.0, 0.0]) * 0.5
                     Image.fromarray(np.clip(steer_img, 0, 255).astype(np.uint8)).convert("RGB").save(frame_path)
+                    steer_prompt = qwen_steer_prompt(goal_ratio["frame_fraction"] * 100.0)
                     query_t0 = time.perf_counter()
                     try:
                         qwen_cmd_txt = qwen_vlm_client.query_vlm_persistent(
-                            frame_path, prompt=QWEN_STEER_PROMPT, max_new_tokens=8,
+                            frame_path, prompt=steer_prompt, max_new_tokens=8,
                             host=args.qwen_host, port=args.qwen_port,
                         )
-                        print(f"[qwen-steer] t={now_t:.2f} step={step} -> {qwen_cmd_txt!r}", flush=True)
+                        print(f"[qwen-steer] t={now_t:.2f} step={step} goal_frame_pct={goal_ratio['frame_fraction'] * 100.0:.2f} -> {qwen_cmd_txt!r}", flush=True)
                         episode_logger.log_qwen_query(
                             step=step, query_type="action_suggestion", trigger="goal_proximity",
-                            input_data={"goal_belief": {"range": goal_dist_now}, "frame": frame_path},
+                            input_data={
+                                "goal_belief": {"range": goal_dist_now},
+                                "goal_frame_fraction": goal_ratio["frame_fraction"],
+                                "frame": frame_path,
+                            },
                             output_data={"action": qwen_cmd_txt},
                             latency_ms=(time.perf_counter() - query_t0) * 1000.0,
                         )
@@ -1847,6 +1923,7 @@ def main() -> None:
             rows["obstacle_distance"].append(float(obstacle_info["range"]))
             rows["belief_fwd"].append(bf)
             rows["belief_left"].append(bl)
+            rows["goal_frame_fraction"].append(goal_ratio["frame_fraction"])
 
             if rocks:
                 distances_to_obstacles = {
@@ -1886,6 +1963,7 @@ def main() -> None:
             if step % 10 == 0:
                 print(
                     f"step {step:04d} | dist={goal_dist:.2f} | goal_px={int(goal_mask.sum())} "
+                    f"({goal_ratio['frame_fraction'] * 100.0:.2f}% of frame) "
                     f"| obs_px={int(obstacle_mask.sum())} "
                     f"| action=[{action_3d[0]:.2f},{action_3d[1]:.2f},{action_3d[2]:.2f}]",
                     flush=True,
@@ -1943,6 +2021,7 @@ def main() -> None:
         obstacle_distance=np.asarray(rows["obstacle_distance"], dtype=np.float32),
         belief_fwd=np.asarray(rows["belief_fwd"], dtype=np.float32),
         belief_left=np.asarray(rows["belief_left"], dtype=np.float32),
+        goal_frame_fraction=np.asarray(rows["goal_frame_fraction"], dtype=np.float32),
         goal_position=goal.astype(np.float32),
         obstacle_position=(ghost_obstacle.astype(np.float32) if ghost_obstacle is not None else np.asarray([np.nan, np.nan, np.nan], dtype=np.float32)),
         success=np.asarray(success, dtype=bool),
