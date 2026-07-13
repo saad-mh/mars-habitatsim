@@ -972,6 +972,32 @@ class EpisodeLogger:
         return False
 
 
+def _parse_obstacle_count(value: str):
+    """argparse type for --obstacles: 'single' (1), 'all' (every non-goal detection,
+    unlimited), or a positive integer count."""
+    if value in ("single", "all"):
+        return value
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--obstacles must be 'single', 'all', or a positive integer (got {value!r})"
+        )
+    if n < 1:
+        raise argparse.ArgumentTypeError("--obstacles integer value must be >= 1")
+    return n
+
+
+def resolve_obstacle_limit(obstacles) -> Optional[int]:
+    """Map the --obstacles flag's parsed value to the obstacle_limit resolve_vlm_selection
+    expects: None = every VLM-flagged obstacle except the goal ('all'), else a max count."""
+    if obstacles == "all":
+        return None
+    if obstacles == "single":
+        return 1
+    return int(obstacles)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run a trained NavDP/S2DiT policy inside the Mars HabitatSim terrain.")
     ap.add_argument("--navdp-root", default=None, help="Path to the navdp_sam repo containing model_s2_dit.py")
@@ -1068,6 +1094,13 @@ def main() -> None:
                     help="Frame index for --goal-from-vlm. With --manual-annotate, selects the "
                          "pre-captured/annotated frame to load; by default (SAM live-capture), it "
                          "just names the live-captured frame's output/annotation files.")
+    ap.add_argument("--obstacles", type=_parse_obstacle_count, default="all",
+                    help="With --goal-from-vlm: how many of the VLM's flagged obstacles to register. "
+                         "'single' = just the first one, 'all' = every detected object except the goal "
+                         "(default), or an integer N = up to N of them. Obstacle selection runs "
+                         "separately from (and after) goal selection: candidates are drawn from every "
+                         "detection other than the chosen goal object, which can never itself be "
+                         "selected as an obstacle.")
     ap.add_argument("--goal-y", type=float, default=None, help="World Y of goal marker; default terrain height + goal-height")
     ap.add_argument("--goal-height", type=float, default=1.2, help="Goal marker height above terrain when --goal-y is omitted")
     ap.add_argument("--goal-terrain-radius", type=float, default=0.8, help="Raise ghost goal from local max terrain height in this radius")
@@ -1363,7 +1396,10 @@ def main() -> None:
         # onto the raw frame and save it to overlay_path.
         draw_annotation_overlay(rgb_path, annotation_path, overlay_path)
 
-        vlm_success, vlm_result, vlm_status = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx)
+        obstacle_limit = resolve_obstacle_limit(args.obstacles)
+        vlm_success, vlm_result, vlm_status = resolve_vlm_selection(
+            rgb_path, overlay_path, annotation_path, frame_idx, obstacle_limit=obstacle_limit
+        )
         if not vlm_success:
             raise SystemExit(f"--goal-from-vlm: VLM selection failed: {vlm_status}")
         vlm_response, vlm_goal_mesh, vlm_obstacle_meshes = vlm_result
@@ -1377,14 +1413,18 @@ def main() -> None:
               f"MESH_GOAL_ID; belief re-derived from the live rendered mask every step (no dead-reckoning "
               f"while in view)", flush=True)
 
-        # OBSTACLE: the VLM's prompt now asks for exactly one goal and marks every OTHER detected
-        # object as an obstacle -- register ALL of them under MESH_OBST_ID so the rendered obstacle
-        # mask the policy/CBF/DWA see is the union of every flagged object's footprint, not just the
-        # first. ALSO wire the first one's resolved world seed into --ghost-obstacle-x/y/z so the
-        # CBF/orbit avoidance's cone-mode math (which prefers a single stable world point over the
-        # mask to avoid abeam-pass flicker) still has one, unless the caller passed an explicit
-        # ghost obstacle of their own; the mask-based CBF/DWA paths don't depend on this and see
-        # every registered mesh.
+        # OBSTACLE: the VLM's prompt asks for exactly one goal and marks every OTHER detected
+        # object as an obstacle; --obstacles (single/all/N) then caps how many of THOSE
+        # goal-excluded candidates resolve_vlm_selection actually resolved (see
+        # resolve_obstacle_limit / resolve_mission_meshes' obstacle_limit) -- register all of
+        # whatever came back under MESH_OBST_ID so the rendered obstacle mask the policy/CBF/DWA
+        # see is the union of every registered object's footprint. ALSO wire the first one's
+        # resolved world seed into --ghost-obstacle-x/y/z so the CBF/orbit avoidance's cone-mode
+        # math (which prefers a single stable world point over the mask to avoid abeam-pass
+        # flicker) still has one, unless the caller passed an explicit ghost obstacle of their
+        # own; the mask-based CBF/DWA paths don't depend on this and see every registered mesh.
+        print(f"[VLM] --obstacles={args.obstacles}: {len(vlm_obstacle_meshes)} obstacle(s) resolved "
+              f"(goal excluded)", flush=True)
         if vlm_obstacle_meshes:
             cbf_obstacle_id = "vlm_obstacle"
             for vlm_obstacle_mesh in vlm_obstacle_meshes:

@@ -847,7 +847,7 @@ def selected_bbox_to_object_mesh(
     }
 
 
-def extract_obstacle_entries(response):
+def extract_obstacle_entries(response, goal_entry=None):
     """
     Normalize the VLM response's obstacle field into a list of entries.
 
@@ -856,6 +856,12 @@ def extract_obstacle_entries(response):
     rgb_*_vlm.txt captured before the prompt grew a list still works. Any
     null/empty entries are dropped so a missing-detection case just yields
     zero obstacles instead of a crash.
+
+    If `goal_entry` is given, any entry sharing its "object_id" is dropped
+    too -- a defensive backstop (independent of the VLM prompt's own "no
+    obstacle may share the goal's object_id" instruction) so the goal can
+    never end up double-booked as an obstacle regardless of how many
+    obstacles get selected downstream.
     """
     entries = response.get("obstacles")
     if entries is None:
@@ -864,7 +870,13 @@ def extract_obstacle_entries(response):
     elif isinstance(entries, dict):
         entries = [entries]
 
-    return [e for e in entries if e]
+    entries = [e for e in entries if e]
+
+    if goal_entry:
+        goal_id = goal_entry.get("object_id")
+        entries = [e for e in entries if e.get("object_id") != goal_id]
+
+    return entries
 
 
 def _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height_at, detected_shapes=None):
@@ -963,13 +975,27 @@ def object_world_position(frame_idx):
     return entry_world_position(goal_entry, frame_idx)
 
 
-def resolve_mission_meshes(frame_idx, response, radius=0.5):
+def resolve_mission_meshes(frame_idx, response, radius=0.5, obstacle_limit=None):
     """
     Resolve every VLM-selected object in a frame's response (goal +
     obstacles) to world positions and local terrain meshes, without driving
     the rover. Shared by the live `navigate_mission` drive and the
     standalone --vlm/--goto CLI reruns, so mesh generation happens exactly
     once per object regardless of which path triggers it.
+
+    Obstacle selection runs entirely separately from (and after) goal
+    selection: the goal is resolved first from `response["goal_object"]`,
+    then obstacle candidates are drawn from the remaining detections with
+    the goal's own object_id excluded (see `extract_obstacle_entries`), and
+    only then is `obstacle_limit` applied to that goal-free pool.
+
+    Args:
+        obstacle_limit: None keeps every resolved obstacle (default,
+            matches prior behavior). An int caps how many of the VLM's
+            obstacle entries are resolved, taken in the order the VLM
+            returned them (e.g. 1 for "single", 5 for "up to 5", or a
+            number >= the detection count for "everything except the
+            goal").
 
     Returns:
         (goal_mesh, obstacle_meshes) - goal_mesh is None if there's no
@@ -989,8 +1015,12 @@ def resolve_mission_meshes(frame_idx, response, radius=0.5):
             detected_shapes=detected_shapes,
         )
 
+    candidate_obstacles = extract_obstacle_entries(response, goal_entry=goal_entry)
+    if obstacle_limit is not None:
+        candidate_obstacles = candidate_obstacles[:obstacle_limit]
+
     obstacle_meshes = []
-    for i, obstacle in enumerate(extract_obstacle_entries(response)):
+    for i, obstacle in enumerate(candidate_obstacles):
         role = "obstacle" if i == 0 else f"obstacle{i}"
         try:
             mesh_meta = selected_bbox_to_object_mesh(
@@ -1007,7 +1037,7 @@ def resolve_mission_meshes(frame_idx, response, radius=0.5):
     return goal_mesh, obstacle_meshes
 
 
-def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PROMPT, radius=0.5):
+def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PROMPT, radius=0.5, obstacle_limit=None):
     """
     Query the VLM for its goal/obstacle object selection on an annotated
     frame, then back-project the chosen bbox(es) through depth + camera
@@ -1025,6 +1055,8 @@ def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, pr
             the frame's saved depth/pose).
         prompt: Question to ask the VLM about the detected objects.
         radius: Local terrain patch radius, in meters, for the resolved mesh(es).
+        obstacle_limit: forwarded to `resolve_mission_meshes` -- None (default)
+            resolves every obstacle the VLM flagged; an int caps the count.
 
     Returns:
         (success, result, status_message). On success, result is
@@ -1039,7 +1071,7 @@ def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, pr
     except Exception as e:
         return False, None, f"could not parse VLM response {vlm_out_path}: {e}"
 
-    goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response, radius=radius)
+    goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response, radius=radius, obstacle_limit=obstacle_limit)
     if goal_mesh is None:
         return False, None, f"no goal_object in {vlm_out_path}"
 
