@@ -23,9 +23,14 @@ import argparse
 import json
 import math
 import os
+import queue
+import re
 import sys
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -559,6 +564,65 @@ def pixel_to_body(u, v, depth_img, height, width, hfov_deg, fallback_range):
     return np.asarray([rng, -right], dtype=np.float32)  # [forward, left]
 
 
+def bbox_to_body(bbox_xyxy, depth_img, height, width, hfov_deg, fallback_range):
+    """Body-frame point [forward, left] from a VLM bbox: bearing from the bbox's center column,
+    range from the MEDIAN depth over the bbox's interior. More robust than pixel_to_body's single
+    center pixel, which can land on a depth discontinuity (a rock's silhouette edge, or a gap
+    between the rock and the background) and seed a badly wrong range that then dead-reckons,
+    uncorrected, for the rest of the episode."""
+    intr = intrinsics_from_hfov(height, width, hfov_deg)
+    x1, y1, x2, y2 = bbox_xyxy
+    iu1, iu2 = int(np.clip(min(x1, x2), 0, width - 1)), int(np.clip(max(x1, x2), 0, width - 1))
+    iv1, iv2 = int(np.clip(min(y1, y2), 0, height - 1)), int(np.clip(max(y1, y2), 0, height - 1))
+    patch = np.asarray(depth_img)[iv1:iv2 + 1, iu1:iu2 + 1]
+    valid = patch[np.isfinite(patch) & (patch > 0.1)]
+    rng = float(np.median(valid)) if valid.size > 0 else float(fallback_range)
+    u = 0.5 * (x1 + x2)
+    right = (u - intr["cx"]) * rng / max(intr["fx"], 1e-6)
+    return np.asarray([rng, -right], dtype=np.float32)  # [forward, left]
+
+
+class VlmSelectionPixelGoal:
+    """Adapts a one-shot VLM object selection (resolve_vlm_selection, run once on an
+    already-captured+annotated frame) to the .ground(rgb, instruction) grounder interface used by
+    --grounder stub/qwen, so --goal-from-vlm seeds the belief via the same image-pixel path --
+    never a world coordinate. The bbox center is stored as a FRACTION of the frame it was resolved
+    on so it reprojects correctly onto the live rollout frame, whose resolution can differ from
+    the capture resolution."""
+
+    # A one-shot capture-time selection, not a live re-detector: the belief should be seeded from
+    # it ONCE (dead-reckoned by odometry after), never re-queried on a cadence like --grounder
+    # stub/qwen (see the main loop's grounder-call gate).
+    one_shot = True
+
+    def __init__(self, bbox_xyxy, capture_hw):
+        cap_h, cap_w = capture_hw
+        x1, y1, x2, y2 = bbox_xyxy
+        self._u_frac = 0.5 * (x1 + x2) / cap_w
+        self._v_frac = 0.5 * (y1 + y2) / cap_h
+        self._x1_frac, self._y1_frac = x1 / cap_w, y1 / cap_h
+        self._x2_frac, self._y2_frac = x2 / cap_w, y2 / cap_h
+
+    def ground(self, rgb, instruction):
+        h, w = rgb.shape[0], rgb.shape[1]
+        bbox = (self._x1_frac * w, self._y1_frac * h, self._x2_frac * w, self._y2_frac * h)
+        return SimpleNamespace(u=self._u_frac * w, v=self._v_frac * h, in_view=True, bbox=bbox)
+
+
+def goal_pixel_ratio(goal_mask: np.ndarray) -> Dict[str, float]:
+    """Fraction of the current frame occupied by goal-object pixels vs. the rest of the image;
+    a general per-step metric fed into the rollout/episode logs."""
+    total_px = int(goal_mask.shape[0] * goal_mask.shape[1])
+    goal_px = int(np.count_nonzero(goal_mask))
+    rest_px = total_px - goal_px
+    return {
+        "goal_px": goal_px,
+        "rest_px": rest_px,
+        "frame_fraction": goal_px / total_px if total_px > 0 else 0.0,
+        "goal_to_rest_ratio": goal_px / rest_px if rest_px > 0 else float("inf"),
+    }
+
+
 def propagate_body_point(bg, action, dt, odom_noise=0.0, rng=None):
     """Move a body-frame point [forward, left] under the robot's own SE(2) motion (dead-reckoning):
     translate back by v*dt and rotate by -yaw*dt -- the same propagation the cone uses. Optional
@@ -634,12 +698,271 @@ def save_video(frames: Sequence[Image.Image], path: Path, fps: float) -> None:
     imageio.mimsave(path, [np.asarray(f) for f in frames], fps=float(fps))
 
 
+_LOG_SENTINEL = object()
+
+
+def _log_json_default(obj):
+    """Tolerate numpy scalars/arrays showing up in logged payloads -- the rollout loop this feeds
+    is numpy-heavy, and a stray np.float32 buried in a nested dict/list should not crash logging
+    mid-episode."""
+    item = getattr(obj, "item", None)
+    if callable(item) and hasattr(obj, "shape") and obj.shape == ():
+        return item()
+    tolist = getattr(obj, "tolist", None)
+    if callable(tolist):
+        return tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _log_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log_slugify(value) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "-", str(value)).strip("-").lower()
+    return s or "na"
+
+
+def make_run_id(config: Dict, timestamp=None) -> str:
+    """`<timestamp>_<goal_mode>-goal_<steering_mode>_obs<count>_seed<seed>`, so the ablation
+    condition is identifiable from the folder name alone."""
+    ts = (timestamp or datetime.now()).strftime("%Y-%m-%d_%H%M%S")
+    goal_mode = _log_slugify(config.get("goal_mode", "na"))
+    steering_mode = _log_slugify(config.get("steering_mode", "na"))
+    obstacle_count = _log_slugify(config.get("obstacle_count", "na"))
+    seed = _log_slugify(config.get("obstacle_seed", "na"))
+    return f"{ts}_{goal_mode}-goal_{steering_mode}_obs{obstacle_count}_seed{seed}"
+
+
+class EpisodeLogger:
+    """Structured, per-episode JSON logging for ablation rollouts. One instance per episode; it
+    knows nothing about ablation semantics (goal mode, steering mode, CBF, ...) -- it just
+    persists whatever `config` dict it's constructed with, plus whatever the rollout loop reports
+    through `log_frame` / `log_qwen_query` / `log_cbf_event`.
+
+    Writes are non-blocking: JSON Lines files (frames/qwen_queries/cbf_events) are appended to by
+    a single background thread pulling off a queue, so `log_*` calls from the physics/render loop
+    only do cheap bookkeeping (dict construction + a queue.put) and never touch disk themselves.
+    `config.json`, `obstacles.json`, and `summary.json` are small, one-shot, pretty-printed writes
+    done directly since they don't recur every step."""
+
+    _JSONL_FILES = ("frames", "qwen_queries", "cbf_events")
+
+    def __init__(self, run_id, config, log_root="logs", save_frames=False, flush_interval_s=1.0):
+        self.run_id = run_id
+        self.run_dir = Path(log_root) / run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        self._save_frames = save_frames
+        self.frames_dir = self.run_dir / "frames"
+        if save_frames:
+            self.frames_dir.mkdir(parents=True, exist_ok=True)
+
+        self._start_monotonic = time.monotonic()
+        self._config = dict(config)
+        self._config.setdefault("run_id", run_id)
+        self._config.setdefault("timestamp_start", _log_now_iso())
+        self._write_json_now("config.json", self._config)
+
+        # Stats accumulated synchronously on the caller's thread (cheap, no I/O) so finalize() can
+        # summarize without waiting on the background writer.
+        self._total_steps = 0
+        self._last_distance_to_goal = None
+        self._closest_approach = {}
+        self._counts = {"cbf_events": 0, "qwen_queries": 0, "goal_proximity_events": 0}
+
+        self._files = {
+            name: open(self.run_dir / f"{name}.jsonl", "a", encoding="utf-8")
+            for name in self._JSONL_FILES
+        }
+        self._queue = queue.Queue()
+        self._flush_interval_s = flush_interval_s
+        self._closed = False
+        self._worker = threading.Thread(target=self._drain_loop, name=f"episode-logger-{run_id}", daemon=True)
+        self._worker.start()
+
+    def _write_json_now(self, filename, obj) -> None:
+        (self.run_dir / filename).write_text(json.dumps(obj, indent=2, default=_log_json_default))
+
+    def _elapsed(self) -> float:
+        return time.monotonic() - self._start_monotonic
+
+    def _enqueue(self, kind, payload) -> None:
+        self._queue.put((kind, payload))
+
+    def _drain_loop(self) -> None:
+        last_flush = time.monotonic()
+        while True:
+            try:
+                item = self._queue.get(timeout=self._flush_interval_s)
+            except queue.Empty:
+                item = None
+
+            if item is _LOG_SENTINEL:
+                self._flush_all()
+                break
+            if item is not None:
+                self._write_item(item)
+
+            now = time.monotonic()
+            if now - last_flush >= self._flush_interval_s:
+                self._flush_all()
+                last_flush = now
+
+        for fh in self._files.values():
+            fh.close()
+
+    def _write_item(self, item) -> None:
+        kind, payload = item
+        if kind == "image":
+            step, image = payload
+            try:
+                import imageio.v3 as iio
+                iio.imwrite(self.frames_dir / f"frame_{step:06d}.png", image)
+            except Exception as e:  # pragma: no cover - best-effort side channel
+                print(f"EpisodeLogger: failed to save frame {step}: {e}")
+            return
+        self._files[kind].write(json.dumps(payload, separators=(",", ":"), default=_log_json_default) + "\n")
+
+    def _flush_all(self) -> None:
+        for fh in self._files.values():
+            fh.flush()
+
+    def write_obstacles(self, obstacle_list, goal_id=None, seed=None) -> None:
+        payload = {
+            "seed": seed if seed is not None else self._config.get("obstacle_seed"),
+            "obstacles": list(obstacle_list),
+            "goal_id": goal_id,
+        }
+        self._write_json_now("obstacles.json", payload)
+
+    def log_frame(
+        self,
+        step,
+        position,
+        orientation,
+        action,
+        distances_to_obstacles=None,
+        cbf_active=False,
+        goal_belief=None,
+        distance_to_goal=None,
+        yaw_to_goal=None,
+    ) -> None:
+        distances_to_obstacles = dict(distances_to_obstacles or {})
+        if distance_to_goal is None and goal_belief is not None:
+            distance_to_goal = goal_belief.get("range")
+        if yaw_to_goal is None and goal_belief is not None:
+            yaw_to_goal = goal_belief.get("bearing")
+
+        entry = {
+            "step": step,
+            "t": self._elapsed(),
+            "position": list(position),
+            "orientation": list(orientation),
+            "action": action,
+            "distance_to_goal": distance_to_goal,
+            "yaw_to_goal": yaw_to_goal,
+            "distances_to_obstacles": distances_to_obstacles,
+            "cbf_active": bool(cbf_active),
+            "goal_belief": goal_belief,
+        }
+        self._enqueue("frames", entry)
+
+        self._total_steps = max(self._total_steps, step + 1)
+        if distance_to_goal is not None:
+            self._last_distance_to_goal = distance_to_goal
+        for obs_id, dist in distances_to_obstacles.items():
+            prev = self._closest_approach.get(obs_id)
+            if prev is None or dist < prev:
+                self._closest_approach[obs_id] = dist
+
+    def log_rendered_frame(self, step, image) -> None:
+        """Save a rendered RGB snapshot to frames/, if the logger was constructed with
+        save_frames=True; no-op otherwise."""
+        if not self._save_frames:
+            return
+        self._enqueue("image", (step, image))
+
+    def log_qwen_query(self, step, query_type, trigger, input_data, output_data, latency_ms) -> None:
+        entry = {
+            "step": step,
+            "t": self._elapsed(),
+            "query_type": query_type,
+            "trigger": trigger,
+            "input": input_data,
+            "output": output_data,
+            "latency_ms": latency_ms,
+        }
+        self._enqueue("qwen_queries", entry)
+        self._counts["qwen_queries"] += 1
+        if trigger == "goal_proximity":
+            self._counts["goal_proximity_events"] += 1
+
+    def log_cbf_event(self, step, obstacle_id, distance, nominal_action, overridden_action, mode) -> None:
+        entry = {
+            "step": step,
+            "t": self._elapsed(),
+            "obstacle_id": obstacle_id,
+            "distance": distance,
+            "nominal_action": nominal_action,
+            "overridden_action": overridden_action,
+            "mode": mode,
+        }
+        self._enqueue("cbf_events", entry)
+        self._counts["cbf_events"] += 1
+        prev = self._closest_approach.get(obstacle_id)
+        if prev is None or distance < prev:
+            self._closest_approach[obstacle_id] = distance
+
+    def finalize(self, summary=None) -> Dict:
+        """Write summary.json (caller-provided fields win over computed ones) and shut down the
+        background writer. Safe to call at most once."""
+        computed = {
+            "run_id": self.run_id,
+            "timestamp_end": _log_now_iso(),
+            "total_steps": self._total_steps,
+            "final_distance_to_goal": self._last_distance_to_goal,
+            "closest_approach_per_obstacle": dict(self._closest_approach),
+            "num_cbf_interventions": self._counts["cbf_events"],
+            "num_qwen_queries": self._counts["qwen_queries"],
+            "num_goal_proximity_events": self._counts["goal_proximity_events"],
+        }
+        computed.update(summary or {})
+        self._write_json_now("summary.json", computed)
+        self.close()
+        return computed
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(_LOG_SENTINEL)
+        self._worker.join(timeout=10.0)
+
+    def __enter__(self) -> "EpisodeLogger":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if not self._closed:
+            self.finalize({
+                "success": False,
+                "termination_reason": "exception" if exc_type else "unfinalized",
+            })
+        return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run a trained NavDP/S2DiT policy inside the Mars HabitatSim terrain.")
     ap.add_argument("--navdp-root", default=None, help="Path to the navdp_sam repo containing model_s2_dit.py")
     ap.add_argument("--ckpt", required=True, help="Path to trained NavDP/S2DiT checkpoint")
     ap.add_argument("--scene", default=str(DEFAULT_SCENE))
     ap.add_argument("--out", default="mars_navdp_rollout")
+    ap.add_argument("--log-root", default="logs",
+                    help="Root dir for structured per-episode ablation logs (config/frames/obstacles/"
+                         "qwen_queries/cbf_events/summary); a timestamped run_id subdir is created "
+                         "under it every rollout, separate from --out.")
+    ap.add_argument("--log-save-frames", action="store_true",
+                    help="Also dump each step's raw RGB frame under the log run dir's frames/ folder.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--weights", choices=["model", "ema"], default="model")
     ap.add_argument("--cbf-cone-project", action=argparse.BooleanOptionalAction, default=True,
@@ -703,8 +1026,27 @@ def main() -> None:
     ap.add_argument("--start-x", type=float, default=0.0)
     ap.add_argument("--start-z", type=float, default=8.0)
     ap.add_argument("--start-yaw-deg", type=float, default=0.0)
-    ap.add_argument("--goal-x", type=float, default=None, help="World goal X (required unless --goal-mesh-uv).")
-    ap.add_argument("--goal-z", type=float, default=None, help="World goal Z (required unless --goal-mesh-uv).")
+    ap.add_argument("--goal-x", type=float, default=None, help="World goal X (required unless --goal-mesh-uv/--goal-from-vlm).")
+    ap.add_argument("--goal-z", type=float, default=None, help="World goal Z (required unless --goal-mesh-uv/--goal-from-vlm).")
+    ap.add_argument("--goal-from-vlm", action="store_true",
+                    help="BELIEF-tracked goal (mode b): resolve a VLM object selection and seed the "
+                         "belief via the same grounder pixel path as --grounder stub/qwen (implies "
+                         "--belief-goal). DEFAULT: the frame is captured LIVE from this rollout's own "
+                         "start pose and auto-annotated with SAM -- no pre-existing files needed. Pass "
+                         "--manual-annotate to instead use a pre-existing, already-annotated frame from "
+                         "vlm_nav_interactive's capture session. The resolved world position is kept "
+                         "only as a logging/success-metric reference, like --goal-bearing-deg -- never "
+                         "fed to control.")
+    ap.add_argument("--manual-annotate", action="store_true",
+                    help="With --goal-from-vlm: use a pre-existing, manually labelme-annotated frame "
+                         "(vlm_nav_interactive's OUT_DIR/ANNOTATIONS_DIR, keyed by --vlm-frame-idx) "
+                         "instead of the default live-capture+SAM path. Warns if --start-x/z/yaw-deg "
+                         "differ from the pose that frame was captured at, since the annotated bbox is "
+                         "a fixed pixel fraction only valid for that pose.")
+    ap.add_argument("--vlm-frame-idx", type=int, default=0,
+                    help="Frame index for --goal-from-vlm. With --manual-annotate, selects the "
+                         "pre-captured/annotated frame to load; by default (SAM live-capture), it "
+                         "just names the live-captured frame's output/annotation files.")
     ap.add_argument("--goal-y", type=float, default=None, help="World Y of goal marker; default terrain height + goal-height")
     ap.add_argument("--goal-height", type=float, default=1.2, help="Goal marker height above terrain when --goal-y is omitted")
     ap.add_argument("--goal-terrain-radius", type=float, default=0.8, help="Raise ghost goal from local max terrain height in this radius")
@@ -845,6 +1187,19 @@ def main() -> None:
         project_forward_velocity_cbf,
     )
     from rollout_habitat_policy import ActionSmoother, action_to_control, frame_to_spatial, load_model, resolve_modes, resolve_obstacle_channel
+    if args.goal_from_vlm:
+        from vlm_nav_interactive import (
+            OUT_DIR as VLM_OUT_DIR,
+            ANNOTATIONS_DIR as VLM_ANNOTATIONS_DIR,
+            RGBD_RESOLUTION as VLM_CAPTURE_HW,
+            START_X as VLM_START_X,
+            START_Z as VLM_START_Z,
+            START_YAW_DEG as VLM_START_YAW_DEG,
+            draw_annotation_overlay,
+            resolve_vlm_selection,
+            save_mission_metadata,
+            save_pose as vlm_save_pose,
+        )
 
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -933,16 +1288,131 @@ def main() -> None:
         print(f"[MASK] rendered-mask goal at pixel {args.goal_mesh_uv}"
               + (f" + obstacle mesh at {args.obstacle_mesh_uv}" if args.obstacle_mesh_uv else ""), flush=True)
 
-    sim = make_sim(Path(args.scene), args.height, args.width, args.hfov_deg, with_semantic=mesh_goal_mode)
+    sim = make_sim(Path(args.scene), args.height, args.width, args.hfov_deg, with_semantic=(mesh_goal_mode or args.goal_from_vlm))
     agent = sim.initialize_agent(0)
 
     x = float(args.start_x)
     z = float(args.start_z)
     yaw = math.radians(float(args.start_yaw_deg))
     dt = 1.0 / float(args.hz)
-    if args.goal_x is None or args.goal_z is None:
+
+    cbf_obstacle_id = "obstacle"  # identifies the single obstacle the live CBF math tracks, for
+                                   # cbf_events.jsonl -- refined below once VLM/ghost obstacle resolve
+    vlm_goal_mesh = None
+    vlm_obstacle_meshes = []
+    vlm_mesh_tracking = False   # True once the VLM's resolved goal mesh is registered with the
+                                 # semantic sensor below, so the main loop tracks it from the live
+                                 # per-frame mask instead of one-shot pixel + odometry dead-reckoning.
+    if args.goal_from_vlm:
+        # SEMANTIC-MASK-tracked goal: resolve the VLM's object selection ONCE here, register its
+        # already-saved mesh (selected_bbox_to_object_mesh's on-disk .obj) with the semantic sensor,
+        # and re-render that mesh's mask every step (see MESH_GOAL_ID handling in the main loop) --
+        # mirrors --goal-mesh-uv's rendered-mask tracking instead of dead-reckoning by odometry alone.
+        frame_idx = args.vlm_frame_idx
+        rgb_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}.png"
+        overlay_path = f"{VLM_OUT_DIR}/rgb_{frame_idx:04d}_at.png"
+        annotation_path = f"{VLM_ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
+
+        if not args.manual_annotate:
+            # DEFAULT: capture the actual live first frame (RGB + depth + pose) at THIS rollout's
+            # own start pose -- run after sim/agent exist so it's a real render, not an assumption
+            # that vlm_nav_interactive.py already produced these files on disk. SAM then annotates
+            # it in place of a human labelme session; resolve_vlm_selection below is unchanged and
+            # can't tell the difference between the two annotation sources.
+            y0 = terrain.local_height_max(x, z, float(args.pose_terrain_radius)) + float(args.clearance)
+            set_agent_pose(agent, x, y0, z, yaw)
+            obs0 = sim.get_sensor_observations()
+            rgb0, depth0 = rgb_depth(obs0)
+            os.makedirs(VLM_OUT_DIR, exist_ok=True)
+            Image.fromarray(rgb0).save(rgb_path)
+            np.save(f"{VLM_OUT_DIR}/depth_{frame_idx:04d}.npy", depth0.astype(np.float32))
+            depth_vis = (np.clip(depth0, 0.0, 10.0) / 10.0 * 255.0).astype(np.uint8)
+            Image.fromarray(depth_vis).save(f"{VLM_OUT_DIR}/depth_{frame_idx:04d}.png")
+            vlm_save_pose(frame_idx, x, y0, z, yaw)
+
+            from sam_annotation_adapter import sam_frame_to_annotation
+            annotation_path, sam_valid, sam_status = sam_frame_to_annotation(rgb_path, annotation_path)
+            if not sam_valid:
+                raise SystemExit(f"--goal-from-vlm: SAM annotation invalid: {sam_status}")
+            print(f"[SAM] live-captured frame {frame_idx} at this rollout's start pose "
+                  f"({x:.2f},{z:.2f},{math.degrees(yaw):.1f}deg) -> {annotation_path}", flush=True)
+
+        # ANNOTATED FRAME FOR REFERENCE: draw the (SAM- or labelme-) annotation's labeled boxes
+        # onto the raw frame and save it to overlay_path.
+        draw_annotation_overlay(rgb_path, annotation_path, overlay_path)
+
+        vlm_success, vlm_result, vlm_status = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx)
+        if not vlm_success:
+            raise SystemExit(f"--goal-from-vlm: VLM selection failed: {vlm_status}")
+        vlm_response, vlm_goal_mesh, vlm_obstacle_meshes = vlm_result
+        register_semantic_mesh(sim, vlm_goal_mesh["mesh_path"], MESH_GOAL_ID)
+        vlm_mesh_tracking = True
+        # Kept only as an inert fallback (unused once vlm_mesh_tracking routes through the
+        # MESH_GOAL_ID branch below) in case the goal mesh ever fails to register.
+        grounder = VlmSelectionPixelGoal(vlm_goal_mesh["bbox"], VLM_CAPTURE_HW)
+        args.belief_goal = True
+        print(f"[VLM] goal '{vlm_goal_mesh['label']}' mesh={vlm_goal_mesh['mesh_path']} registered as "
+              f"MESH_GOAL_ID; belief re-derived from the live rendered mask every step (no dead-reckoning "
+              f"while in view)", flush=True)
+
+        # OBSTACLE: the VLM's prompt asks for exactly one "rock" obstacle, but Qwen routinely
+        # returns several -- register ALL of them under MESH_OBST_ID so the rendered obstacle mask
+        # the policy/CBF/DWA see is the union of every flagged rock's footprint, not just the
+        # first. ALSO wire the first one's resolved world seed into --ghost-obstacle-x/y/z so the
+        # CBF/orbit avoidance's cone-mode math (which prefers a single stable world point over the
+        # mask to avoid abeam-pass flicker) still has one, unless the caller passed an explicit
+        # ghost obstacle of their own; the mask-based CBF/DWA paths don't depend on this and see
+        # every registered mesh.
+        if vlm_obstacle_meshes:
+            cbf_obstacle_id = "vlm_obstacle"
+            for vlm_obstacle_mesh in vlm_obstacle_meshes:
+                register_semantic_mesh(sim, vlm_obstacle_mesh["mesh_path"], MESH_OBST_ID)
+                print(f"[VLM] obstacle '{vlm_obstacle_mesh['label']}' bbox={vlm_obstacle_mesh['bbox']} "
+                      f"mesh={vlm_obstacle_mesh['mesh_path']} registered as MESH_OBST_ID", flush=True)
+            if args.ghost_obstacle_x is None and args.ghost_obstacle_z is None:
+                obs_vx, obs_vy, obs_vz = vlm_obstacle_meshes[0]["seed_world"]
+                args.ghost_obstacle_x = obs_vx
+                args.ghost_obstacle_z = obs_vz
+                # y is left to the existing terrain-height + --ghost-obstacle-height computation
+                # below (unless the caller passed --ghost-obstacle-y explicitly) -- seed_world's y
+                # sits at the rock's own surface, not the elevated marker height the rest of this
+                # script expects for a ghost obstacle.
+                print(f"[VLM] ghost world seeded from first obstacle=({obs_vx:.2f},{obs_vy:.2f},"
+                      f"{obs_vz:.2f}); cone-mode math tracks this point while the mask-based CBF/DWA "
+                      f"see all {len(vlm_obstacle_meshes)} registered obstacle meshes", flush=True)
+        else:
+            print("[VLM] no obstacle resolved from the VLM's selection; proceeding without one", flush=True)
+
+        if args.manual_annotate:
+            # The bbox is a FIXED pixel fraction from an OFFLINE labelme session (not a live
+            # re-detection), so it's only valid if the rollout starts from ~the pose that frame
+            # was captured at. Doesn't apply to the default SAM path above: that frame IS this
+            # rollout's own start pose, by construction, so it can't be stale.
+            if (abs(args.start_x - VLM_START_X) > 0.5 or abs(args.start_z - VLM_START_Z) > 0.5
+                    or abs(args.start_yaw_deg - VLM_START_YAW_DEG) > 5.0):
+                print(f"[WARN] --start-x/z/yaw-deg ({args.start_x},{args.start_z},{args.start_yaw_deg}) "
+                      f"differ from the capture pose ({VLM_START_X},{VLM_START_Z},{VLM_START_YAW_DEG}); "
+                      "the seeded pixel may not land on the object in the first live frame.", flush=True)
+
+    if args.goal_from_vlm:
+        # World position of the VLM selection, kept ONLY as the success-metric/logging reference
+        # (mirrors --goal-bearing-deg) -- control is driven by the pixel-seeded belief wired
+        # above, this world point is never read by the control path.
+        goal_vx, goal_vy, goal_vz = vlm_goal_mesh["seed_world"]
+        print(f"[VLM] goal '{vlm_goal_mesh['label']}' reference world=({goal_vx:.2f},{goal_vy:.2f},{goal_vz:.2f})", flush=True)
+        goal_y = args.goal_y
+        if goal_y is None:
+            goal_y = terrain.local_height_max(goal_vx, goal_vz, float(args.goal_terrain_radius)) + float(args.goal_height)
+        goal = np.asarray([goal_vx, goal_y, goal_vz], dtype=np.float32)
+
+        # MISSION RECORD: first frame (rgb_path), its SAM-annotated overlay (overlay_path), the
+        # annotation JSON (annotation_path), and the raw VLM prompt/response are already on disk
+        # under VLM_OUT_DIR/VLM_ANNOTATIONS_DIR; this adds one consolidated JSON tying the VLM's
+        # parsed goal+obstacle choice to their resolved world positions/meshes.
+        save_mission_metadata(frame_idx, vlm_response, vlm_goal_mesh, vlm_obstacle_meshes, goal_target_world=goal)
+    elif args.goal_x is None or args.goal_z is None:
         if not mesh_goal_mode:
-            raise SystemExit("Pass --goal-x and --goal-z, or use --goal-mesh-uv for a rendered-mask goal.")
+            raise SystemExit("Pass --goal-x and --goal-z, --goal-from-vlm, or use --goal-mesh-uv for a rendered-mask goal.")
         goal = np.zeros(3, dtype=np.float32)   # placeholder; set from the mesh centroid at step 0
     else:
         goal_y = args.goal_y
@@ -961,12 +1431,49 @@ def main() -> None:
             [float(args.ghost_obstacle_x), float(obstacle_y), float(args.ghost_obstacle_z)],
             dtype=np.float32,
         )
+        if cbf_obstacle_id == "obstacle":
+            cbf_obstacle_id = "ghost"
+
+    # Structured per-episode ablation logs (separate from the --out npz/manifest dump above):
+    # config.json / obstacles.json up front, frames.jsonl / qwen_queries.jsonl / cbf_events.jsonl
+    # appended to every step, summary.json once at the end.
+    goal_mode = "vlm" if args.goal_from_vlm else ("uv" if args.goal_mesh_uv else "coord")
+    log_config = {
+        "scene_glb": str(Path(args.scene).expanduser().resolve()),
+        "goal_mode": goal_mode,
+        "goal_coord": [float(args.goal_x), float(args.goal_z)] if (args.goal_x is not None and args.goal_z is not None) else None,
+        "steering_mode": "none",
+        "cbf_enabled": bool(args.cbf),
+        "obstacle_count": 1 if ghost_obstacle is not None else 0,
+        "obstacle_seed": None,
+        "obstacle_distance_threshold_X": float(args.cbf_d_safe),
+        "goal_distance_threshold_Y": float(args.stop_dist),
+        "max_steps": int(args.max_steps),
+        "agent_height_offset": float(args.clearance),
+    }
+    run_id = make_run_id(log_config)
+    episode_logger = EpisodeLogger(run_id, log_config, log_root=args.log_root, save_frames=args.log_save_frames)
+    if ghost_obstacle is not None:
+        episode_logger.write_obstacles(
+            [{
+                "id": "ghost",
+                "position": [float(ghost_obstacle[0]), float(ghost_obstacle[1]), float(ghost_obstacle[2])],
+                "orientation": [0.0, 0.0, 0.0, 1.0],
+                "radius": float(args.ghost_obstacle_world_radius),
+                "is_goal": False,
+            }],
+            goal_id=("vlm_goal" if args.goal_from_vlm else None),
+        )
+    else:
+        episode_logger.write_obstacles([], goal_id=("vlm_goal" if args.goal_from_vlm else None))
+    termination_reason = "timeout"
 
     rows = {k: [] for k in [
         "rgb", "depth", "goal_mask", "obstacle_mask", "seg_masks", "pose", "proprio",
         "action_3d", "pred_chunk", "goal_visible_pixels", "goal_u", "goal_v", "goal_distance",
         "obstacle_visible_pixels", "obstacle_u", "obstacle_v", "obstacle_distance",
         "belief_fwd", "belief_left",   # body-frame belief_g each tick (nan if not tracking) -> lets
+        "goal_frame_fraction",         # goal_px / total_px this tick, from goal_pixel_ratio()
         "cone_correction_step0", "cone_correction_last", "hard_gate_tick",   # Euclidean vs
     ]}                                 # Mahalanobis mechanistic ablation (see project_chunk_cone)
     video_frames = []
@@ -974,6 +1481,8 @@ def main() -> None:
     last_pred_chunk = None
     chunk_len = 0
     replan_every = max(int(args.replan_every), 1)
+    mesh_tracking_mode = mesh_goal_mode or vlm_mesh_tracking  # goal (+ obstacle, if resolved) tracked
+                                 # from the live rendered semantic mask each step, not dead-reckoned
     cbf_active = 0
     cone_side_latch = None      # committed cone-projection side while the obstacle is in view
     around_side = None          # committed tangent-pursuit side (+1 = pass on obstacle's left)
@@ -1038,10 +1547,13 @@ def main() -> None:
             set_agent_pose(agent, x, y, z, yaw)
             obs = sim.get_sensor_observations()
             rgb, depth = rgb_depth(obs)
-            if mesh_goal_mode:
-                # RENDERED-MASK goal: a semantic mesh (placed at t=0 from a pixel) is rendered each
-                # step; the belief is built from that mask, so the policy's goal channel IS the mask.
-                if step == 0:
+            if mesh_tracking_mode:
+                # RENDERED-MASK goal: a semantic mesh (placed at t=0 from a pixel, or registered
+                # up-front from the VLM's resolved selection) is rendered each step; the belief is
+                # RE-DERIVED from that live mask every step it's visible, so tracking follows the
+                # mask's ground truth instead of dead-reckoning by odometry alone (which drifts) --
+                # dead-reckoning only bridges the gap while the mask briefly drops out of view.
+                if mesh_goal_mode and step == 0:
                     _gw, _ow = place_mesh_goal_obstacle(sim, depth, position, yaw, intr, args, out_dir)
                     if _gw is not None:
                         goal[:] = np.asarray(_gw, dtype=np.float32)
@@ -1050,8 +1562,7 @@ def main() -> None:
                 _sem = semantic_from_obs(obs)
                 _gm = np.where(_sem == MESH_GOAL_ID, 255, 0).astype(np.uint8)
                 if int(_gm.sum()) >= int(args.lost_goal_min_px):
-                    if belief_g is None:   # seed ONCE from the mask, then dead-reckon (stable distance)
-                        belief_g = mask_to_body(_gm, depth, rgb.shape[0], rgb.shape[1], args.hfov_deg, float(args.goal_range))
+                    belief_g = mask_to_body(_gm, depth, rgb.shape[0], rgb.shape[1], args.hfov_deg, float(args.goal_range))
                     _ys, _xs = np.where(_gm > 0)
                     goal_mask = _gm
                     goal_info = {
@@ -1070,12 +1581,22 @@ def main() -> None:
                 # BELIEF-tracked goal: the ghost comes from a body-frame estimate propagated by
                 # odometry. It is seeded either from an IMAGE bearing+range (no world xyz) or from
                 # the world goal at t=0; with a world goal it can also correct on sight.
-                if grounder is not None and (belief_g is None or step % max(1, int(args.grounder_every)) == 0):
+                if grounder is not None and (
+                    belief_g is None
+                    or (not getattr(grounder, "one_shot", False) and step % max(1, int(args.grounder_every)) == 0)
+                ):
                     # LANGUAGE grounds the goal: RGB + instruction -> pixel -> body point (belief)
                     pg = grounder.ground(rgb, args.instruction)
                     if pg.in_view:
-                        belief_g = pixel_to_body(pg.u, pg.v, depth, rgb.shape[0], rgb.shape[1],
-                                                 args.hfov_deg, args.goal_range)
+                        bbox = getattr(pg, "bbox", None)
+                        if bbox is not None:
+                            # Robust: median depth over the whole VLM bbox, not one pixel that can
+                            # land on a depth discontinuity (see bbox_to_body's docstring).
+                            belief_g = bbox_to_body(bbox, depth, rgb.shape[0], rgb.shape[1],
+                                                    args.hfov_deg, args.goal_range)
+                        else:
+                            belief_g = pixel_to_body(pg.u, pg.v, depth, rgb.shape[0], rgb.shape[1],
+                                                     args.hfov_deg, args.goal_range)
                 elif belief_g is None:
                     if args.goal_bearing_deg is not None:
                         _b = math.radians(float(args.goal_bearing_deg))  # + = right of forward
@@ -1125,9 +1646,14 @@ def main() -> None:
                 ghost_obstacle_point = obstacle_point_from_world(ghost_obstacle, position, yaw)
                 obstacle_mask = np.maximum(obstacle_mask, ghost_obstacle_mask).astype(np.uint8)
 
-            if mesh_goal_mode:
+            if mesh_tracking_mode:
                 # obstacle = ONLY the rendered obstacle-mesh pixels (semantic id), never the ground.
+                # All-zero if no obstacle mesh was registered (no --obstacle-mesh-uv / no VLM
+                # obstacle resolved), same as before -- this only ever ADDS ground-truth precision.
                 obstacle_mask = np.where(_sem == MESH_OBST_ID, 255, 0).astype(np.uint8)
+
+            goal_ratio = goal_pixel_ratio(goal_mask)
+
             spatial = frame_to_spatial(depth, goal_mask, image_size, obstacle_mask, include_obstacle_channel=use_obstacle_channel).to(device)
             obstacle_map = obstacle_builder.build(depth) if args.obstacle_mode == "depth" else np.zeros((96, 96), dtype=np.float32)
             obstacle_map = paint_obstacle_map_point(
@@ -1462,8 +1988,14 @@ def main() -> None:
                 yaw_cmd = float(np.clip(
                     float(args.cbf_pursuit_kp) * psi, -float(args.max_yaw_rate), float(args.max_yaw_rate),
                 ))
+                nominal_action_orbit = [float(v) for v in action_3d]
                 action_3d = np.asarray([float(args.cbf_goaround_forward), 0.0, yaw_cmd], dtype=np.float32)
                 escape_active += 1
+                episode_logger.log_cbf_event(
+                    step=step, obstacle_id=cbf_obstacle_id, distance=float(L),
+                    nominal_action=nominal_action_orbit, overridden_action=[float(v) for v in action_3d],
+                    mode="orbit",
+                )
             elif around_side is not None:
                 around_side = None  # rock no longer blocks the goal ray -> release the side
 
@@ -1486,6 +2018,7 @@ def main() -> None:
                 if cone_clears and float(action_3d[0]) > 0.0:
                     pass  # turned enough that forward motion misses the obstacle -> let it drive
                 else:
+                    nominal_action_gate = [float(v) for v in action_3d]
                     action_3d, _gated = project_forward_velocity_cbf(
                         action_3d,
                         ctrl_op,
@@ -1498,6 +2031,11 @@ def main() -> None:
                     if _gated:
                         hard_gate_fired += 1
                         hard_gate_fired_tick = True
+                        episode_logger.log_cbf_event(
+                            step=step, obstacle_id=cbf_obstacle_id, distance=float(math.hypot(p_fwd, p_lat)),
+                            nominal_action=nominal_action_gate, overridden_action=[float(v) for v in action_3d],
+                            mode="brake",
+                        )
 
             # ABLATION BASELINE (--dwa): classic Dynamic Window Approach REPLACES the diffusion
             # policy's action + collision cone entirely -- a from-scratch reactive planner with no
@@ -1589,9 +2127,26 @@ def main() -> None:
             rows["obstacle_distance"].append(float(obstacle_info["range"]))
             rows["belief_fwd"].append(bf)
             rows["belief_left"].append(bl)
+            rows["goal_frame_fraction"].append(goal_ratio["frame_fraction"])
             rows["cone_correction_step0"].append(cone_correction_step0)
             rows["cone_correction_last"].append(cone_correction_last)
             rows["hard_gate_tick"].append(bool(hard_gate_fired_tick))
+
+            distances_to_obstacles = {cbf_obstacle_id: float(obstacle_info["range"])} if ghost_obstacle is not None else {}
+            episode_logger.log_frame(
+                step=step,
+                position=[float(pose[0]), float(pose[1]), float(pose[2])],
+                orientation=[float(pose[3]), float(pose[4]), float(pose[5]), float(pose[6])],
+                action={"v_fwd": float(action_3d[0]), "v_lat": float(action_3d[1]), "yaw_rate": float(action_3d[2])},
+                distances_to_obstacles=distances_to_obstacles,
+                cbf_active=bool(avoiding),
+                goal_belief={
+                    "range": goal_dist,
+                    "bearing": math.degrees(planar_goal_bearing(position, yaw, goal)),
+                    "source": "observed" if int(goal_mask.sum()) >= int(args.lost_goal_min_px) else "dead_reckoned",
+                },
+            )
+            episode_logger.log_rendered_frame(step, rgb)
 
             if step % max(int(args.save_every), 1) == 0:
                 lost_txt = " LOST" if int(goal_mask.sum()) < int(args.lost_goal_min_px) else ""
@@ -1619,10 +2174,17 @@ def main() -> None:
             belief_dist = float(np.hypot(belief_g[0], belief_g[1])) if belief_g is not None else float("nan")
             if goal_dist <= float(args.stop_dist):
                 print(f"Reached goal at step {step} dist={goal_dist:.2f}m (belief={belief_dist:.2f})", flush=True)
+                termination_reason = "goal_reached"
                 break
             if stop_cmd:   # language "stop" already halted (action zeroed above) -- end the rollout,
                 print(f"Stopped by language command at step {step} dist={goal_dist:.2f}m", flush=True)
+                termination_reason = "stop_command"
                 break
+    except BaseException:
+        # Make sure the structured logs are flushed and closed even if the rollout crashes
+        # mid-episode -- the happy-path finalize() call below is skipped once this re-raises.
+        episode_logger.finalize({"success": False, "termination_reason": "exception"})
+        raise
     finally:
         sim.close()
 
@@ -1632,6 +2194,7 @@ def main() -> None:
         flush=True,
     )
     success = bool(rows["goal_distance"] and rows["goal_distance"][-1] <= float(args.stop_dist))
+    episode_logger.finalize({"success": success, "termination_reason": termination_reason})
     npz_path = out_dir / "rollout.npz"
     np.savez_compressed(
         npz_path,
@@ -1654,6 +2217,7 @@ def main() -> None:
         obstacle_distance=np.asarray(rows["obstacle_distance"], dtype=np.float32),
         belief_fwd=np.asarray(rows["belief_fwd"], dtype=np.float32),
         belief_left=np.asarray(rows["belief_left"], dtype=np.float32),
+        goal_frame_fraction=np.asarray(rows["goal_frame_fraction"], dtype=np.float32),
         cone_correction_step0=np.asarray(rows["cone_correction_step0"], dtype=np.float32),
         cone_correction_last=np.asarray(rows["cone_correction_last"], dtype=np.float32),
         hard_gate_tick=np.asarray(rows["hard_gate_tick"], dtype=bool),
