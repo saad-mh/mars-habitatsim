@@ -582,6 +582,20 @@ def bbox_to_body(bbox_xyxy, depth_img, height, width, hfov_deg, fallback_range):
     return np.asarray([rng, -right], dtype=np.float32)  # [forward, left]
 
 
+def bbox_center_depth(bbox_xyxy, depth_img) -> Optional[float]:
+    """Depth-sensor reading at a detected object's bbox CENTER pixel -- the straight-line-forward
+    distance from the agent's camera to that object's surface in the frame the bbox came from.
+    Unlike bbox_to_body's median-over-interior (built for a robust control seed), this is the raw
+    single-pixel reading callers want for a literal "how far is this object" log entry."""
+    depth = np.asarray(depth_img)
+    height, width = depth.shape[:2]
+    x1, y1, x2, y2 = bbox_xyxy
+    u = int(np.clip(round(0.5 * (float(x1) + float(x2))), 0, width - 1))
+    v = int(np.clip(round(0.5 * (float(y1) + float(y2))), 0, height - 1))
+    d = float(depth[v, u])
+    return d if (np.isfinite(d) and d > 0.0) else None
+
+
 class VlmSelectionPixelGoal:
     """Adapts a one-shot VLM object selection (resolve_vlm_selection, run once on an
     already-captured+annotated frame) to the .ground(rgb, instruction) grounder interface used by
@@ -835,6 +849,13 @@ class EpisodeLogger:
             "goal_id": goal_id,
         }
         self._write_json_now("obstacles.json", payload)
+
+    def write_object_depths(self, object_depths) -> None:
+        """Per-episode: the first-frame depth-sensor reading at each detected object's bbox
+        center, from the rover's own start pose -- how far each VLM-flagged object (goal +
+        obstacles) actually is from the agent's camera, independent of the world-seed
+        back-projection stored in obstacles.json / the VLM mission metadata."""
+        self._write_json_now("object_depths.json", {"objects": list(object_depths)})
 
     def log_frame(
         self,
@@ -1196,6 +1217,7 @@ def main() -> None:
             START_Z as VLM_START_Z,
             START_YAW_DEG as VLM_START_YAW_DEG,
             draw_annotation_overlay,
+            load_depth_frame as vlm_load_depth_frame,
             resolve_vlm_selection,
             save_mission_metadata,
             save_pose as vlm_save_pose,
@@ -1383,6 +1405,28 @@ def main() -> None:
         else:
             print("[VLM] no obstacle resolved from the VLM's selection; proceeding without one", flush=True)
 
+        # PER-OBJECT DEPTH: the raw depth-sensor reading at each detected object's bbox center in
+        # the first frame, from the rover's own start pose -- a literal "how far is this from the
+        # agent" figure. Distinct from seed_world (a median over the bbox interior used to seed a
+        # robust world position); this is the single center pixel, matching what a "distance to
+        # this object" readout would show a human looking at that frame.
+        vlm_first_frame_depth = vlm_load_depth_frame(frame_idx)
+        vlm_object_depths = [{
+            "role": vlm_goal_mesh["role"],
+            "label": vlm_goal_mesh["label"],
+            "bbox": vlm_goal_mesh["bbox"],
+            "depth_m": bbox_center_depth(vlm_goal_mesh["bbox"], vlm_first_frame_depth),
+        }]
+        for vlm_obstacle_mesh in vlm_obstacle_meshes:
+            vlm_object_depths.append({
+                "role": vlm_obstacle_mesh["role"],
+                "label": vlm_obstacle_mesh["label"],
+                "bbox": vlm_obstacle_mesh["bbox"],
+                "depth_m": bbox_center_depth(vlm_obstacle_mesh["bbox"], vlm_first_frame_depth),
+            })
+        print(f"[VLM] first-frame object depths (bbox-center, agent POV): "
+              + ", ".join(f"{o['label']}={o['depth_m']}" for o in vlm_object_depths), flush=True)
+
         if args.manual_annotate:
             # The bbox is a FIXED pixel fraction from an OFFLINE labelme session (not a live
             # re-detection), so it's only valid if the rollout starts from ~the pose that frame
@@ -1466,6 +1510,8 @@ def main() -> None:
         )
     else:
         episode_logger.write_obstacles([], goal_id=("vlm_goal" if args.goal_from_vlm else None))
+    if args.goal_from_vlm:
+        episode_logger.write_object_depths(vlm_object_depths)
     termination_reason = "timeout"
 
     rows = {k: [] for k in [
