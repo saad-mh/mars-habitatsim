@@ -23,11 +23,13 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
@@ -36,10 +38,117 @@ import habitat_sim
 from habitat_sim.agent import AgentConfiguration
 import quaternion
 
+import qwen_vlm_client
+
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_SCENE = HERE / "marsyard2022_tri.glb"
 DEFAULT_OBJ = HERE / "marsyard2022.obj"
+
+def qwen_steer_prompt(frame_fraction_pct: float) -> str:
+    """
+    Build the steering prompt using the measured percentage of image pixels
+    occupied by the green goal mask.
+
+    frame_fraction_pct must be in percentage units:
+        0.50 means 0.50%
+        1.25 means 1.25%
+    """
+    stop_threshold_pct = 1.0
+    threshold_exceeded = frame_fraction_pct > stop_threshold_pct
+    goal_not_visible = frame_fraction_pct <= 0.0
+
+    return f"""
+You are controlling a rover moving toward a navigation goal.
+
+Scene definition:
+- The bright neon-green highlighted region is the navigation goal.
+- Large beige rocks are obstacles.
+- The black region is background and must be ignored.
+
+A separate image-processing function has already measured the goal-mask
+coverage. Treat this measurement as exact. Do not estimate it from the image.
+
+MEASURED GOAL COVERAGE: {frame_fraction_pct:.4f}%
+STOP THRESHOLD: greater than {stop_threshold_pct:.2f}%
+IS THE STOP THRESHOLD EXCEEDED: {"YES" if threshold_exceeded else "NO"}
+IS THE GOAL VISIBLE AT ALL: {"NO" if goal_not_visible else "YES"}
+
+Follow this decision process internally and in the exact order shown.
+
+STEP 0 — GOAL NOT VISIBLE
+
+If IS THE GOAL VISIBLE AT ALL is NO (measured coverage is exactly 0.0000%,
+i.e. no green pixels anywhere in the image), the stop rule in Step 1 CANNOT
+apply -- there is no goal coverage to have exceeded any threshold. In this
+case:
+- The action MUST NOT be stop, no matter what else is in the frame.
+- This holds even if a large obstacle fills most or all of the image --
+  a full frame of obstacle is not a reason to stop; it only means the goal
+  is currently hidden behind or beside it.
+- Skip Step 1 entirely and go straight to Step 2, using the obstacle's
+  position (not the goal, which you cannot see) to pick left or right:
+  choose the side with more clear, obstacle-free terrain visible at the
+  edges of the frame.
+
+If IS THE GOAL VISIBLE AT ALL is YES, continue to Step 1 as normal.
+
+STEP 1 — CHECK THE STOP RULE
+
+If IS THE STOP THRESHOLD EXCEEDED is YES:
+- The action MUST be stop.
+- This rule overrides every visual steering consideration.
+- Do not select left or right.
+- Do not reconsider the decision based on the goal's position.
+- Do not estimate the goal coverage yourself.
+
+If IS THE STOP THRESHOLD EXCEEDED is NO:
+- The action must not be stop.
+- Continue to Step 2 and select either left or right.
+
+STEP 2 — SELECT A STEERING DIRECTION
+
+Only perform this step when the stop threshold is not exceeded.
+
+1. Locate the bright neon-green goal, if any is visible.
+2. Determine whether the safest route toward it is to the left or right.
+   If no goal is visible (Step 0 applied), determine the safest route
+   AROUND the obstacle instead.
+3. Treat beige rocks as obstacles.
+4. Ignore the black background.
+5. If the goal is approximately centered, or no goal is visible, choose the
+   side with more clear, obstacle-free terrain.
+
+STEP 3 — VERIFY THE DECISION
+
+Before responding, silently verify:
+- If the measured coverage is exactly 0.0000%, the action is left or right,
+  never stop -- regardless of how much of the frame an obstacle fills.
+- If the measured coverage is greater than 1.00%, the action is stop.
+- If the measured coverage is not greater than 1.00%, the action is left or right.
+- The measured numerical value has priority over visual appearance.
+
+Do not provide a detailed chain of thought. Provide only the selected action
+and one brief reason.
+
+Output exactly one word in this format:
+
+ACTION: left, right, or stop
+
+Examples:
+
+MEASURED GOAL COVERAGE: 1.24%
+ACTION: stop
+
+MEASURED GOAL COVERAGE: 0.72%
+ACTION: left
+
+MEASURED GOAL COVERAGE: 0.0000% (goal not visible, obstacle fills the frame)
+ACTION: right
+
+STOP has more priority over STEER. If the measured coverage is GREATER than 1.00%, the action is stop, even if the goal appears to be centered or to the left or right. The ONE exception is exactly 0.0000% coverage (goal not visible at all) -- that case is NEVER stop, even if an obstacle fills the whole frame.
+"""
+
 
 SIZE_X = 50.0
 SIZE_Z = 50.0
@@ -466,6 +575,24 @@ def draw_circle_mask(height: int, width: int, u: float, v: float, radius: int) -
     return mask.astype(np.uint8)
 
 
+def goal_pixel_ratio(goal_mask: np.ndarray) -> Dict[str, float]:
+    """Fraction of the current frame occupied by goal-object pixels vs. the rest of the image.
+
+    Feeds qwen_steer_prompt() the measured "goal obstacle % of the entire image" value so the
+    VLM is told the ratio instead of eyeballing it; callers can also threshold `frame_fraction`
+    directly instead of (or alongside) the VLM's answer.
+    """
+    total_px = int(goal_mask.shape[0] * goal_mask.shape[1])
+    goal_px = int(np.count_nonzero(goal_mask))
+    rest_px = total_px - goal_px
+    return {
+        "goal_px": goal_px,
+        "rest_px": rest_px,
+        "frame_fraction": goal_px / total_px if total_px > 0 else 0.0,
+        "goal_to_rest_ratio": goal_px / rest_px if rest_px > 0 else float("inf"),
+    }
+
+
 def project_goal_mask(
     *,
     goal: np.ndarray,
@@ -655,6 +782,11 @@ def main() -> None:
     ap.add_argument("--hz", type=float, default=10.0)
     ap.add_argument("--max-steps", type=int, default=300)
     ap.add_argument("--stop-dist", type=float, default=1.0)
+    ap.add_argument("--qwen-stop-frame-fraction", type=float, default=0.01,
+                    help="If the goal's measured frame_fraction (from goal_pixel_ratio()) is at "
+                    "least this, treat it as proximity for a Qwen 'stop' verdict, same as "
+                    "near_obstacle/near_goal -- matches the 1%% threshold already stated in "
+                    "qwen_steer_prompt().")
     ap.add_argument("--vla-dump", type=str, default="",
                     help="If set, dump paired left/right counterfactual VLA training samples "
                     "(neutral-goal obs + orbit-generated left & right chunks) to this dir at blocked steps.")
@@ -666,6 +798,15 @@ def main() -> None:
     ap.add_argument("--command-file", type=str, default="",
                     help="Path polled every tick for the current command (a human or a VLM writes to it). "
                     "Overrides --command. This is the LIVE inference interface.")
+    ap.add_argument("--qwen-steer", action="store_true",
+                    help="Once near the goal (same stop-dist+deadzone gate used for goal-reached), poll "
+                    "the persistent Qwen VLM server (qwen_vlm_server.py) for a live left/right/stop "
+                    "steering command instead of --command/--command-file. Feeds into the same "
+                    "command_intent path -- overrides --command/--command-file once active.")
+    ap.add_argument("--qwen-steer-hz", type=float, default=3.0,
+                    help="Poll rate (Hz) for --qwen-steer once near-goal; independent of --hz.")
+    ap.add_argument("--qwen-host", default=qwen_vlm_client.DEFAULT_HOST)
+    ap.add_argument("--qwen-port", type=int, default=qwen_vlm_client.DEFAULT_PORT)
     ap.add_argument("--vla-adapter", type=str, default="",
                     help="Path to a trained vla_adapter.pt. REGIME B: the language-conditioned POLICY "
                     "produces the maneuver (orbit override + soft cone projection off; hard gate keeps it "
@@ -982,6 +1123,9 @@ def main() -> None:
     dwa_prev_v, dwa_prev_w = 0.0, 0.0   # DWA's own dynamic-window state (--dwa ablation baseline)
     cone_correction_step0 = float("nan")   # ||corrected - raw|| on the EXECUTED step (mechanistic
     cone_correction_last = float("nan")    # ablation metric: Euclidean vs Mahalanobis correction spread)
+    qwen_cmd_txt = ""            # last command text received from --qwen-steer (persists between polls)
+    last_qwen_poll_t = 0.0
+    qwen_steer_active = False    # logs once, the tick --qwen-steer polling starts
 
     print("Mars NavDP rollout", flush=True)
     print(f"  navdp_root : {navdp_root}", flush=True)
@@ -1014,25 +1158,24 @@ def main() -> None:
 
     try:
         for step in range(int(args.max_steps)):
+            y = terrain.local_height_max(x, z, float(args.pose_terrain_radius)) + float(args.clearance)
+            position = np.asarray([x, y, z], dtype=np.float32)
+            set_agent_pose(agent, x, y, z, yaw)
+            obs = sim.get_sensor_observations()
+            rgb, depth = rgb_depth(obs)
+
             # LIVE language command (real-time inference). Read once per tick so it can drive the
             # sample below. With --vla-adapter the intent becomes the policy's text token (Regime
             # B: the POLICY executes the maneuver); without it, intent drives the orbit (Regime A).
+            goal_dist_now = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z], dtype=np.float32)))
+            near_goal = goal_dist_now <= float(args.stop_dist) + float(args.cbf_deadzone)
+
             cmd_txt = args.command
             if args.command_file:
                 try:
                     cmd_txt = Path(args.command_file).read_text(encoding="utf-8").strip() or args.command
                 except Exception:
                     pass
-            intent = command_intent(cmd_txt)
-            force_side = 1.0 if intent == "left" else (-1.0 if intent == "right" else None)
-            vla_token = None   # set below, once the obstacle distance is known
-            stop_cmd = False   # set below (gated on obstacle proximity)
-
-            y = terrain.local_height_max(x, z, float(args.pose_terrain_radius)) + float(args.clearance)
-            position = np.asarray([x, y, z], dtype=np.float32)
-            set_agent_pose(agent, x, y, z, yaw)
-            obs = sim.get_sensor_observations()
-            rgb, depth = rgb_depth(obs)
             if mesh_goal_mode:
                 # RENDERED-MASK goal: a semantic mesh (placed at t=0 from a pixel) is rendered each
                 # step; the belief is built from that mask, so the policy's goal channel IS the mask.
@@ -1123,6 +1266,55 @@ def main() -> None:
             if mesh_goal_mode:
                 # obstacle = ONLY the rendered obstacle-mesh pixels (semantic id), never the ground.
                 obstacle_mask = np.where(_sem == MESH_OBST_ID, 255, 0).astype(np.uint8)
+
+            goal_ratio = goal_pixel_ratio(goal_mask)
+
+            if args.qwen_steer:
+                # Near the goal, hand steering over to the persistent Qwen VLM server, polled at
+                # qwen_steer_hz (NOT every control tick -- --hz is typically much higher). Its
+                # reply is fed straight into command_intent below, same as any live command text.
+                # Runs AFTER goal_mask/obstacle_mask are finalized for THIS step so the frame sent
+                # to the VLM is this tick's rgb (never a stale/reused frame) with the current goal
+                # mask composited on top -- without that overlay the model has no way to tell which
+                # object in frame the prompt's "goal obstacle" refers to.
+                if not qwen_steer_active:
+                    print(f"[qwen-steer] near goal (dist={goal_dist_now:.2f}m) -- polling Qwen at {args.qwen_steer_hz:g}Hz", flush=True)
+                    qwen_steer_active = True
+                now_t = time.time()
+                if now_t - last_qwen_poll_t >= 1.0 / float(args.qwen_steer_hz):
+                    last_qwen_poll_t = now_t
+                    frame_path = str(out_dir / "qwen_steer_frame.jpg")
+                    steer_img = rgb.astype(np.float32).copy()
+                    # The raw goal_mask (esp. the rendered semantic-mesh mask in mesh_goal_mode)
+                    # comes out as a sparse crosshatch -- likely z-fighting between the goal
+                    # mesh and the terrain it rests on -- rather than a solid blob. Reading as
+                    # scattered noise instead of "a close, large green region" made Qwen ignore the
+                    # measured frame_fraction and never choose stop. Close the mask ONLY for this
+                    # composited display frame (goal_mask itself, used for belief/physics/frame_
+                    # fraction/logging, is untouched) so what the VLM sees matches what it's told.
+                    gm_display = cv2.morphologyEx(
+                        (goal_mask > 0).astype(np.uint8) * 255,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+                        iterations=2,
+                    ) > 0
+                    steer_img[gm_display] = steer_img[gm_display] * 0.5 + np.asarray([0.0, 255.0, 0.0]) * 0.5
+                    Image.fromarray(np.clip(steer_img, 0, 255).astype(np.uint8)).convert("RGB").save(frame_path)
+                    steer_prompt = qwen_steer_prompt(goal_ratio["frame_fraction"] * 100.0)
+                    try:
+                        qwen_cmd_txt = qwen_vlm_client.query_vlm_persistent(
+                            frame_path, prompt=steer_prompt, max_new_tokens=512,
+                            host=args.qwen_host, port=args.qwen_port,
+                        )
+                        print(f"[qwen-steer] t={now_t:.2f} step={step} goal_frame_pct={goal_ratio['frame_fraction'] * 100.0:.2f} -> {qwen_cmd_txt!r}", flush=True)
+                    except Exception as e:
+                        print(f"[qwen-steer] query failed: {e}", flush=True)
+                cmd_txt = qwen_cmd_txt
+            intent = command_intent(cmd_txt)
+            force_side = 1.0 if intent == "left" else (-1.0 if intent == "right" else None)
+            vla_token = None   # set below, once the obstacle distance is known
+            stop_cmd = False   # set below (gated on obstacle proximity)
+
             spatial = frame_to_spatial(depth, goal_mask, image_size, obstacle_mask, include_obstacle_channel=use_obstacle_channel).to(device)
             obstacle_map = obstacle_builder.build(depth) if args.obstacle_mode == "depth" else np.zeros((96, 96), dtype=np.float32)
             obstacle_map = paint_obstacle_map_point(
@@ -1194,9 +1386,9 @@ def main() -> None:
             # "stop" is a language TRIGGER, but the HALT itself is proximity-gated: engage once close
             # to the obstacle OR the goal (whichever comes first), not the instant "stop" is said.
             # Without the goal term, "stop" never fired on a goal-only run (no obstacle to be near).
-            goal_dist_now = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z], dtype=np.float32)))
-            near_goal = goal_dist_now <= float(args.stop_dist) + float(args.cbf_deadzone)
-            stop_cmd = (intent == "stop") and (near_obstacle or near_goal)
+            # (goal_dist_now / near_goal already computed above, at the top of the loop.)
+            near_goal_visual = goal_ratio["frame_fraction"] >= float(args.qwen_stop_frame_fraction)
+            stop_cmd = (intent == "stop") and (near_obstacle or near_goal or near_goal_visual)
             if vla_adapter is not None:
                 # Hard, full-strength switch (NOT a blend): interpolating between two different
                 # instruction tokens landed off the trained manifold -- the adapter only ever
@@ -1788,9 +1980,17 @@ def command_intent(text):
     t = (text or "").strip().lower()
     if not t:
         return ""
-    if any(k in t for k in ("stop", "halt", "brake", "wait", "hold")):
+    # qwen_steer_prompt asks for "ACTION: left/right/stop" but the model often appends a
+    # REASON line (e.g. "...less than the 1.00% stop threshold...") that contains the
+    # substring "stop" even when the actual action is left/right. Parse only the ACTION
+    # field when present so that reasoning text can't false-trigger a stop; fall back to
+    # the first line for plain one-word replies ("stop" / "left" / "right").
+    m = re.search(r"action\s*:\s*([a-z]+)", t)
+    field = m.group(1) if m else t.splitlines()[0]
+    words = re.findall(r"[a-z]+", field)
+    if any(w in ("stop", "halt", "brake", "wait", "hold") for w in words):
         return "stop"
-    left, right = "left" in t, "right" in t
+    left, right = "left" in words, "right" in words
     if left and not right:
         return "left"
     if right and not left:
