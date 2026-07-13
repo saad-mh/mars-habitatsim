@@ -1,30 +1,14 @@
-"""rollout_navdp_policy_mars.py - run a NavDP/S2DiT policy in the Mars HabitatSim scene.
 
-This is the Mars terrain adapter WITH the full cone-safety layer ported from
-rollout_habitat_policy.py: per-tick hard safety gate + deterministic escape-yaw +
-committed go-around side. Copy this over your Mars repo's rollout_navdp_policy.py
-(or run it from there); it imports the NavDP repo via --navdp-root.
-
-Typical usage:
-
-    python rollout_navdp_policy_mars.py \
-      --navdp-root /path/to/navdp_sam \
-      --ckpt /path/to/navdp_sam/runs/.../ckpt_last.pt \
-      --scene marsyard2022_rocks.obj --terrain-obj marsyard2022.obj \
-      --goal-x 8 --goal-z -8 --ghost-obstacle-x 4 --ghost-obstacle-z 0 \
-      --cbf --cbf-mode cone --zero-lateral --action-smoothing none \
-      --cbf-radius-mode fixed --cbf-d-safe 1.2 --cbf-deadzone 0.8 \
-      --cbf-hard-gate --cbf-escape-yaw 0.6 --cbf-commit-side \
-      --out mars_rocks_rollout
-"""
 from __future__ import annotations
 
 import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
+import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional, Sequence, Tuple
@@ -39,12 +23,13 @@ from habitat_sim.agent import AgentConfiguration
 import quaternion
 
 import qwen_vlm_client
+from sam_vla.env.rock_generation import load_rock_field, register_rocks
 from sam_vla.logging.episode_logger import EpisodeLogger, make_run_id
 
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_SCENE = HERE / "marsyard2022_tri.glb"
-DEFAULT_OBJ = HERE / "marsyard2022.obj"
+DEFAULT_SCENE = HERE / "assets/marsyard2022.glb"
+DEFAULT_OBJ = HERE / "assets/marsyard2022.obj"
 
 def qwen_steer_prompt(frame_fraction_pct: float) -> str:
     """
@@ -472,11 +457,22 @@ def pixel_to_world(u, v, d, position, yaw, intr):
 
 
 def mask_to_body(mask, depth_img, height, width, hfov_deg, fallback_range, min_px=1):
-    """Body-frame goal point [forward, left] from a rendered mask centroid + depth (belief from mask)."""
+    """Body-frame goal point [forward, left] from a rendered mask: bearing from the mask's centroid
+    column, range from the MEDIAN depth over all mask pixels. Mirrors bbox_to_body's robustness --
+    a single centroid pixel (the old behavior here) can land on a depth discontinuity (a rock's
+    silhouette edge, a gap between the mesh and the background behind it) and seed a badly wrong
+    range that then dead-reckons, uncorrected, for the rest of the episode (mesh_goal_mode seeds
+    belief_g ONCE and never re-corrects it -- see the caller)."""
     ys, xs = np.where(np.asarray(mask) > 0)
     if xs.size < min_px:
         return None
-    return pixel_to_body(float(xs.mean()), float(ys.mean()), depth_img, height, width, hfov_deg, fallback_range)
+    intr = intrinsics_from_hfov(height, width, hfov_deg)
+    patch = np.asarray(depth_img)[ys, xs]
+    valid = patch[np.isfinite(patch) & (patch > 0.1)]
+    rng = float(np.median(valid)) if valid.size > 0 else float(fallback_range)
+    u = float(xs.mean())
+    right = (u - intr["cx"]) * rng / max(intr["fx"], 1e-6)
+    return np.asarray([rng, -right], dtype=np.float32)  # [forward, left]
 
 
 def belief_feat(belief, r_scale=10.0):
@@ -817,7 +813,13 @@ def main() -> None:
     ap.add_argument("--navdp-root", default=None, help="Path to the navdp_sam repo containing model_s2_dit.py")
     ap.add_argument("--ckpt", required=True, help="Path to trained NavDP/S2DiT checkpoint")
     ap.add_argument("--scene", default=str(DEFAULT_SCENE))
-    ap.add_argument("--out", default="mars_navdp_rollout")
+    ap.add_argument("--rock-field", default=None,
+                    help="Path to a rock_field.json produced by generate_rock_env.py. Loads that fixed, "
+                    "already-placed rock layout into the scene (visible in RGB before any goal/obstacle "
+                    "resolution runs) instead of an empty terrain -- use the same path across ablation "
+                    "runs to keep the obstacle layout identical.")
+    ap.add_argument("--out", default=f"navdp_rollout{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    help="Output directory for the rollout results.")
     ap.add_argument("--log-root", default="logs",
                     help="Root dir for structured per-episode ablation logs (config/frames/obstacles/"
                          "qwen_queries/cbf_events/summary); a timestamped run_id subdir is created "
@@ -839,6 +841,11 @@ def main() -> None:
     ap.add_argument("--hz", type=float, default=10.0)
     ap.add_argument("--max-steps", type=int, default=300)
     ap.add_argument("--stop-dist", type=float, default=1.0)
+    ap.add_argument("--qwen-stop-frame-fraction", type=float, default=0.01,
+                    help="If the goal's measured frame_fraction (from goal_pixel_ratio()) is at "
+                    "least this, treat it as proximity for a Qwen 'stop' verdict, same as "
+                    "near_obstacle/near_goal -- matches the 1%% threshold already stated in "
+                    "qwen_steer_prompt().")
     ap.add_argument("--vla-dump", type=str, default="",
                     help="If set, dump paired left/right counterfactual VLA training samples "
                     "(neutral-goal obs + orbit-generated left & right chunks) to this dir at blocked steps.")
@@ -852,8 +859,9 @@ def main() -> None:
                     "Overrides --command. This is the LIVE inference interface.")
     ap.add_argument("--qwen-steer", action="store_true",
                     help="Once near the goal (same stop-dist+deadzone gate used for goal-reached), poll "
-                    "the persistent Qwen VLM server (qwen_vlm_server.py) for a live steering command "
-                    "instead of --command/--command-file.")
+                    "the persistent Qwen VLM server (qwen_vlm_server.py) for a live left/right/stop "
+                    "steering command instead of --command/--command-file. Feeds into the same "
+                    "command_intent path -- overrides --command/--command-file once active.")
     ap.add_argument("--qwen-steer-hz", type=float, default=3.0,
                     help="Poll rate (Hz) for --qwen-steer once near-goal; independent of --hz.")
     ap.add_argument("--qwen-host", default=qwen_vlm_client.DEFAULT_HOST)
@@ -934,19 +942,6 @@ def main() -> None:
     ap.add_argument("--belief-reacquire-px", type=int, default=None,
                     help="goal-pixel count above which the belief-return gate releases (hysteresis); "
                          "default 3x --lost-goal-min-px.")
-    ap.add_argument("--dwa", action="store_true",
-                    help="ABLATION BASELINE: classic Dynamic Window Approach REPLACES the diffusion "
-                         "policy's action + the collision cone entirely (a from-scratch reactive "
-                         "planner with no learned prior). Disables cone/orbit/hard-gate/ghost-assist.")
-    ap.add_argument("--dwa-v-samples", type=int, default=9)
-    ap.add_argument("--dwa-w-samples", type=int, default=15)
-    ap.add_argument("--dwa-predict-time", type=float, default=1.5, help="forward-simulation horizon (s)")
-    ap.add_argument("--dwa-max-accel", type=float, default=1.0, help="max forward acceleration (m/s^2)")
-    ap.add_argument("--dwa-max-yaw-accel", type=float, default=3.0, help="max yaw acceleration (rad/s^2)")
-    ap.add_argument("--dwa-obstacle-radius", type=float, default=0.9, help="hard-reject candidates closer than this (m)")
-    ap.add_argument("--dwa-heading-weight", type=float, default=1.0)
-    ap.add_argument("--dwa-clearance-weight", type=float, default=2.0)
-    ap.add_argument("--dwa-velocity-weight", type=float, default=0.5)
     ap.add_argument("--terrain-height-mode", choices=["auto", "heightmap", "obj", "flat"], default="auto")
     ap.add_argument("--heightmap", default=None)
     ap.add_argument("--terrain-obj", default=str(DEFAULT_OBJ))
@@ -1046,7 +1041,6 @@ def main() -> None:
         DepthObstacleMap,
         horizon_growth_covariance,
         nearest_obstacle_point,
-        nearest_obstacle_state,
         project_chunk_cone,
         project_forward_velocity_cbf,
     )
@@ -1124,11 +1118,6 @@ def main() -> None:
         print(f"[BELIEF] learned return: the belief token drives the policy when the goal is off-screen "
               f"(replaces the P-controller); tokens={belief_adapter.num_tokens}", flush=True)
 
-    if args.dwa:
-        print("[DWA] ABLATION BASELINE: classic Dynamic Window Approach replaces the diffusion "
-              "policy's action + the collision cone entirely (cone/orbit/hard-gate/ghost-assist disabled)",
-              flush=True)
-
     # GROUNDED GOAL: a VLM (or stub) points the goal from RGB + instruction; the pixel seeds the
     # belief and odometry tracks it -> language decides WHERE, geometry never sees the world goal.
     grounder = None
@@ -1154,6 +1143,12 @@ def main() -> None:
 
     sim = make_sim(Path(args.scene), args.height, args.width, args.hfov_deg, with_semantic=(mesh_goal_mode or args.goal_from_vlm))
     agent = sim.initialize_agent(0)
+
+    rocks, _rock_config = [], None
+    if args.rock_field:
+        rocks, _rock_config = load_rock_field(Path(args.rock_field))
+        register_rocks(sim, rocks)
+        print(f"[ROCKS] loaded {len(rocks)} rocks from {args.rock_field}", flush=True)
 
     x = float(args.start_x)
     z = float(args.start_z)
@@ -1221,32 +1216,29 @@ def main() -> None:
               f"MESH_GOAL_ID; belief re-derived from the live rendered mask every step (no dead-reckoning "
               f"while in view)", flush=True)
 
-        # OBSTACLE: the VLM's prompt (VLM_PROMPT in vlm_nav_interactive.py) ASKS for exactly one
-        # "rock" obstacle, but Qwen routinely ignores that and returns several (observed: 5 in one
-        # frame) -- so vlm_obstacle_meshes can hold more than one resolved mesh. Register ALL of
-        # them under MESH_OBST_ID so the rendered obstacle mask the policy/CBF/DWA see is the union
-        # of every flagged rock's footprint, not just the first. ALSO wire the first one's resolved
-        # world seed into --ghost-obstacle-x/y/z so the CBF/orbit avoidance's cone-mode math (which
-        # prefers a single stable world point over the mask to avoid abeam-pass flicker) still has
-        # one, unless the caller passed an explicit ghost obstacle of their own; the mask-based
-        # CBF/DWA paths don't depend on this and see every registered mesh.
+        # OBSTACLE: the VLM's prompt (VLM_PROMPT in vlm_nav_interactive.py) already restricts
+        # it to exactly one "rock" obstacle, chosen only from SAM's bigrock detections (bedrock
+        # is dropped upstream in sam_annotation_adapter.py, so it's never a candidate). Register
+        # its mesh too (MESH_OBST_ID) so the obstacle mask the policy sees, and the mask-based CBF
+        # fallback, are also ground-truth per frame. ALSO wire its resolved world seed into
+        # --ghost-obstacle-x/y/z so the CBF/orbit avoidance's cone-mode math (which prefers a
+        # stable world point over the mask to avoid abeam-pass flicker -- see ctrl_op below) still
+        # has one, unless the caller passed an explicit ghost obstacle of their own.
         if vlm_obstacle_meshes:
             cbf_obstacle_id = "vlm_obstacle"
-            for vlm_obstacle_mesh in vlm_obstacle_meshes:
-                register_semantic_mesh(sim, vlm_obstacle_mesh["mesh_path"], MESH_OBST_ID)
-                print(f"[VLM] obstacle '{vlm_obstacle_mesh['label']}' bbox={vlm_obstacle_mesh['bbox']} "
-                      f"mesh={vlm_obstacle_mesh['mesh_path']} registered as MESH_OBST_ID", flush=True)
+            vlm_obstacle_mesh = vlm_obstacle_meshes[0]
+            register_semantic_mesh(sim, vlm_obstacle_mesh["mesh_path"], MESH_OBST_ID)
             if args.ghost_obstacle_x is None and args.ghost_obstacle_z is None:
-                obs_vx, obs_vy, obs_vz = vlm_obstacle_meshes[0]["seed_world"]
+                obs_vx, obs_vy, obs_vz = vlm_obstacle_mesh["seed_world"]
                 args.ghost_obstacle_x = obs_vx
                 args.ghost_obstacle_z = obs_vz
                 # y is left to the existing terrain-height + --ghost-obstacle-height computation
                 # below (unless the caller passed --ghost-obstacle-y explicitly), same pattern as
                 # the goal's y a few lines up -- seed_world's y sits at the rock's own surface, not
                 # the elevated marker height the rest of this script expects for a ghost obstacle.
-                print(f"[VLM] ghost world seeded from first obstacle=({obs_vx:.2f},{obs_vy:.2f},"
-                      f"{obs_vz:.2f}); cone-mode math tracks this point while the mask-based CBF/DWA "
-                      f"see all {len(vlm_obstacle_meshes)} registered obstacle meshes", flush=True)
+                print(f"[VLM] obstacle '{vlm_obstacle_mesh['label']}' bbox={vlm_obstacle_mesh['bbox']} "
+                      f"mesh={vlm_obstacle_mesh['mesh_path']} registered as MESH_OBST_ID; ghost world="
+                      f"({obs_vx:.2f},{obs_vy:.2f},{obs_vz:.2f}) -> driving around it", flush=True)
         else:
             print("[VLM] no obstacle resolved from the VLM's selection; proceeding without one", flush=True)
 
@@ -1260,9 +1252,6 @@ def main() -> None:
                 print(f"[WARN] --start-x/z/yaw-deg ({args.start_x},{args.start_z},{args.start_yaw_deg}) "
                       f"differ from the capture pose ({VLM_START_X},{VLM_START_Z},{VLM_START_YAW_DEG}); "
                       "the seeded pixel may not land on the object in the first live frame.", flush=True)
-
-    mesh_tracking_mode = mesh_goal_mode or vlm_mesh_tracking  # goal (+ obstacle, if resolved) tracked
-                                 # from the live rendered semantic mask each step, not dead-reckoned
 
     if args.goal_from_vlm:
         # World position of the VLM selection, kept ONLY as the success-metric/logging
@@ -1316,8 +1305,8 @@ def main() -> None:
         "goal_coord": [float(args.goal_x), float(args.goal_z)] if (args.goal_x is not None and args.goal_z is not None) else None,
         "steering_mode": steering_mode,
         "cbf_enabled": bool(args.cbf),
-        "obstacle_count": 1 if ghost_obstacle is not None else 0,
-        "obstacle_seed": None,
+        "obstacle_count": len(rocks) if rocks else (1 if ghost_obstacle is not None else 0),
+        "obstacle_seed": _rock_config.seed if _rock_config is not None else None,
         "obstacle_distance_threshold_X": float(args.cbf_d_safe),
         "goal_distance_threshold_Y": float(args.stop_dist),
         "max_steps": int(args.max_steps),
@@ -1325,7 +1314,19 @@ def main() -> None:
     }
     run_id = make_run_id(log_config)
     episode_logger = EpisodeLogger(run_id, log_config, log_root=args.log_root, save_frames=args.log_save_frames)
-    if ghost_obstacle is not None:
+    if rocks:
+        obstacle_records = [
+            {
+                "id": f"rock_{r.id:03d}",
+                "position": [float(r.x), float(r.y), float(r.z)],
+                "orientation": [float(v) for v in yaw_quat_xyzw(float(r.yaw))],
+                "radius": float(r.radius),
+                "is_goal": False,
+            }
+            for r in rocks
+        ]
+        episode_logger.write_obstacles(obstacle_records, goal_id=("vlm_goal" if args.goal_from_vlm else None))
+    elif ghost_obstacle is not None:
         episode_logger.write_obstacles(
             [{
                 "id": "ghost",
@@ -1345,8 +1346,8 @@ def main() -> None:
         "action_3d", "pred_chunk", "goal_visible_pixels", "goal_u", "goal_v", "goal_distance",
         "obstacle_visible_pixels", "obstacle_u", "obstacle_v", "obstacle_distance",
         "belief_fwd", "belief_left",   # body-frame belief_g each tick (nan if not tracking) -> lets
-        "cone_correction_step0", "cone_correction_last", "hard_gate_tick",   # Euclidean vs
-    ]}                                 # Mahalanobis mechanistic ablation (see project_chunk_cone)
+        "goal_frame_fraction",         # goal_px / total_px this tick, from goal_pixel_ratio()
+    ]}                                 # a post-hoc script measure belief ACCURACY vs the true goal
     video_frames = []
     prev_obstacle_point = None
     last_pred_chunk = None
@@ -1358,13 +1359,12 @@ def main() -> None:
     hard_gate_fired = 0
     escape_active = 0
     vla_count = 0               # counter for --vla-dump paired-sample writing
+    mesh_tracking_mode = mesh_goal_mode or vlm_mesh_tracking  # goal (+ obstacle, if resolved) tracked
+                                 # from the live rendered semantic mask each step, not dead-reckoned
     belief_g = None             # body-frame [forward, left] belief estimate of the goal (--belief-goal)
     belief_rng = np.random.default_rng(0)
     near_obstacle_state = False  # hysteresis-latched maneuver gate (avoids flicker at the boundary)
     belief_state = False         # hysteresis-latched belief-return gate
-    dwa_prev_v, dwa_prev_w = 0.0, 0.0   # DWA's own dynamic-window state (--dwa ablation baseline)
-    cone_correction_step0 = float("nan")   # ||corrected - raw|| on the EXECUTED step (mechanistic
-    cone_correction_last = float("nan")    # ablation metric: Euclidean vs Mahalanobis correction spread)
     qwen_cmd_txt = ""            # last command text received from --qwen-steer (persists between polls)
     last_qwen_poll_t = 0.0
     qwen_steer_active = False    # logs once, the tick --qwen-steer polling starts
@@ -1400,30 +1400,31 @@ def main() -> None:
 
     try:
         for step in range(int(args.max_steps)):
+            y = terrain.local_height_max(x, z, float(args.pose_terrain_radius)) + float(args.clearance)
+            position = np.asarray([x, y, z], dtype=np.float32)
+            set_agent_pose(agent, x, y, z, yaw)
+            obs = sim.get_sensor_observations()
+            rgb, depth = rgb_depth(obs)
+
             # LIVE language command (real-time inference). Read once per tick so it can drive the
             # sample below. With --vla-adapter the intent becomes the policy's text token (Regime
             # B: the POLICY executes the maneuver); without it, intent drives the orbit (Regime A).
+            goal_dist_now = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z], dtype=np.float32)))
+            near_goal = goal_dist_now <= float(args.stop_dist) + float(args.cbf_deadzone)
+
             cmd_txt = args.command
             if args.command_file:
                 try:
                     cmd_txt = Path(args.command_file).read_text(encoding="utf-8").strip() or args.command
                 except Exception:
                     pass
-            intent = command_intent(cmd_txt)
-            force_side = 1.0 if intent == "left" else (-1.0 if intent == "right" else None)
-            vla_token = None   # set below, once the obstacle distance is known
-            stop_cmd = False   # set below (gated on obstacle proximity)
 
-            y = terrain.local_height_max(x, z, float(args.pose_terrain_radius)) + float(args.clearance)
-            position = np.asarray([x, y, z], dtype=np.float32)
-            set_agent_pose(agent, x, y, z, yaw)
-            obs = sim.get_sensor_observations()
-            rgb, depth = rgb_depth(obs)
             if mesh_tracking_mode:
                 # RENDERED-MASK goal: a semantic mesh (placed at t=0 from a pixel, or registered
                 # up-front from the VLM's resolved selection) is rendered each step; the belief is
-                # RE-DERIVED from that live mask every step it's visible, so the policy's goal
-                # channel IS the mask instead of dead-reckoning by odometry alone.
+                # RE-DERIVED from that live mask every step it's visible, so tracking follows the
+                # mask's ground truth instead of dead-reckoning by odometry alone (which drifts) --
+                # dead-reckoning only bridges the gap while the mask briefly drops out of view.
                 if mesh_goal_mode and step == 0:
                     _gw, _ow = place_mesh_goal_obstacle(sim, depth, position, yaw, intr, args, out_dir)
                     if _gw is not None:
@@ -1433,8 +1434,7 @@ def main() -> None:
                 _sem = semantic_from_obs(obs)
                 _gm = np.where(_sem == MESH_GOAL_ID, 255, 0).astype(np.uint8)
                 if int(_gm.sum()) >= int(args.lost_goal_min_px):
-                    if belief_g is None:   # seed ONCE from the mask, then dead-reckon (stable distance)
-                        belief_g = mask_to_body(_gm, depth, rgb.shape[0], rgb.shape[1], args.hfov_deg, float(args.goal_range))
+                    belief_g = mask_to_body(_gm, depth, rgb.shape[0], rgb.shape[1], args.hfov_deg, float(args.goal_range))
                     _ys, _xs = np.where(_gm > 0)
                     goal_mask = _gm
                     goal_info = {
@@ -1453,12 +1453,22 @@ def main() -> None:
                 # BELIEF-tracked goal: the ghost comes from a body-frame estimate propagated by
                 # odometry. It is seeded either from an IMAGE bearing+range (no world xyz) or from
                 # the world goal at t=0; with a world goal it can also correct on sight.
-                if grounder is not None and (belief_g is None or step % max(1, int(args.grounder_every)) == 0):
+                if grounder is not None and (
+                    belief_g is None
+                    or (not getattr(grounder, "one_shot", False) and step % max(1, int(args.grounder_every)) == 0)
+                ):
                     # LANGUAGE grounds the goal: RGB + instruction -> pixel -> body point (belief)
                     pg = grounder.ground(rgb, args.instruction)
                     if pg.in_view:
-                        belief_g = pixel_to_body(pg.u, pg.v, depth, rgb.shape[0], rgb.shape[1],
-                                                 args.hfov_deg, args.goal_range)
+                        bbox = getattr(pg, "bbox", None)
+                        if bbox is not None:
+                            # Robust: median depth over the whole VLM bbox, not one pixel that
+                            # can land on a discontinuity (see bbox_to_body's docstring).
+                            belief_g = bbox_to_body(bbox, depth, rgb.shape[0], rgb.shape[1],
+                                                    args.hfov_deg, args.goal_range)
+                        else:
+                            belief_g = pixel_to_body(pg.u, pg.v, depth, rgb.shape[0], rgb.shape[1],
+                                                     args.hfov_deg, args.goal_range)
                 elif belief_g is None:
                     if args.goal_bearing_deg is not None:
                         _b = math.radians(float(args.goal_bearing_deg))  # + = right of forward
@@ -1516,73 +1526,75 @@ def main() -> None:
                 obstacle_mask = np.where(_sem == MESH_OBST_ID, 255, 0).astype(np.uint8)
 
             goal_ratio = goal_pixel_ratio(goal_mask)
+
             if args.qwen_steer:
                 # Near the goal, hand steering over to the persistent Qwen VLM server, polled at
                 # qwen_steer_hz (NOT every control tick -- --hz is typically much higher). Its
-                # reply is fed straight into cmd_txt/intent below, same as any live command text.
+                # reply is fed straight into command_intent below, same as any live command text.
                 # Runs AFTER goal_mask/obstacle_mask are finalized for THIS step so the frame sent
                 # to the VLM is this tick's rgb (never a stale/reused frame) with the current goal
                 # mask composited on top -- without that overlay the model has no way to tell which
                 # object in frame the prompt's "goal obstacle" refers to.
-                goal_dist_now = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z], dtype=np.float32)))
-                near_goal_now = goal_dist_now <= float(args.stop_dist) + float(args.cbf_deadzone)
-                if near_goal_now:
-                    if not qwen_steer_active:
-                        print(f"[qwen-steer] near goal (dist={goal_dist_now:.2f}m) -- polling Qwen at {args.qwen_steer_hz:g}Hz", flush=True)
-                        qwen_steer_active = True
-                    now_t = time.time()
-                    if now_t - last_qwen_poll_t >= 1.0 / float(args.qwen_steer_hz):
-                        last_qwen_poll_t = now_t
-                        frame_path = str(out_dir / "qwen_steer_frame.jpg")
-                        steer_img = rgb.astype(np.float32).copy()
-                        # The raw goal_mask (esp. the rendered semantic-mesh mask in --goal-from-vlm
-                        # mode) comes out as a sparse crosshatch -- likely z-fighting between the goal
-                        # mesh and the terrain it rests on -- rather than a solid blob. Reading as
-                        # scattered noise instead of "a close, large green region" made Qwen ignore the
-                        # measured frame_fraction and never choose stop. Close the mask ONLY for this
-                        # composited display frame (goal_mask itself, used for belief/physics/frame_
-                        # fraction/logging, is untouched) so what the VLM sees matches what it's told.
-                        gm_display = cv2.morphologyEx(
-                            (goal_mask > 0).astype(np.uint8) * 255,
-                            cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
-                            iterations=2,
-                        ) > 0
-                        steer_img[gm_display] = steer_img[gm_display] * 0.5 + np.asarray([0.0, 255.0, 0.0]) * 0.5
-                        # obstacle_mask suffers the same rendered-mesh z-fighting sparseness as goal_mask
-                        # in --goal-from-vlm mode, so close it the same way before compositing. Applied
-                        # after the goal tint so an obstacle wins any pixel where the two masks overlap.
-                        om_display = cv2.morphologyEx(
-                            (obstacle_mask > 0).astype(np.uint8) * 255,
-                            cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
-                            iterations=2,
-                        ) > 0
-                        steer_img[om_display] = steer_img[om_display] * 0.5 + np.asarray([255.0, 0.0, 0.0]) * 0.5
-                        Image.fromarray(np.clip(steer_img, 0, 255).astype(np.uint8)).convert("RGB").save(frame_path)
-                        steer_prompt = qwen_steer_prompt(goal_ratio["frame_fraction"] * 100.0)
-                        query_t0 = time.perf_counter()
-                        try:
-                            qwen_cmd_txt = qwen_vlm_client.query_vlm_persistent(
-                                frame_path, prompt=steer_prompt, max_new_tokens=512,
-                                host=args.qwen_host, port=args.qwen_port,
-                            )
-                            print(f"[qwen-steer] t={now_t:.2f} step={step} goal_frame_pct={goal_ratio['frame_fraction'] * 100.0:.2f} -> {qwen_cmd_txt!r}", flush=True)
-                            episode_logger.log_qwen_query(
-                                step=step, query_type="action_suggestion", trigger="goal_proximity",
-                                input_data={
-                                    "goal_belief": {"range": goal_dist_now},
-                                    "goal_frame_fraction": goal_ratio["frame_fraction"],
-                                    "frame": frame_path,
-                                },
-                                output_data={"action": qwen_cmd_txt},
-                                latency_ms=(time.perf_counter() - query_t0) * 1000.0,
-                            )
-                        except Exception as e:
-                            print(f"[qwen-steer] query failed: {e}", flush=True)
-                    cmd_txt = qwen_cmd_txt
-                    intent = command_intent(cmd_txt)
-                    force_side = 1.0 if intent == "left" else (-1.0 if intent == "right" else None)
+                if not qwen_steer_active:
+                    print(f"[qwen-steer] near goal (dist={goal_dist_now:.2f}m) -- polling Qwen at {args.qwen_steer_hz:g}Hz", flush=True)
+                    qwen_steer_active = True
+                now_t = time.time()
+                if now_t - last_qwen_poll_t >= 1.0 / float(args.qwen_steer_hz):
+                    last_qwen_poll_t = now_t
+                    frame_path = str(out_dir / "qwen_steer_frame.jpg")
+                    steer_img = rgb.astype(np.float32).copy()
+                    # The raw goal_mask (esp. the rendered semantic-mesh mask in --goal-from-vlm
+                    # mode) comes out as a sparse crosshatch -- likely z-fighting between the goal
+                    # mesh and the terrain it rests on -- rather than a solid blob. Reading as
+                    # scattered noise instead of "a close, large green region" made Qwen ignore the
+                    # measured frame_fraction and never choose stop. Close the mask ONLY for this
+                    # composited display frame (goal_mask itself, used for belief/physics/frame_
+                    # fraction/logging, is untouched) so what the VLM sees matches what it's told.
+                    gm_display = cv2.morphologyEx(
+                        (goal_mask > 0).astype(np.uint8) * 255,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+                        iterations=2,
+                    ) > 0
+                    steer_img[gm_display] = steer_img[gm_display] * 0.5 + np.asarray([0.0, 255.0, 0.0]) * 0.5
+                    # obstacle_mask suffers the same rendered-mesh z-fighting sparseness as goal_mask
+                    # in --goal-from-vlm mode (both come from MESH_GOAL_ID/MESH_OBST_ID semantic
+                    # renders), so close it the same way before compositing. Applied after the goal
+                    # tint so an obstacle wins any pixel where the two masks overlap, matching
+                    # overlay_frame's ordering.
+                    om_display = cv2.morphologyEx(
+                        (obstacle_mask > 0).astype(np.uint8) * 255,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+                        iterations=2,
+                    ) > 0
+                    steer_img[om_display] = steer_img[om_display] * 0.5 + np.asarray([255.0, 0.0, 0.0]) * 0.5
+                    Image.fromarray(np.clip(steer_img, 0, 255).astype(np.uint8)).convert("RGB").save(frame_path)
+                    steer_prompt = qwen_steer_prompt(goal_ratio["frame_fraction"] * 100.0)
+                    query_t0 = time.perf_counter()
+                    try:
+                        qwen_cmd_txt = qwen_vlm_client.query_vlm_persistent(
+                            frame_path, prompt=steer_prompt, max_new_tokens=512,
+                            host=args.qwen_host, port=args.qwen_port,
+                        )
+                        print(f"[qwen-steer] t={now_t:.2f} step={step} goal_frame_pct={goal_ratio['frame_fraction'] * 100.0:.2f} -> {qwen_cmd_txt!r}", flush=True)
+                        episode_logger.log_qwen_query(
+                            step=step, query_type="action_suggestion", trigger="goal_proximity",
+                            input_data={
+                                "goal_belief": {"range": goal_dist_now},
+                                "goal_frame_fraction": goal_ratio["frame_fraction"],
+                                "frame": frame_path,
+                            },
+                            output_data={"action": qwen_cmd_txt},
+                            latency_ms=(time.perf_counter() - query_t0) * 1000.0,
+                        )
+                    except Exception as e:
+                        print(f"[qwen-steer] query failed: {e}", flush=True)
+                cmd_txt = qwen_cmd_txt
+            intent = command_intent(cmd_txt)
+            force_side = 1.0 if intent == "left" else (-1.0 if intent == "right" else None)
+            vla_token = None   # set below, once the obstacle distance is known
+            stop_cmd = False   # set below (gated on obstacle proximity)
 
             spatial = frame_to_spatial(depth, goal_mask, image_size, obstacle_mask, include_obstacle_channel=use_obstacle_channel).to(device)
             obstacle_map = obstacle_builder.build(depth) if args.obstacle_mode == "depth" else np.zeros((96, 96), dtype=np.float32)
@@ -1603,29 +1615,10 @@ def main() -> None:
             active_goal_index = torch.zeros(1, dtype=torch.long, device=device)
 
             obstacle_point = None
-            obstacle_radius_perceived = None   # mask-derived obstacle radius (mesh obstacles only;
-                                                # ghost obstacles use --ghost-obstacle-world-radius instead)
-            if (args.cbf or args.dwa) and int(obstacle_mask.sum()) > 0:
+            if args.cbf and int(obstacle_mask.sum()) > 0:
                 obstacle_point = ghost_obstacle_point
                 if obstacle_point is None:
-                    # nearest_obstacle_state gives BOTH the nearest point AND a robust (90th-
-                    # percentile, clamped) radius from the mask's own unprojected spatial extent
-                    # -- a real "obstacle size" measurement (pixel extent -> depth -> metres), not
-                    # a hand-picked constant. Falls back to nearest_obstacle_point's plain nearest-
-                    # point-only behavior if the mask/depth don't support a radius estimate.
-                    _obs_state = nearest_obstacle_state(obstacle_mask, depth, intr)
-                    if _obs_state is not None:
-                        obstacle_point = _obs_state["p0"]
-                        obstacle_radius_perceived = _obs_state["radius"]
-                    else:
-                        obstacle_point = nearest_obstacle_point(obstacle_mask, depth, intr)
-            if obstacle_point is not None and ghost_obstacle is None:
-                # obstacle_info["range"] is only ever set by the ghost-obstacle world-coordinate
-                # path (project_goal_mask below); mesh-obstacle mode never touches it, so
-                # min_obstacle_dist stayed NaN in every logged run. Fill it from the perceived
-                # obstacle_point directly so the safety-margin ablation metric is actually recorded.
-                obstacle_info["range"] = float(np.hypot(obstacle_point[0], obstacle_point[1]))
-                obstacle_info["visible"] = 1.0
+                    obstacle_point = nearest_obstacle_point(obstacle_mask, depth, intr)
             if obstacle_point is None:
                 cone_side_latch = None  # obstacle gone -> release the committed cone-proj side
                 # (around_side is released below when the obstacle stops blocking the goal ray)
@@ -1655,9 +1648,9 @@ def main() -> None:
             # "stop" is a language TRIGGER, but the HALT itself is proximity-gated: engage once close
             # to the obstacle OR the goal (whichever comes first), not the instant "stop" is said.
             # Without the goal term, "stop" never fired on a goal-only run (no obstacle to be near).
-            goal_dist_now = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z], dtype=np.float32)))
-            near_goal = goal_dist_now <= float(args.stop_dist) + float(args.cbf_deadzone)
-            stop_cmd = (intent == "stop") and (near_obstacle or near_goal)
+            # (goal_dist_now / near_goal already computed above, at the top of the loop.)
+            near_goal_visual = goal_ratio["frame_fraction"] >= float(args.qwen_stop_frame_fraction)
+            stop_cmd = (intent == "stop") and (near_obstacle or near_goal or near_goal_visual)
             if vla_adapter is not None:
                 # Hard, full-strength switch (NOT a blend): interpolating between two different
                 # instruction tokens landed off the trained manifold -- the adapter only ever
@@ -1713,7 +1706,7 @@ def main() -> None:
                     extra_cond_tokens=extra_cond,   # belief token (off-screen) and/or language token
                 )
 
-                if args.cbf and args.cbf_mode == "cone" and obstacle_point is not None and not args.vla_adapter and not args.dwa:
+                if args.cbf and args.cbf_mode == "cone" and obstacle_point is not None and not args.vla_adapter:
                     cbf_active += 1
                     v_o = np.zeros(2, dtype=np.float32)
                     if args.zero_lateral and pred.shape[-1] >= 3:
@@ -1738,19 +1731,8 @@ def main() -> None:
                         )
                     if args.cbf_radius_mode == "perceived" and ghost_obstacle is not None:
                         r_used = args.ghost_obstacle_world_radius + args.robot_radius + args.safety_margin
-                    elif args.cbf_radius_mode == "perceived" and obstacle_radius_perceived is not None:
-                        # mesh/mask obstacle: robot radius + the mask-derived obstacle radius (pixel
-                        # extent -> depth -> metres, via nearest_obstacle_state) + margin -- an
-                        # ACTUAL collision cone radius, not a hand-set constant.
-                        r_used = obstacle_radius_perceived + args.robot_radius + args.safety_margin
                     else:
                         r_used = args.cbf_d_safe
-                    # Capture the PRE-cone chunk (after zero_lateral, so both raw/corrected share
-                    # that masking) to measure how much the cone projection itself moves the
-                    # EXECUTED step vs a later one -- the direct test of "does Euclidean spread the
-                    # correction uniformly while Mahalanobis concentrates it on the near step".
-                    pre_cone_step0 = pred[0, 0, :].detach().cpu().numpy().copy()
-                    pre_cone_last = pred[0, -1, :].detach().cpu().numpy().copy()
                     pred = project_chunk_cone(
                         pred,
                         obstacle_point,
@@ -1768,10 +1750,6 @@ def main() -> None:
                         deadzone_range=r_used + args.cbf_deadzone,
                         side=side,
                     )
-                    post_cone_step0 = pred[0, 0, :].detach().cpu().numpy()
-                    post_cone_last = pred[0, -1, :].detach().cpu().numpy()
-                    cone_correction_step0 = float(np.linalg.norm(post_cone_step0 - pre_cone_step0))
-                    cone_correction_last = float(np.linalg.norm(post_cone_last - pre_cone_last))
                     prev_obstacle_point = obstacle_point
 
                 pred_chunk = pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
@@ -1804,30 +1782,19 @@ def main() -> None:
             # Perceived safety radius (obstacle + rover + margin) or a fixed d_safe.
             if args.cbf_radius_mode == "perceived" and ghost_obstacle is not None:
                 r_gate = args.ghost_obstacle_world_radius + args.robot_radius + args.safety_margin
-            elif args.cbf_radius_mode == "perceived" and obstacle_radius_perceived is not None:
-                r_gate = obstacle_radius_perceived + args.robot_radius + args.safety_margin
             else:
                 r_gate = args.cbf_d_safe
 
             # Physical collision radius (obstacle + rover + margin). The orbit hugs the larger
-            # r_gate circle; this smaller radius is only the hard-breach backstop. Always prefers
-            # a REAL measured radius (ghost world-radius, or the mask-derived one) over the
-            # --ghost-obstacle-world-radius fallback, regardless of --cbf-radius-mode -- this is
-            # the physical safety backstop, so it shouldn't silently use an unrelated constant
-            # whenever a real obstacle-size measurement is available.
-            if ghost_obstacle is not None:
-                r_cone = args.ghost_obstacle_world_radius + args.robot_radius + args.safety_margin
-            elif obstacle_radius_perceived is not None:
-                r_cone = obstacle_radius_perceived + args.robot_radius + args.safety_margin
-            else:
-                r_cone = args.ghost_obstacle_world_radius + args.robot_radius + args.safety_margin
+            # r_gate circle; this smaller radius is only the hard-breach backstop.
+            r_cone = args.ghost_obstacle_world_radius + args.robot_radius + args.safety_margin
 
             # Control obstacle point [forward, left]. For a GHOST obstacle use the RAW geometry
             # (no forward>0.05 cutoff) so distance/bearing never flicker as it passes abeam --
             # that flicker toggles the avoid state and chatters the commands. Perceived
             # obstacles keep the mask-based obstacle_point.
             ctrl_op = None
-            if (args.cbf and args.cbf_mode == "cone") or args.dwa:
+            if args.cbf and args.cbf_mode == "cone":
                 if ghost_obstacle is not None:
                     _r, _u, _f = camera_coords(ghost_obstacle, position, yaw)
                     ctrl_op = np.asarray([_f, -_r], dtype=np.float32)  # [forward, left]
@@ -1865,7 +1832,7 @@ def main() -> None:
             # Suppressed only while the rock BLOCKS the goal ray (the orbit owns steering then),
             # so the goal pull can't drag us back through it; a nearby-but-clear rock still lets
             # the assist run.
-            if args.lost_goal_ghost and not blocked and belief_adapter is None and not args.dwa:   # belief adapter / DWA replace this P-controller
+            if args.lost_goal_ghost and not blocked and belief_adapter is None:   # belief adapter replaces this P-controller
                 bearing = (math.atan2(float(belief_g[1]), float(belief_g[0]))
                            if (args.belief_goal and belief_g is not None)
                            else planar_goal_bearing(position, yaw, goal))
@@ -1886,7 +1853,7 @@ def main() -> None:
             if args.zero_lateral and action_3d.shape[0] >= 2:
                 action_3d = action_3d.copy()
                 action_3d[1] = 0.0
-            if args.cbf and args.cbf_mode == "project" and obstacle_point is not None and not args.dwa:
+            if args.cbf and args.cbf_mode == "project" and obstacle_point is not None:
                 action_3d, _ = project_forward_velocity_cbf(
                     action_3d,
                     obstacle_point,
@@ -1903,7 +1870,7 @@ def main() -> None:
             # line-arc-line detour at constant cruise -> no stop/rotate/go judder, and no
             # asin-tangent bounce when hugging tight. Body frame is [forward, left]; +heading
             # turns left. Released back to goal-seeking once the rock clears the ray (+hyst).
-            if blocked and args.cbf_escape_yaw > 0.0 and not args.vla_adapter and not args.dwa:
+            if blocked and args.cbf_escape_yaw > 0.0 and not args.vla_adapter:
                 # Commit which way around: the tangent heading closest to the goal bearing
                 # (least detour, natural return). Latched until the rock stops blocking.
                 if force_side is not None:
@@ -1936,8 +1903,7 @@ def main() -> None:
             # still outside the collision radius, trust the steering and stay smooth; only if
             # we somehow penetrate r_cone (a genuine breach) do we fall back to the brake.
             # When pursuit is off (escape-yaw 0), the plain distance brake applies as before.
-            hard_gate_fired_tick = False   # per-tick flag: did the cheap backup brake have to rescue
-            if args.cbf and args.cbf_mode == "cone" and args.cbf_hard_gate and ctrl_op is not None and not args.dwa:
+            if args.cbf and args.cbf_mode == "cone" and args.cbf_hard_gate and ctrl_op is not None:
                 p_fwd, p_lat = float(ctrl_op[0]), float(ctrl_op[1])
                 # Release on LATERAL clearance, not distance: driving straight forward MISSES the
                 # obstacle once its lateral offset exceeds the collision radius (i.e. we have
@@ -1960,24 +1926,11 @@ def main() -> None:
                     )
                     if _gated:
                         hard_gate_fired += 1
-                        hard_gate_fired_tick = True
                         episode_logger.log_cbf_event(
                             step=step, obstacle_id=cbf_obstacle_id, distance=float(math.hypot(p_fwd, p_lat)),
                             nominal_action=nominal_action_gate, overridden_action=[float(v) for v in action_3d],
                             mode="brake",
                         )
-
-            # ABLATION BASELINE (--dwa): classic Dynamic Window Approach REPLACES the diffusion
-            # policy's action + collision cone entirely -- a from-scratch reactive planner with no
-            # learned prior, for the "collision cone vs DWA" comparison. Overrides whatever the
-            # (now cone/orbit/ghost-disabled) blocks above produced.
-            if args.dwa:
-                dwa_goal_bearing = (math.atan2(float(belief_g[1]), float(belief_g[0]))
-                                     if (args.belief_goal and belief_g is not None)
-                                     else planar_goal_bearing(position, yaw, goal))
-                dwa_v, dwa_w = dwa_action(dwa_goal_bearing, ctrl_op, dwa_prev_v, dwa_prev_w, dt, args)
-                action_3d = np.asarray([dwa_v, 0.0, dwa_w], dtype=np.float32)
-                dwa_prev_v, dwa_prev_w = dwa_v, dwa_w
 
             # VLA counterfactual data: at blocked steps, save the NEUTRAL-goal observation the
             # policy sees, plus ALL FOUR instruction targets on that SAME observation:
@@ -1995,7 +1948,6 @@ def main() -> None:
                     ck_right = orbit_chunk(position, yaw, ghost_obstacle, -1.0, Hc, dt, r_gate, kr, cr, kp, mw)
                     ck_stop = brake_chunk(cr, Hc)
                     ck_straight = goal_chunk(position, yaw, goal, Hc, dt, cr, args.lost_goal_turn_kp, mw)
-                    ck_back = back_chunk(cr, Hc)
                     np.savez_compressed(
                         str(dump_dir / f"{Path(args.out).name}_{vla_count:06d}.npz"),
                         spatial=spatial.detach().cpu().numpy()[0].astype(np.float32),
@@ -2005,8 +1957,7 @@ def main() -> None:
                         chunk_right=ck_right.astype(np.float32),
                         chunk_stop=ck_stop.astype(np.float32),
                         chunk_straight=ck_straight.astype(np.float32),
-                        chunk_back=ck_back.astype(np.float32),
-                        classes=np.array("left,right,stop,straight,back"),
+                        classes=np.array("left,right,stop,straight"),
                     )
                 vla_count += 1
 
@@ -2057,11 +2008,16 @@ def main() -> None:
             rows["obstacle_distance"].append(float(obstacle_info["range"]))
             rows["belief_fwd"].append(bf)
             rows["belief_left"].append(bl)
-            rows["cone_correction_step0"].append(cone_correction_step0)
-            rows["cone_correction_last"].append(cone_correction_last)
-            rows["hard_gate_tick"].append(bool(hard_gate_fired_tick))
+            rows["goal_frame_fraction"].append(goal_ratio["frame_fraction"])
 
-            distances_to_obstacles = {cbf_obstacle_id: float(obstacle_info["range"])} if ghost_obstacle is not None else {}
+            if rocks:
+                distances_to_obstacles = {
+                    f"rock_{r.id:03d}": float(math.hypot(pose[0] - r.x, pose[2] - r.z)) for r in rocks
+                }
+            elif ghost_obstacle is not None:
+                distances_to_obstacles = {cbf_obstacle_id: float(obstacle_info["range"])}
+            else:
+                distances_to_obstacles = {}
             episode_logger.log_frame(
                 step=step,
                 position=[float(pose[0]), float(pose[1]), float(pose[2])],
@@ -2092,6 +2048,7 @@ def main() -> None:
             if step % 10 == 0:
                 print(
                     f"step {step:04d} | dist={goal_dist:.2f} | goal_px={int(goal_mask.sum())} "
+                    f"({goal_ratio['frame_fraction'] * 100.0:.2f}% of frame) "
                     f"| obs_px={int(obstacle_mask.sum())} "
                     f"| action=[{action_3d[0]:.2f},{action_3d[1]:.2f},{action_3d[2]:.2f}]",
                     flush=True,
@@ -2107,7 +2064,7 @@ def main() -> None:
                 break
             if stop_cmd:   # language "stop" already halted (action zeroed above) -- end the rollout,
                 print(f"Stopped by language command at step {step} dist={goal_dist:.2f}m", flush=True)
-                termination_reason = "stopped_by_command"
+                termination_reason = "qwen_stop"
                 break
     except BaseException:
         # Make sure the structured logs are flushed and closed even if the rollout crashes
@@ -2117,16 +2074,16 @@ def main() -> None:
     finally:
         sim.close()
 
-    success = bool(rows["goal_distance"] and rows["goal_distance"][-1] <= float(args.stop_dist))
-    episode_logger.finalize({
-        "success": success,
-        "termination_reason": termination_reason,
-    })
     print(
         f"[CBF diag] cbf_active={cbf_active} hard_gate_fired={hard_gate_fired} "
         f"escape_active={escape_active}",
         flush=True,
     )
+    success = bool(rows["goal_distance"] and rows["goal_distance"][-1] <= float(args.stop_dist))
+    episode_logger.finalize({
+        "success": success,
+        "termination_reason": termination_reason,
+    })
     npz_path = out_dir / "rollout.npz"
     np.savez_compressed(
         npz_path,
@@ -2149,9 +2106,7 @@ def main() -> None:
         obstacle_distance=np.asarray(rows["obstacle_distance"], dtype=np.float32),
         belief_fwd=np.asarray(rows["belief_fwd"], dtype=np.float32),
         belief_left=np.asarray(rows["belief_left"], dtype=np.float32),
-        cone_correction_step0=np.asarray(rows["cone_correction_step0"], dtype=np.float32),
-        cone_correction_last=np.asarray(rows["cone_correction_last"], dtype=np.float32),
-        hard_gate_tick=np.asarray(rows["hard_gate_tick"], dtype=bool),
+        goal_frame_fraction=np.asarray(rows["goal_frame_fraction"], dtype=np.float32),
         goal_position=goal.astype(np.float32),
         obstacle_position=(ghost_obstacle.astype(np.float32) if ghost_obstacle is not None else np.asarray([np.nan, np.nan, np.nan], dtype=np.float32)),
         success=np.asarray(success, dtype=bool),
@@ -2181,7 +2136,6 @@ def main() -> None:
         "cbf_cov_mode": args.cbf_cov_mode,
         "cbf_radius_mode": args.cbf_radius_mode,
         "npz": str(npz_path),
-        "log_run_dir": str(episode_logger.run_dir),
     }
     with (out_dir / "manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -2189,54 +2143,6 @@ def main() -> None:
         save_video(video_frames, out_dir / "rollout.mp4", fps=max(float(args.hz) / max(int(args.save_every), 1), 1.0))
     print(f"Saved rollout: {npz_path}", flush=True)
     print(f"Output dir   : {out_dir}", flush=True)
-
-
-def dwa_action(goal_bearing_body, obstacle_point, v_prev, w_prev, dt, args):
-    """Classic Dynamic Window Approach -- a REACTIVE, from-scratch local planner with NO learned
-    policy involved, used as an ablation baseline against the collision cone.
-
-    Sample every (v, w) reachable from (v_prev, w_prev) under the acceleration limits (the
-    "dynamic window"); forward-simulate each for --dwa-predict-time seconds assuming the obstacle
-    stays fixed in the current body frame (standard DWA simplification); reject any candidate that
-    would come within --dwa-obstacle-radius of it; score the survivors by heading-to-goal +
-    clearance + forward speed; return the single best (v, w). This REPLACES the diffusion policy's
-    action entirely for that tick -- DWA is a full navigation decision, not a filter on top of one.
-    """
-    max_v, max_w = float(args.max_forward_speed), float(args.max_yaw_rate)
-    dv, dw = float(args.dwa_max_accel) * dt, float(args.dwa_max_yaw_accel) * dt
-    v_lo, v_hi = max(0.0, v_prev - dv), min(max_v, v_prev + dv)
-    w_lo, w_hi = max(-max_w, w_prev - dw), min(max_w, w_prev + dw)
-    steps = max(int(float(args.dwa_predict_time) / dt), 1)
-    ox, oy = (float(obstacle_point[0]), float(obstacle_point[1])) if obstacle_point is not None else (1e9, 1e9)
-
-    best_score, best = -1e18, (0.0, 0.0)
-    for v in np.linspace(v_lo, v_hi, max(int(args.dwa_v_samples), 1)):
-        for w in np.linspace(w_lo, w_hi, max(int(args.dwa_w_samples), 1)):
-            px = py = pth = 0.0
-            min_clear = float("inf")
-            collided = False
-            for _ in range(steps):
-                pth += float(w) * dt
-                px += float(v) * math.cos(pth) * dt
-                py += float(v) * math.sin(pth) * dt
-                d = math.hypot(ox - px, oy - py)
-                min_clear = min(min_clear, d)
-                if d < float(args.dwa_obstacle_radius):
-                    collided = True
-                    break
-            if collided:
-                continue   # infeasible candidate -> hard-rejected (classic DWA, not a soft cost)
-            heading_score = math.cos(goal_bearing_body - pth)         # 1.0 = ends pointed at the goal
-            clearance_score = min(min_clear, 3.0)                     # saturate so far obstacles don't dominate
-            velocity_score = float(v) / max(max_v, 1e-6)
-            score = (float(args.dwa_heading_weight) * heading_score
-                     + float(args.dwa_clearance_weight) * clearance_score
-                     + float(args.dwa_velocity_weight) * velocity_score)
-            if score > best_score:
-                best_score, best = score, (float(v), float(w))
-    if best_score <= -1e17:
-        return 0.0, 0.0   # every sampled candidate collides -> full stop (a known DWA failure mode:
-    return best            # it has no escape when the whole dynamic window is blocked)
 
 
 def planar_goal_bearing(position: np.ndarray, yaw: float, goal: np.ndarray) -> float:
@@ -2289,9 +2195,17 @@ def command_intent(text):
     t = (text or "").strip().lower()
     if not t:
         return ""
-    if any(k in t for k in ("stop", "halt", "brake", "wait", "hold")):
+    # qwen_steer_prompt asks for "ACTION: left/right/stop" but the model often appends a
+    # REASON line (e.g. "...less than the 1.00% stop threshold...") that contains the
+    # substring "stop" even when the actual action is left/right. Parse only the ACTION
+    # field when present so that reasoning text can't false-trigger a stop; fall back to
+    # the first line for plain one-word replies ("stop" / "left" / "right").
+    m = re.search(r"action\s*:\s*([a-z]+)", t)
+    field = m.group(1) if m else t.splitlines()[0]
+    words = re.findall(r"[a-z]+", field)
+    if any(w in ("stop", "halt", "brake", "wait", "hold") for w in words):
         return "stop"
-    left, right = "left" in t, "right" in t
+    left, right = "left" in words, "right" in words
     if left and not right:
         return "left"
     if right and not left:
@@ -2307,14 +2221,6 @@ def brake_chunk(v0, H):
         v = float(v0) * max(0.0, 1.0 - k / max(int(H) - 1, 1))
         out.append(np.asarray([v, 0.0, 0.0], np.float32))
     return np.stack(out, 0)
-
-
-def back_chunk(v_back, H):
-    """Straight-reverse chunk: constant NEGATIVE forward velocity, no turn -- retreat away from
-    the obstacle in a straight line. Target for the 'back'/'reverse' instruction. Geometry-
-    independent (same for every observation), unlike orbit_chunk/goal_chunk."""
-    v = -abs(float(v_back))
-    return np.stack([np.asarray([v, 0.0, 0.0], np.float32) for _ in range(int(H))], 0)
 
 
 def goal_chunk(position, yaw, goal, H, dt, cruise, kp, max_yaw):
