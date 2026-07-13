@@ -24,7 +24,6 @@ import json
 import math
 import os
 import random
-import re
 import sys
 import time
 import datetime
@@ -861,35 +860,31 @@ def main() -> None:
     ap.add_argument("--hz", type=float, default=10.0)
     ap.add_argument("--max-steps", type=int, default=300)
     ap.add_argument("--stop-dist", type=float, default=1.0)
-    ap.add_argument("--qwen-stop-frame-fraction", type=float, default=0.01,
-                    help="If the goal's measured frame_fraction (from goal_pixel_ratio()) is at "
-                    "least this, treat it as proximity for a Qwen 'stop' verdict, same as "
-                    "near_obstacle/near_goal -- matches the 1%% threshold already stated in "
-                    "qwen_steer_prompt().")
     ap.add_argument("--vla-dump", type=str, default="",
                     help="If set, dump paired left/right counterfactual VLA training samples "
                     "(neutral-goal obs + orbit-generated left & right chunks) to this dir at blocked steps.")
     ap.add_argument("--vla-dump-every", type=int, default=3, help="Dump one sample per N blocked steps.")
     ap.add_argument("--vla-horizon", type=int, default=8, help="Orbit target chunk length (match the policy horizon).")
     ap.add_argument("--command", type=str, default="",
-                    help="Real-time language command: 'pass left' / 'pass right' / 'stop' / '' (default). "
-                    "Overrides the geometric side choice while an obstacle blocks the path.")
+                    help="Real-time language command, e.g. 'pass left' / 'pass right' / 'stop'. Only has "
+                    "an effect with --vla-adapter, which encodes the raw text itself -- no keyword "
+                    "parsing is done here.")
     ap.add_argument("--command-file", type=str, default="",
                     help="Path polled every tick for the current command (a human or a VLM writes to it). "
                     "Overrides --command. This is the LIVE inference interface.")
     ap.add_argument("--qwen-steer", action="store_true",
                     help="Once near the goal (same stop-dist+deadzone gate used for goal-reached), poll "
-                    "the persistent Qwen VLM server (qwen_vlm_server.py) for a live left/right/stop "
-                    "steering command instead of --command/--command-file. Feeds into the same "
-                    "command_intent path -- overrides --command/--command-file once active.")
+                    "the persistent Qwen VLM server (qwen_vlm_server.py) for a live steering command "
+                    "instead of --command/--command-file (requires --vla-adapter to have any effect).")
     ap.add_argument("--qwen-steer-hz", type=float, default=3.0,
                     help="Poll rate (Hz) for --qwen-steer once near-goal; independent of --hz.")
     ap.add_argument("--qwen-host", default=qwen_vlm_client.DEFAULT_HOST)
     ap.add_argument("--qwen-port", type=int, default=qwen_vlm_client.DEFAULT_PORT)
     ap.add_argument("--vla-adapter", type=str, default="",
-                    help="Path to a trained vla_adapter.pt. REGIME B: the language-conditioned POLICY "
-                    "produces the maneuver (orbit override + soft cone projection off; hard gate keeps it "
-                    "safe). Without it, the command drives the orbit controller (Regime A).")
+                    help="Path to a trained vla_adapter.pt. The language-conditioned POLICY produces the "
+                    "maneuver (orbit override + soft cone projection off; hard gate keeps it safe). "
+                    "Without it, --command/--command-file/--qwen-steer have no effect -- there is no "
+                    "geometric fallback.")
     ap.add_argument("--vla-alpha-scale", type=float, default=1.25,
                     help="Scale the adapter's language token at inference (ablation showed ~1.25 gives the "
                     "cleanest instruction-following).")
@@ -1471,10 +1466,10 @@ def main() -> None:
             rgb, depth = rgb_depth(obs)
 
             # LIVE language command (real-time inference). Read once per tick so it can drive the
-            # sample below. With --vla-adapter the intent becomes the policy's text token (Regime
-            # B: the POLICY executes the maneuver); without it, intent drives the orbit (Regime A).
+            # sample below. Only has an effect with --vla-adapter, which encodes the raw text
+            # itself as the policy's text token; without it there is no fallback -- cmd_txt is read
+            # but unused.
             goal_dist_now = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z], dtype=np.float32)))
-            near_goal = goal_dist_now <= float(args.stop_dist) + float(args.cbf_deadzone)
 
             cmd_txt = args.command
             if args.command_file:
@@ -1593,7 +1588,7 @@ def main() -> None:
             if args.qwen_steer:
                 # Near the goal, hand steering over to the persistent Qwen VLM server, polled at
                 # qwen_steer_hz (NOT every control tick -- --hz is typically much higher). Its
-                # reply is fed straight into command_intent below, same as any live command text.
+                # reply is fed straight to the VLA adapter below, same as any live command text.
                 # Runs AFTER goal_mask/obstacle_mask are finalized for THIS step so the frame sent
                 # to the VLM is this tick's rgb (never a stale/reused frame) with the current goal
                 # mask composited on top -- without that overlay the model has no way to tell which
@@ -1654,10 +1649,7 @@ def main() -> None:
                     except Exception as e:
                         print(f"[qwen-steer] query failed: {e}", flush=True)
                 cmd_txt = qwen_cmd_txt
-            intent = command_intent(cmd_txt)
-            force_side = 1.0 if intent == "left" else (-1.0 if intent == "right" else None)
             vla_token = None   # set below, once the obstacle distance is known
-            stop_cmd = False   # set below (gated on obstacle proximity)
 
             spatial = frame_to_spatial(depth, goal_mask, image_size, obstacle_mask, include_obstacle_channel=use_obstacle_channel).to(device)
             obstacle_map = obstacle_builder.build(depth) if args.obstacle_mode == "depth" else np.zeros((96, 96), dtype=np.float32)
@@ -1727,13 +1719,6 @@ def main() -> None:
             elif near_obstacle_exit:
                 near_obstacle_state = False
             near_obstacle = near_obstacle_state
-            # "stop" is a language TRIGGER, but the HALT itself is proximity-gated: engage only once
-            # close to the GOAL, never merely because an obstacle is close. A "stop" verdict issued
-            # while near an obstacle (but not the goal) is deliberately dropped -- near-obstacle
-            # proximity still gates left/right (force_side / around_side, below), just not stop.
-            # (goal_dist_now / near_goal already computed above, at the top of the loop.)
-            near_goal_visual = goal_ratio["frame_fraction"] >= float(args.qwen_stop_frame_fraction)
-            stop_cmd = (intent == "stop") and (near_goal or near_goal_visual)
             if vla_adapter is not None:
                 # Hard, full-strength switch (NOT a blend): interpolating between two different
                 # instruction tokens landed off the trained manifold -- the adapter only ever
@@ -1741,11 +1726,11 @@ def main() -> None:
                 # diffusion sampling is nonlinear in its conditioning, every replan along a blend
                 # sampled an uncorrelated, effectively random chunk (far worse than one clean cut).
                 # The hysteresis above still does its job: it debounces near_obstacle so this switch
-                # doesn't fire repeatedly from boundary jitter.
-                if intent in ("left", "right") and near_obstacle:
-                    _phrase = cmd_txt
-                elif intent in ("left", "right", "straight", "stop"):
-                    _phrase = "navigate to the goal"
+                # doesn't fire repeatedly from boundary jitter. The raw command text is passed
+                # straight to the adapter's text encoder -- no keyword parsing here, the adapter
+                # itself is responsible for turning the phrase into a maneuver.
+                if cmd_txt.strip():
+                    _phrase = cmd_txt if near_obstacle else "navigate to the goal"
                 else:
                     _phrase = None
                 if _phrase is not None:
@@ -1927,8 +1912,7 @@ def main() -> None:
                 thresh = r_gate + (args.cbf_orbit_hyst if around_side is not None else 0.0)
                 blocked = avoiding and (proj > 0.0) and (perp < thresh)
 
-            # (language command already read at the top of the loop -> intent / force_side /
-            # stop_cmd / vla_token)
+            # (language command already read at the top of the loop -> vla_token)
 
             # Ghost heading assist. The goal ghost is a binary mask; once the goal drifts
             # past ~hfov/2 it clamps to the SAME border pixel no matter how far off-axis it
@@ -1982,9 +1966,7 @@ def main() -> None:
             if blocked and args.cbf_escape_yaw > 0.0 and not args.vla_adapter and not args.dwa:
                 # Commit which way around: the tangent heading closest to the goal bearing
                 # (least detour, natural return). Latched until the rock stops blocking.
-                if force_side is not None:
-                    around_side = force_side   # language command overrides the geometric side
-                elif around_side is None:
+                if around_side is None:
                     a = math.asin(min(1.0, r_gate / max(L, 1e-6)))
                     dl = abs(wrap_angle(phi + a - beta))
                     dr = abs(wrap_angle(phi - a - beta))
@@ -2085,9 +2067,6 @@ def main() -> None:
                         classes=np.array("left,right,stop,straight,back"),
                     )
                 vla_count += 1
-
-            if stop_cmd:
-                action_3d = np.zeros(3, dtype=np.float32)  # real-time STOP command halts the rover
 
             next_position, next_yaw = integrate_mars(position, yaw, action_3d, dt)
             x = float(np.clip(next_position[0], -args.size_x / 2.0 + 0.5, args.size_x / 2.0 - 0.5))
@@ -2190,10 +2169,6 @@ def main() -> None:
             if goal_dist <= float(args.stop_dist):
                 print(f"Reached goal at step {step} dist={goal_dist:.2f}m (belief={belief_dist:.2f})", flush=True)
                 termination_reason = "goal_reached"
-                break
-            if stop_cmd:   # language "stop" already halted (action zeroed above) -- end the rollout,
-                print(f"Stopped by language command at step {step} dist={goal_dist:.2f}m", flush=True)
-                termination_reason = "qwen_stop"
                 break
     except BaseException:
         # Make sure the structured logs are flushed and closed even if the rollout crashes
@@ -2367,30 +2342,6 @@ def orbit_chunk(position, yaw, ghost_obstacle, side, H, dt, r_gate, kr, cruise, 
         out.append(a)
         p, y = integrate_mars(p, y, a, dt)
     return np.stack(out, 0)
-
-
-def command_intent(text):
-    """Map a real-time language command to an intent: 'left' / 'right' / 'stop' / '' (default).
-    Keyword now; swap for the embedding grounder or a VLM call. Same interface either way."""
-    t = (text or "").strip().lower()
-    if not t:
-        return ""
-    # qwen_steer_prompt asks for "ACTION: left/right/stop" but the model often appends a
-    # REASON line (e.g. "...less than the 1.00% stop threshold...") that contains the
-    # substring "stop" even when the actual action is left/right. Parse only the ACTION
-    # field when present so that reasoning text can't false-trigger a stop; fall back to
-    # the first line for plain one-word replies ("stop" / "left" / "right").
-    m = re.search(r"action\s*:\s*([a-z]+)", t)
-    field = m.group(1) if m else t.splitlines()[0]
-    words = re.findall(r"[a-z]+", field)
-    if any(w in ("stop", "halt", "brake", "wait", "hold") for w in words):
-        return "stop"
-    left, right = "left" in words, "right" in words
-    if left and not right:
-        return "left"
-    if right and not left:
-        return "right"
-    return ""   # navigate normally / unrecognised -> default geometric behaviour
 
 
 def brake_chunk(v0, H):
