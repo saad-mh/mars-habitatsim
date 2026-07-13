@@ -42,6 +42,7 @@ def qwen_steer_prompt(frame_fraction_pct: float) -> str:
     """
     stop_threshold_pct = 1.0
     threshold_exceeded = frame_fraction_pct > stop_threshold_pct
+    goal_not_visible = frame_fraction_pct <= 0.0
 
     return f"""
 You are controlling a rover moving toward a navigation goal.
@@ -57,8 +58,26 @@ coverage. Treat this measurement as exact. Do not estimate it from the image.
 MEASURED GOAL COVERAGE: {frame_fraction_pct:.4f}%
 STOP THRESHOLD: greater than {stop_threshold_pct:.2f}%
 IS THE STOP THRESHOLD EXCEEDED: {"YES" if threshold_exceeded else "NO"}
+IS THE GOAL VISIBLE AT ALL: {"NO" if goal_not_visible else "YES"}
 
 Follow this decision process internally and in the exact order shown.
+
+STEP 0 — GOAL NOT VISIBLE
+
+If IS THE GOAL VISIBLE AT ALL is NO (measured coverage is exactly 0.0000%,
+i.e. no green pixels anywhere in the image), the stop rule in Step 1 CANNOT
+apply -- there is no goal coverage to have exceeded any threshold. In this
+case:
+- The action MUST NOT be stop, no matter what else is in the frame.
+- This holds even if a large obstacle fills most or all of the image --
+  a full frame of obstacle is not a reason to stop; it only means the goal
+  is currently hidden behind or beside it.
+- Skip Step 1 entirely and go straight to Step 2, using the obstacle's
+  position (not the goal, which you cannot see) to pick left or right:
+  choose the side with more clear, obstacle-free terrain visible at the
+  edges of the frame.
+
+If IS THE GOAL VISIBLE AT ALL is YES, continue to Step 1 as normal.
 
 STEP 1 — CHECK THE STOP RULE
 
@@ -77,16 +96,20 @@ STEP 2 — SELECT A STEERING DIRECTION
 
 Only perform this step when the stop threshold is not exceeded.
 
-1. Locate the bright neon-green goal.
+1. Locate the bright neon-green goal, if any is visible.
 2. Determine whether the safest route toward it is to the left or right.
+   If no goal is visible (Step 0 applied), determine the safest route
+   AROUND the obstacle instead.
 3. Treat beige rocks as obstacles.
 4. Ignore the black background.
-5. If the goal is approximately centered, choose the side with more clear,
-   obstacle-free terrain.
+5. If the goal is approximately centered, or no goal is visible, choose the
+   side with more clear, obstacle-free terrain.
 
 STEP 3 — VERIFY THE DECISION
 
 Before responding, silently verify:
+- If the measured coverage is exactly 0.0000%, the action is left or right,
+  never stop -- regardless of how much of the frame an obstacle fills.
 - If the measured coverage is greater than 1.00%, the action is stop.
 - If the measured coverage is not greater than 1.00%, the action is left or right.
 - The measured numerical value has priority over visual appearance.
@@ -101,12 +124,15 @@ ACTION: left, right, or stop
 Examples:
 
 MEASURED GOAL COVERAGE: 1.24%
-stop
+ACTION: stop
 
 MEASURED GOAL COVERAGE: 0.72%
-left
+ACTION: left
 
-STOP has more priority over STEER. If the measured coverage is GREATER than 1.00%, the action is stop, even if the goal appears to be centered or to the left or right.
+MEASURED GOAL COVERAGE: 0.0000% (goal not visible, obstacle fills the frame)
+ACTION: right
+
+STOP has more priority over STEER. If the measured coverage is GREATER than 1.00%, the action is stop, even if the goal appears to be centered or to the left or right. The ONE exception is exactly 0.0000% coverage (goal not visible at all) -- that case is NEVER stop, even if an obstacle fills the whole frame.
 """
 
 
