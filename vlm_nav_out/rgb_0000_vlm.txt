@@ -3,39 +3,21 @@
   "goal_object": {
     "object_id": 0,
     "label": "rock",
-    "coordinates2D": [42, 443],
+    "coordinates2D": [386, 410],
     "reasoning": "This rock is the most scientifically significant object as it appears to be a potential sample for analysis."
   },
   "obstacles": [
     {
       "object_id": 1,
       "label": "rock",
-      "coordinates2D": [568, 436],
-      "reasoning": "This rock is the next most significant obstacle as it is located in the path of the rover and needs to be driven around."
+      "coordinates2D": [182, 383],
+      "reasoning": "This rock is the next most significant obstacle as it is close to the goal and could potentially block the path if not avoided."
     },
     {
       "object_id": 2,
       "label": "rock",
-      "coordinates2D": [159, 397],
-      "reasoning": "This rock is another potential obstacle that needs to be driven around."
-    },
-    {
-      "object_id": 3,
-      "label": "rock",
-      "coordinates2D": [207, 387],
-      "reasoning": "This rock is another obstacle that needs to be driven around."
-    },
-    {
-      "object_id": 4,
-      "label": "rock",
-      "coordinates2D": [311, 379],
-      "reasoning": "This rock is another obstacle that needs to be driven around."
-    },
-    {
-      "object_id": 5,
-      "label": "rock",
-      "coordinates2D": [432, 376],
-      "reasoning": "This rock is another obstacle that needs to be driven around."
+      "coordinates2D": [292, 373],
+      "reasoning": "This rock is another potential obstacle that needs to be driven around or over."
     }
   ]
 }

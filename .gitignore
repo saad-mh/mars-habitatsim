@@ -14,6 +14,8 @@ vla_rollout*
 mars_belief_demo*
 navdp_rollout*
 
+vlm_nav_out
+
 assets/marsyard2022.obj
 assets/marsyard2022.glb
 marsyard2022.obj
