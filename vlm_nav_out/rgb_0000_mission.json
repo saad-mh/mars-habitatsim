@@ -5,20 +5,20 @@
       "object_id": 2,
       "label": "rock",
       "coordinates2D": [
-        517,
-        407
+        518,
+        412
       ],
-      "reasoning": "This rock is the most prominent and central object in the scene, suggesting it could be of scientific interest."
+      "reasoning": "This rock is the most prominent and central object in the image, suggesting it could be of scientific interest."
     },
     "obstacles": [
       {
         "object_id": 1,
         "label": "rock",
         "coordinates2D": [
-          280,
+          279,
           692
         ],
-        "reasoning": "This rock is located near the center of the scene and is likely to be encountered by the rover as it moves towards the goal object."
+        "reasoning": "This rock is located near the center of the image and is likely to be encountered by the rover as it moves towards the goal object."
       }
     ]
   },
@@ -26,13 +26,13 @@
     "role": "goal",
     "label": "rock",
     "bbox": [
-      517.0,
-      407.0,
-      517.0,
-      407.0
+      518.0,
+      412.0,
+      518.0,
+      412.0
     ],
     "seed_world": [
-      -10.007,
+      -9.406,
       -0.077,
       7.774
     ],
@@ -48,15 +48,15 @@
       "role": "obstacle",
       "label": "rock",
       "bbox": [
-        280.0,
+        279.0,
         692.0,
-        280.0,
+        279.0,
         692.0
       ],
       "seed_world": [
-        -2.799,
+        -2.798,
         -0.058,
-        8.605
+        8.608
       ],
       "mesh_path": "/home/nahar/Desktop/pineapple/marsHabitat/vlm_nav_out/rgb_0000_obstacle_rock_r0.50.obj",
       "radius": 0.5,
@@ -67,8 +67,8 @@
     }
   ],
   "goal_target_world": [
-    -10.006999969482422,
-    1.2931629419326782,
+    -9.406000137329102,
+    1.217542052268982,
     7.77400016784668
   ],
   "semantic_render_path": null

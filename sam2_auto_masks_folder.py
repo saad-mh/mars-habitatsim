@@ -9,7 +9,11 @@ from tqdm import tqdm
 
 import torch
 
-from sam2.build_sam import build_sam2
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
+
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
 DEFAULT_INPUT_DIR = "mars_teleop_out"
@@ -133,11 +137,26 @@ def main():
     output_dir = Path(args.output).resolve()
     sam2_root = Path(args.sam2_root).resolve()
 
-    model_cfg = args.model_cfg
     checkpoint = str((sam2_root / args.checkpoint).resolve())
+
+    # Resolve the model config directly against sam2_root's own config folder,
+    # instead of going through sam2's hydra-module search path (pkg://sam2),
+    # which chokes on absolute/foreign paths (MissingConfigException).
+    config_dir = (sam2_root / "sam2" / "configs").resolve()
+    config_name = args.model_cfg.replace("\\", "/")
+    if "configs/" in config_name:
+        # Strip everything up through the last "configs/" segment, so this
+        # works whether --model-cfg was given relative (configs/sam2.1/x.yaml)
+        # or as a full absolute path (.../sam2/configs/sam2.1/x.yaml).
+        config_name = config_name.rsplit("configs/", 1)[1]
+    if config_name.endswith(".yaml"):
+        config_name = config_name[: -len(".yaml")]
 
     if not input_dir.exists():
         raise FileNotFoundError(f"Input folder not found: {input_dir}")
+
+    if not config_dir.exists():
+        raise FileNotFoundError(f"SAM2 config folder not found: {config_dir}")
 
     if not Path(checkpoint).exists():
         raise FileNotFoundError(
@@ -153,7 +172,7 @@ def main():
     mask_dir.mkdir(parents=True, exist_ok=True)
     meta_dir.mkdir(parents=True, exist_ok=True)
 
-    frames = sorted(input_dir.glob("rgb_*.png"), key=natural_sort_key)
+    frames = sorted(input_dir.glob("frame_*.png"), key=natural_sort_key)
 
     if args.max_frames is not None:
         frames = frames[: args.max_frames]
@@ -167,15 +186,26 @@ def main():
     print("Input:", input_dir)
     print("Output:", output_dir)
     print("SAM2 root:", sam2_root)
-    print("Config:", model_cfg)
+    print("Config dir:", config_dir)
+    print("Config name:", config_name)
     print("Checkpoint:", checkpoint)
 
-    model = build_sam2(
-        model_cfg,
-        checkpoint,
-        device=device,
-        apply_postprocessing=False,
-    )
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(config_name=config_name)
+        OmegaConf.resolve(cfg)
+        model = instantiate(cfg.model, _recursive_=True)
+
+    state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)["model"]
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict)
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(
+            f"Failed to load checkpoint cleanly.\n"
+            f"Missing keys: {missing_keys}\nUnexpected keys: {unexpected_keys}"
+        )
+
+    model = model.to(device)
+    model.eval()
 
     mask_generator = SAM2AutomaticMaskGenerator(
         model,

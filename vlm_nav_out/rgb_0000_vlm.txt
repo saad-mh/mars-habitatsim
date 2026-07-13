@@ -3,15 +3,15 @@
   "goal_object": {
     "object_id": 2,
     "label": "rock",
-    "coordinates2D": [517, 407],
-    "reasoning": "This rock is the most prominent and central object in the scene, suggesting it could be of scientific interest."
+    "coordinates2D": [518, 412],
+    "reasoning": "This rock is the most prominent and central object in the image, suggesting it could be of scientific interest."
   },
   "obstacles": [
     {
       "object_id": 1,
       "label": "rock",
-      "coordinates2D": [280, 692],
-      "reasoning": "This rock is located near the center of the scene and is likely to be encountered by the rover as it moves towards the goal object."
+      "coordinates2D": [279, 692],
+      "reasoning": "This rock is located near the center of the image and is likely to be encountered by the rover as it moves towards the goal object."
     }
   ]
 }
