@@ -90,7 +90,7 @@ def main():
 
     print("[vlm] running inference")
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=640)
+        generated_ids = model.generate(**inputs, max_new_tokens=1024)
 
     generated_ids_trimmed = [
         out_ids[len(in_ids):]
