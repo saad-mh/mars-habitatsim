@@ -29,4 +29,6 @@ annotations
 *.md
 .venv
 
+.vscode
+
 logs
