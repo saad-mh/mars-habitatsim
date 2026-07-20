@@ -10,6 +10,8 @@ __pycache__/
 navdp/ckpt_last.pt
 *.pt
 
+rollout_navdp1.py
+
 vla_rollout*
 mars_belief_demo*
 navdp_rollout*
