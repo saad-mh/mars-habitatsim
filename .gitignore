@@ -29,7 +29,7 @@ samples
 .DS_Store
 
 *.pth
-*.md
+# *.md
 .venv
 
 .vscode
