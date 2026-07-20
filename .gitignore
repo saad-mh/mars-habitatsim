@@ -24,11 +24,14 @@ marsyard2022.obj
 marsyard2022_tri.glb
 
 annotations
+samples
 
 .DS_Store
 
 *.pth
 *.md
 .venv
+
+.vscode
 
 logs

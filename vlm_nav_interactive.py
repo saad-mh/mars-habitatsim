@@ -73,8 +73,8 @@ VLM_PYTHON_BIN = f"{CONDA_BASE}/envs/qwen_vlm/bin/python"
 VLM_SCRIPT = str(HERE / "vlm_query.py")
 VLM_PROMPT = """You must output ONLY valid JSON with no other text.
 
-1. Goal Object: Identify the single most scientifically significant detected object (can be rock or sand). This is your primary target.
-2. Obstacles: Select only 1 rock object from the remaining detected objects (not the goal object) that the rover must drive to/around before it heads to the goal. For now, select exactly one, but the field must always be a JSON list so more can be added later without changing this format.
+1. Goal Object: Identify the single most scientifically significant detected object (can be rock or sand). This is your primary target. Select exactly ONE.
+2. Obstacles: every OTHER detected object (i.e. every detected object except the one you picked as the goal) is an obstacle the rover must drive to/around before it heads to the goal. List ALL of them, not a subset.
 
 Output format:
 {
@@ -95,11 +95,12 @@ Output format:
 }
 
 Requirements:
+- Exactly one goal_object, chosen from the detected objects
+- "obstacles" must contain every detected object except the goal_object -- none may be omitted
 - No obstacle may share an object_id with the goal_object
-- Every obstacle's label must be "rock"
 - "obstacles" must always be a JSON array (never a bare object), even when it holds a single entry
 - Output ONLY JSON, no preamble or explanation
-- If no valid obstacle is detected, output "obstacles": []"""
+- If there are no other detected objects besides the goal, output "obstacles": []"""
 
 """VLM_PROMPT = "Identify the most scientifically significant test subject among the detected objects. Output strictly in JSON format with keys: 'object_id', 'label', 'coordinates2Darray', 'reasoning'."""
 
@@ -301,6 +302,27 @@ def load_depth_frame(frame_idx):
           f"(precision limited to the 0-10m visualization clip range)")
     depth_vis = np.array(Image.open(png_path)).astype(np.float32)
     return depth_vis / 255.0 * 10.0
+
+def load_detected_shapes(frame_idx):
+    """
+    Load the SAM/labelme annotation for a frame, keyed by the object id
+    `assign_object_ids` stamped onto each shape.
+
+    This is the ground truth for where each detected object actually is.
+    The VLM is only asked to pick *which* object_id is the goal/each
+    obstacle - its own echoed "coordinates2D" is not reliable geometry (it
+    has been observed to just copy one corner of the annotation instead of
+    describing the object), so mesh/position resolution must look the real
+    bounding box up here by object_id rather than trust the VLM's reply.
+
+    Returns:
+        {object_id: shape_dict}, shape_dict has "label" and "points" (the
+        labelme rectangle's two corners, in pixels).
+    """
+    annotation_path = f"{ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
+    with open(annotation_path, "r") as f:
+        data = json.load(f)
+    return {shape["id"]: shape for shape in data["shapes"]}
 
 def validate_annotation_json(json_path):
     """
@@ -555,21 +577,6 @@ def parse_vlm_response(vlm_out_path):
         raise ValueError(f"no JSON object found in {vlm_out_path}")
     return json.loads(match.group(0))
 
-def bbox_center_pixel(coords2d):
-    """
-    Average the VLM's 2D coordinates into a single target pixel (u, v).
-
-    coords2d may be a single flat [u, v] pair or a list of points
-    ([[u1, v1], [u2, v2], ...]) describing a bbox/polygon; either way the
-    result is the mean pixel.
-    """
-    pts = np.array(coords2d, dtype=np.float32)
-    if pts.ndim == 1:
-        u, v = pts
-    else:
-        u, v = pts.mean(axis=0)
-    return float(u), float(v)
-
 def coords2d_to_bbox_xyxy(coords2d):
     """
     Reduce the VLM's 2D coordinates into an axis-aligned (x1, y1, x2, y2)
@@ -608,86 +615,6 @@ def pixel_to_world(u, v, depth_value, pose):
 
     agent_pos = np.array([pose["x"], pose["y"], pose["z"]])
     return agent_pos + world_offset
-
-
-def bbox_to_world_seed(
-    bbox_xyxy,
-    depth,
-    pose,
-    pixel_to_world,
-    terrain_height_at=None,
-    stride=4,
-    inner_crop=0.15,
-):
-    """
-    Robustly back-project a 2D bbox into a single 3D world-space seed point.
-
-    A single bbox-center pixel is fragile: it can land on background, a
-    shadow, or a depth discontinuity at the object's silhouette edge. This
-    instead samples a grid of pixels from the bbox's inner region (shrunk
-    by `inner_crop` on each side to stay off the box's own boundary),
-    back-projects every pixel with a valid (finite, positive) depth
-    reading via `pixel_to_world`, and takes the per-axis median of the
-    resulting world points. The median tolerates the handful of outlier
-    samples that straddle an edge or fall through to background depth
-    without a mean's sensitivity to them.
-
-    Args:
-        bbox_xyxy: (x1, y1, x2, y2) pixel bbox, corners in any order.
-        depth: HxW metric depth array for the frame.
-        pose: agent pose dict, as consumed by `pixel_to_world`.
-        pixel_to_world: fn(u, v, depth_value, pose) -> array-like [x, y, z].
-        terrain_height_at: optional fn(x, z) -> y; if given, the seed's y
-            is replaced with the terrain height under it, since depth
-            lands on the object's near surface, not the ground it sits on.
-        stride: pixel spacing between samples inside the bbox.
-        inner_crop: fraction of width/height to shave off each edge before
-            sampling.
-
-    Returns:
-        (seed_world, sampled_world_points): seed_world is an
-        np.array([x, y, z]), or None if no pixel in the bbox had valid
-        depth; sampled_world_points is an (N, 3) array of the valid
-        samples the median was computed from (N == 0 when seed_world is
-        None).
-    """
-    x1, y1, x2, y2 = bbox_xyxy
-    x1, x2 = sorted((x1, x2))
-    y1, y2 = sorted((y1, y2))
-
-    bw, bh = x2 - x1, y2 - y1
-    cx1, cx2 = x1 + bw * inner_crop, x2 - bw * inner_crop
-    cy1, cy2 = y1 + bh * inner_crop, y2 - bh * inner_crop
-    if cx2 <= cx1:
-        cx1, cx2 = x1, x2
-    if cy2 <= cy1:
-        cy1, cy2 = y1, y2
-
-    h, w = depth.shape[:2]
-    px_min = int(np.clip(round(cx1), 0, w - 1))
-    px_max = int(np.clip(round(cx2), 0, w - 1))
-    py_min = int(np.clip(round(cy1), 0, h - 1))
-    py_max = int(np.clip(round(cy2), 0, h - 1))
-    step = max(int(stride), 1)
-
-    samples = []
-    for py in range(py_min, py_max + 1, step):
-        for px in range(px_min, px_max + 1, step):
-            depth_value = float(depth[py, px])
-            if not np.isfinite(depth_value) or depth_value <= 0.0:
-                continue
-            samples.append(pixel_to_world(px, py, depth_value, pose))
-
-    if not samples:
-        return None, np.empty((0, 3), dtype=np.float64)
-
-    sampled_world_points = np.array(samples, dtype=np.float64)
-    seed_world = np.median(sampled_world_points, axis=0)
-
-    if terrain_height_at is not None:
-        seed_world[1] = terrain_height_at(seed_world[0], seed_world[2])
-
-    return seed_world, sampled_world_points
 
 
 # Local mesh patch export
@@ -863,6 +790,7 @@ def selected_bbox_to_object_mesh(
     terrain_height_at,
     output_dir,
     radius=0.5,
+    detected_shapes=None,
 ):
     """
     Resolve one VLM-selected object entry (goal or obstacle) to a world seed
@@ -876,7 +804,7 @@ def selected_bbox_to_object_mesh(
 
     Args:
         selected_obj: VLM object entry (goal_object or one obstacle), with
-            "label" and "coordinates2D" keys.
+            "object_id", "label" and "coordinates2D" keys.
         depth: HxW metric depth array for the frame.
         pose: agent pose dict active when the frame was captured.
         frame_idx: frame index the object was resolved from (for naming).
@@ -885,6 +813,9 @@ def selected_bbox_to_object_mesh(
         terrain_height_at: fn(x, z) -> y.
         output_dir: directory to save the mesh OBJ into.
         radius: patch radius in meters.
+        detected_shapes: {object_id: shape} from `load_detected_shapes`, the
+            SAM/labelme ground truth to resolve the bbox from instead of
+            the VLM's own (unreliable) coordinates2D.
 
     Returns:
         {
@@ -894,7 +825,7 @@ def selected_bbox_to_object_mesh(
         }
     """
     seed_world, bbox_xyxy, label = _resolve_entry_seed_world(
-        selected_obj, depth, pose, pixel_to_world, terrain_height_at
+        selected_obj, depth, pose, pixel_to_world, terrain_height_at, detected_shapes
     )
 
     safe_label = re.sub(r"[^a-zA-Z0-9]+", "_", label.strip().lower()).strip("_") or "object"
@@ -916,7 +847,7 @@ def selected_bbox_to_object_mesh(
     }
 
 
-def extract_obstacle_entries(response):
+def extract_obstacle_entries(response, goal_entry=None):
     """
     Normalize the VLM response's obstacle field into a list of entries.
 
@@ -925,6 +856,12 @@ def extract_obstacle_entries(response):
     rgb_*_vlm.txt captured before the prompt grew a list still works. Any
     null/empty entries are dropped so a missing-detection case just yields
     zero obstacles instead of a crash.
+
+    If `goal_entry` is given, any entry sharing its "object_id" is dropped
+    too -- a defensive backstop (independent of the VLM prompt's own "no
+    obstacle may share the goal's object_id" instruction) so the goal can
+    never end up double-booked as an obstacle regardless of how many
+    obstacles get selected downstream.
     """
     entries = response.get("obstacles")
     if entries is None:
@@ -933,54 +870,69 @@ def extract_obstacle_entries(response):
     elif isinstance(entries, dict):
         entries = [entries]
 
-    return [e for e in entries if e]
+    entries = [e for e in entries if e]
+
+    if goal_entry:
+        goal_id = goal_entry.get("object_id")
+        entries = [e for e in entries if e.get("object_id") != goal_id]
+
+    return entries
 
 
-def _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height_at):
+def _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height_at, detected_shapes=None):
     """
-    Back-project a single VLM object entry's bbox to a world-space seed
-    point. Shared by `entry_world_position` (plain position lookups) and
+    Resolve a single VLM object entry's bbox to a world-space seed point.
+    Shared by `entry_world_position` (plain position lookups) and
     `selected_bbox_to_object_mesh` (position + mesh extraction) so the
-    sampling/fallback logic only lives in one place.
+    resolution logic only lives in one place.
 
-    The bbox is back-projected robustly via `bbox_to_world_seed`: many
-    pixels inside it are sampled and back-projected, and the median of
-    the valid ones is used instead of a single (fragile) center pixel.
-    y is re-derived from the terrain heightmap at the seed's (x, z)
-    since the depth reading lands on the object's surface, not the
-    ground it's sitting on. If the bbox has no valid depth anywhere
-    (e.g. a degenerate single-point "bbox"), this falls back to the
-    plain center-pixel back-projection.
+    The bbox comes from `detected_shapes` (the SAM/labelme annotation),
+    looked up by the entry's "object_id" - NOT from the VLM's own
+    "coordinates2D", which has been observed to just echo one corner of
+    the annotation rather than describe the object, silently detaching the
+    resolved mesh from what SAM actually detected. `detected_shapes` is
+    optional only so this still degrades gracefully (with a loud warning)
+    for callers that haven't been updated to load it.
+
+    Only that bbox's exact center pixel is used (no grid sampling across
+    the box), so a loose annotation box can't pull the seed toward its own
+    background. The depth image is read at that single pixel and
+    back-projected via `pixel_to_world`; y is then re-derived from the
+    terrain heightmap at the resulting (x, z), since the depth reading
+    lands on the object's surface, not the ground it's resting on.
 
     Returns:
         (seed_world, bbox_xyxy, label) - seed_world is an np.array([x, y, z]).
     """
-    label = entry.get("label", "?")
-    bbox_xyxy = coords2d_to_bbox_xyxy(entry["coordinates2D"])
+    object_id = entry.get("object_id")
+    shape = detected_shapes.get(object_id) if detected_shapes is not None else None
 
-    seed_world, sampled_world_points = bbox_to_world_seed(
-        bbox_xyxy, depth, pose, pixel_to_world, terrain_height_at=terrain_height_at,
-    )
-
-    if seed_world is None:
-        print(f"[warn] no valid depth samples inside bbox={bbox_xyxy} for '{label}'; "
-              f"falling back to bbox-center pixel")
-        u, v = bbox_center_pixel(entry["coordinates2D"])
-        h, w = depth.shape[:2]
-        px = int(np.clip(round(u), 0, w - 1))
-        py = int(np.clip(round(v), 0, h - 1))
-        depth_value = float(depth[py, px])
-        if depth_value <= 0.0:
-            print(f"[warn] non-positive depth ({depth_value}) at pixel ({px},{py}); result will be unreliable")
-        world = pixel_to_world(u, v, depth_value, pose)
-        grounded_y = terrain_height_at(world[0], world[2])
-        seed_world = np.array([world[0], grounded_y, world[2]], dtype=np.float64)
-        print(f"[object] '{label}' pixel=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
-              f"world=({seed_world[0]:.2f}, {seed_world[1]:.2f}, {seed_world[2]:.2f}) [fallback:center-pixel]")
+    if shape is not None:
+        label = shape.get("label", entry.get("label", "?"))
+        bbox_xyxy = coords2d_to_bbox_xyxy(shape["points"])
     else:
-        print(f"[object] '{label}' bbox={tuple(round(c, 1) for c in bbox_xyxy)} "
-              f"samples={len(sampled_world_points)} "
-              f"seed=({seed_world[0]:.2f}, {seed_world[1]:.2f}, {seed_world[2]:.2f})")
+        print(f"[warn] object_id={object_id} not found in SAM annotation; "
+              f"falling back to the VLM's own coordinates2D (unreliable)")
+        label = entry.get("label", "?")
+        bbox_xyxy = coords2d_to_bbox_xyxy(entry["coordinates2D"])
+
+    x1, y1, x2, y2 = bbox_xyxy
+    u, v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+    h, w = depth.shape[:2]
+    px = int(np.clip(round(u), 0, w - 1))
+    py = int(np.clip(round(v), 0, h - 1))
+    depth_value = float(depth[py, px])
+    if not np.isfinite(depth_value) or depth_value <= 0.0:
+        print(f"[warn] non-positive/invalid depth ({depth_value}) at bbox-center pixel ({px},{py}) "
+              f"for '{label}'; result will be unreliable")
+    world = pixel_to_world(u, v, depth_value, pose)
+    grounded_y = terrain_height_at(world[0], world[2])
+    seed_world = np.array([world[0], grounded_y, world[2]], dtype=np.float64)
+
+    print(f"[object] '{label}' object_id={object_id} bbox={tuple(round(c, 1) for c in bbox_xyxy)} "
+          f"center=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
+          f"seed=({seed_world[0]:.2f}, {seed_world[1]:.2f}, {seed_world[2]:.2f})")
 
     return seed_world, bbox_xyxy, label
 
@@ -988,15 +940,19 @@ def _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height
 def entry_world_position(entry, frame_idx):
     """
     Resolve a single VLM object entry (goal_object or one obstacle) to a
-    world position, using the depth/pose captured alongside frame_idx.
+    world position, using the depth/pose/annotation captured alongside
+    frame_idx.
 
     Returns:
         (x, y, z, label)
     """
     depth = load_depth_frame(frame_idx)
     pose = load_pose(frame_idx)
+    detected_shapes = load_detected_shapes(frame_idx)
 
-    seed_world, _, label = _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height_at)
+    seed_world, _, label = _resolve_entry_seed_world(
+        entry, depth, pose, pixel_to_world, terrain_height_at, detected_shapes
+    )
 
     return float(seed_world[0]), float(seed_world[1]), float(seed_world[2]), label
 
@@ -1019,13 +975,27 @@ def object_world_position(frame_idx):
     return entry_world_position(goal_entry, frame_idx)
 
 
-def resolve_mission_meshes(frame_idx, response, radius=0.5):
+def resolve_mission_meshes(frame_idx, response, radius=0.5, obstacle_limit=None):
     """
     Resolve every VLM-selected object in a frame's response (goal +
     obstacles) to world positions and local terrain meshes, without driving
     the rover. Shared by the live `navigate_mission` drive and the
     standalone --vlm/--goto CLI reruns, so mesh generation happens exactly
     once per object regardless of which path triggers it.
+
+    Obstacle selection runs entirely separately from (and after) goal
+    selection: the goal is resolved first from `response["goal_object"]`,
+    then obstacle candidates are drawn from the remaining detections with
+    the goal's own object_id excluded (see `extract_obstacle_entries`), and
+    only then is `obstacle_limit` applied to that goal-free pool.
+
+    Args:
+        obstacle_limit: None keeps every resolved obstacle (default,
+            matches prior behavior). An int caps how many of the VLM's
+            obstacle entries are resolved, taken in the order the VLM
+            returned them (e.g. 1 for "single", 5 for "up to 5", or a
+            number >= the detection count for "everything except the
+            goal").
 
     Returns:
         (goal_mesh, obstacle_meshes) - goal_mesh is None if there's no
@@ -1034,6 +1004,7 @@ def resolve_mission_meshes(frame_idx, response, radius=0.5):
     """
     depth = load_depth_frame(frame_idx)
     pose = load_pose(frame_idx)
+    detected_shapes = load_detected_shapes(frame_idx)
 
     goal_entry = response.get("goal_object")
     goal_mesh = None
@@ -1041,15 +1012,21 @@ def resolve_mission_meshes(frame_idx, response, radius=0.5):
         goal_mesh = selected_bbox_to_object_mesh(
             goal_entry, depth, pose, frame_idx, "goal",
             pixel_to_world, terrain_height_at, OUT_DIR, radius=radius,
+            detected_shapes=detected_shapes,
         )
 
+    candidate_obstacles = extract_obstacle_entries(response, goal_entry=goal_entry)
+    if obstacle_limit is not None:
+        candidate_obstacles = candidate_obstacles[:obstacle_limit]
+
     obstacle_meshes = []
-    for i, obstacle in enumerate(extract_obstacle_entries(response)):
+    for i, obstacle in enumerate(candidate_obstacles):
         role = "obstacle" if i == 0 else f"obstacle{i}"
         try:
             mesh_meta = selected_bbox_to_object_mesh(
                 obstacle, depth, pose, frame_idx, role,
                 pixel_to_world, terrain_height_at, OUT_DIR, radius=radius,
+                detected_shapes=detected_shapes,
             )
         except Exception as e:
             oid = obstacle.get("object_id", "?") if isinstance(obstacle, dict) else "?"
@@ -1060,7 +1037,7 @@ def resolve_mission_meshes(frame_idx, response, radius=0.5):
     return goal_mesh, obstacle_meshes
 
 
-def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PROMPT, radius=0.5):
+def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PROMPT, radius=0.5, obstacle_limit=None):
     """
     Query the VLM for its goal/obstacle object selection on an annotated
     frame, then back-project the chosen bbox(es) through depth + camera
@@ -1078,6 +1055,8 @@ def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, pr
             the frame's saved depth/pose).
         prompt: Question to ask the VLM about the detected objects.
         radius: Local terrain patch radius, in meters, for the resolved mesh(es).
+        obstacle_limit: forwarded to `resolve_mission_meshes` -- None (default)
+            resolves every obstacle the VLM flagged; an int caps the count.
 
     Returns:
         (success, result, status_message). On success, result is
@@ -1092,7 +1071,7 @@ def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, pr
     except Exception as e:
         return False, None, f"could not parse VLM response {vlm_out_path}: {e}"
 
-    goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response, radius=radius)
+    goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response, radius=radius, obstacle_limit=obstacle_limit)
     if goal_mesh is None:
         return False, None, f"no goal_object in {vlm_out_path}"
 
