@@ -1,0 +1,7 @@
+name: sam2
+channels:
+  - aihabitat
+  - defaults
+dependencies:
+  - python=3.10
+prefix: /home/gpu/miniconda3/envs/sam2
