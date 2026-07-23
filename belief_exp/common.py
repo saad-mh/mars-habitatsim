@@ -16,9 +16,6 @@ from typing import Tuple
 
 import numpy as np
 
-# --------------------------------------------------------------------------------
-# Make the real navdp package importable without modifying navdp/ in any way.
-# --------------------------------------------------------------------------------
 NAVDP_ROOT = Path(__file__).resolve().parents[1] / "navdp"
 if str(NAVDP_ROOT) not in sys.path:
     sys.path.insert(0, str(NAVDP_ROOT))

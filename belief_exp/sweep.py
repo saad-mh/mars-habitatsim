@@ -160,7 +160,7 @@ def print_leaderboard(rows: List[Dict[str, float]], top_n: int = 10) -> None:
         print(" ".join(f"{row[c]:>14.4f}" for c in cols))
 
     best = rows[0]
-    print("\nBest config, ready to paste:")
+    print("\nBest config:")
     print(
         "SubgoalBeliefBank([goal_id], "
         f"sigma_init={best['sigma_init']:.4g}, sigma_visible={best['sigma_visible']:.4g}, "
