@@ -20,12 +20,10 @@ interaction -- this is a caller-side GateConfig choice only; scenario.py and nav
 untouched. The continuous speed-caution scaling (strength_sigma_low/high) is a separate
 always-on mechanism and stays active.
 
-Smoke test (fast, seconds):
-    conda run -n sam2 python belief_exp/sigma_min_sweep.py --episodes-per-config 5 \\
-        --sigma-visible-grid 1e-3 0.2 4 --odom-noise-grid 1e-3 0.1 4 --other-grid-n 2 \\
-        --params decay_factor,success_radius
+Smoke test:
+   conda run -n sam2 python belief_exp/sigma_min_sweep.py --episodes-per-config 5  --sigma-visible-grid 1e-3 0.2 4 --odom-noise-grid 1e-3 0.1 4 --other-grid-n 2  --params decay_factor,success_radius
 
-Full run (minutes; ~48 config-points x 144 sigma pairs x 20 episodes):
+Full run (~48 config-points x 144 sigma pairs x 20 episodes):
     conda run -n sam2 python belief_exp/sigma_min_sweep.py --seed 0
 """
 
@@ -52,21 +50,51 @@ DISABLED_GATE = GateConfig(sigma_ale_threshold=float("inf"))
 # README notes it's essentially dead / rarely hit in practice); sigma_ale_threshold is
 # excluded because the gate is disabled for this whole script.
 OTHER_PARAMS: Dict[str, dict] = {
-    "decay_factor": dict(kind="bank", field="decay_factor", range=(0.8, 0.999), spacing="linear"),
-    "large_uncertainty": dict(kind="bank", field="large_uncertainty", range=(50.0, 5000.0), spacing="log"),
-    "success_radius": dict(kind="route", field="success_radius", range=(0.2, 1.0), spacing="linear"),
-    "env_obs_noise": dict(kind="env", field="obs_noise_std", range=(0.02, 0.3), spacing="log"),
-    "env_odom_noise": dict(kind="env", field="odom_noise_std", range=(0.0, 0.15), spacing="linear"),
-    "occlusion_mode": dict(kind="env", field="occlusion_mode", values=["markov", "bernoulli"], spacing="categorical"),
-    "p_visible": dict(
-        kind="env", field="p_visible", range=(0.2, 0.8), spacing="linear",
-        forces={"occlusion_mode": "bernoulli"},  # p_visible is a no-op under the default "markov" mode
+    "decay_factor": dict(
+        kind="bank", field="decay_factor", range=(0.8, 0.999), spacing="linear"
     ),
-    "mean_streak_len": dict(kind="env", field="mean_streak_len", range=(3.0, 12.0), spacing="linear"),
-    "bearing0_deg": dict(kind="env", field="bearing0_deg", range=(30.0, 90.0), spacing="linear"),
+    "large_uncertainty": dict(
+        kind="bank", field="large_uncertainty", range=(50.0, 5000.0), spacing="log"
+    ),
+    "success_radius": dict(
+        kind="route", field="success_radius", range=(0.2, 1.0), spacing="linear"
+    ),
+    "env_obs_noise": dict(
+        kind="env", field="obs_noise_std", range=(0.02, 0.3), spacing="log"
+    ),
+    "env_odom_noise": dict(
+        kind="env", field="odom_noise_std", range=(0.0, 0.15), spacing="linear"
+    ),
+    "occlusion_mode": dict(
+        kind="env",
+        field="occlusion_mode",
+        values=["markov", "bernoulli"],
+        spacing="categorical",
+    ),
+    "p_visible": dict(
+        kind="env",
+        field="p_visible",
+        range=(0.2, 0.8),
+        spacing="linear",
+        forces={
+            "occlusion_mode": "bernoulli"
+        },  # p_visible is a no-op under the default "markov" mode
+    ),
+    "mean_streak_len": dict(
+        kind="env", field="mean_streak_len", range=(3.0, 12.0), spacing="linear"
+    ),
+    "bearing0_deg": dict(
+        kind="env", field="bearing0_deg", range=(30.0, 90.0), spacing="linear"
+    ),
     "range0": dict(
-        kind="env", field="range0", range=(4.0, 20.0), spacing="linear",
-        to_field=lambda upper: (2.0, upper),  # lower bound fixed at 2.0; sweep the upper bound
+        kind="env",
+        field="range0",
+        range=(4.0, 20.0),
+        spacing="linear",
+        to_field=lambda upper: (
+            2.0,
+            upper,
+        ),  # lower bound fixed at 2.0; sweep the upper bound
     ),
     "dt": dict(kind="env", field="dt", range=(0.2, 1.0), spacing="linear"),
 }
@@ -91,7 +119,13 @@ def _param_grid_values(name: str, spec: dict, args: argparse.Namespace) -> List:
 
 
 def iter_config_points(args: argparse.Namespace) -> Iterator[dict]:
-    yield {"sweep_param": "baseline", "sweep_value": None, "bank": {}, "route": {}, "env": {}}
+    yield {
+        "sweep_param": "baseline",
+        "sweep_value": None,
+        "bank": {},
+        "route": {},
+        "env": {},
+    }
     selected = args.params
     for name, spec in OTHER_PARAMS.items():
         if selected is not None and name not in selected:
@@ -109,7 +143,9 @@ def is_viable(metrics: Dict[str, float], args: argparse.Namespace) -> bool:
     cov_ok = metrics["coverage_deviation"] <= args.coverage_dev_tol
     adv_ok = metrics["advance_rate"] >= args.min_advance_rate
     false_adv = metrics["false_advance_rate"]
-    false_adv_ok = (not np.isnan(false_adv)) and false_adv <= args.max_false_advance_rate
+    false_adv_ok = (
+        not np.isnan(false_adv)
+    ) and false_adv <= args.max_false_advance_rate
     return cov_ok and adv_ok and false_adv_ok
 
 
@@ -120,44 +156,44 @@ def evaluate_sigma_grid(
     args: argparse.Namespace,
     sv_grid: List[float],
     on_grid: List[float],
-    progress_prefix: str = "",
-) -> Tuple[List[Tuple[float, float, Dict[str, float], bool]], Optional[Tuple[float, float, float, Dict[str, float]]]]:
+) -> Tuple[
+    List[Tuple[float, float, Dict[str, float], bool]],
+    Optional[Tuple[float, float, float, Dict[str, float]]],
+]:
     detail_rows = []
     best: Optional[Tuple[float, float, float, Dict[str, float]]] = None
-    total_pairs = len(sv_grid) * len(on_grid)
-    report_every = max(1, total_pairs // 10)
-    t0 = time.time()
-    for idx, (sv, on) in enumerate(
-        ((sv, on) for sv in sv_grid for on in on_grid), start=1
-    ):
-        bank_cfg = replace(bank_base, sigma_visible=sv, odom_noise=on)
-        logs = [
-            run_episode(
-                bank_cfg, route_cfg, env_cfg, DISABLED_GATE,
-                np.random.default_rng(args.seed + i), args.max_steps,
-            )
-            for i in range(args.episodes_per_config)
-        ]
-        metrics = compute_metrics(logs, success_radius=route_cfg.success_radius)
-        viable = is_viable(metrics, args)
-        detail_rows.append((sv, on, metrics, viable))
-        if viable:
-            score = sv * on
-            if best is None or score < best[0]:
-                best = (score, sv, on, metrics)
-        if idx % report_every == 0 or idx == total_pairs:
-            elapsed = time.time() - t0
-            rate = idx / elapsed if elapsed > 0 else float("inf")
-            print(
-                f"    {progress_prefix}sigma pair {idx}/{total_pairs} "
-                f"({elapsed:.1f}s elapsed, {rate:.1f} pairs/s)",
-                flush=True,
-            )
+    for sv in sv_grid:
+        for on in on_grid:
+            bank_cfg = replace(bank_base, sigma_visible=sv, odom_noise=on)
+            logs = [
+                run_episode(
+                    bank_cfg,
+                    route_cfg,
+                    env_cfg,
+                    DISABLED_GATE,
+                    np.random.default_rng(args.seed + i),
+                    args.max_steps,
+                )
+                for i in range(args.episodes_per_config)
+            ]
+            metrics = compute_metrics(logs, success_radius=route_cfg.success_radius)
+            viable = is_viable(metrics, args)
+            detail_rows.append((sv, on, metrics, viable))
+            if viable:
+                score = sv * on
+                if best is None or score < best[0]:
+                    best = (score, sv, on, metrics)
     return detail_rows, best
 
 
 def print_summary_table(rows: List[Dict]) -> None:
-    cols = ["sweep_param", "sweep_value", "min_sigma_visible", "min_odom_noise", "found_viable"]
+    cols = [
+        "sweep_param",
+        "sweep_value",
+        "min_sigma_visible",
+        "min_odom_noise",
+        "found_viable",
+    ]
     header = " ".join(f"{c:>18}" for c in cols)
     print("\n" + header)
     print("-" * len(header))
@@ -173,8 +209,20 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--sigma-visible-grid", type=float, nargs=3, default=[1e-4, 0.5, 12], metavar=("MIN", "MAX", "N"))
-    ap.add_argument("--odom-noise-grid", type=float, nargs=3, default=[1e-4, 0.3, 12], metavar=("MIN", "MAX", "N"))
+    ap.add_argument(
+        "--sigma-visible-grid",
+        type=float,
+        nargs=3,
+        default=[1e-4, 0.5, 12],
+        metavar=("MIN", "MAX", "N"),
+    )
+    ap.add_argument(
+        "--odom-noise-grid",
+        type=float,
+        nargs=3,
+        default=[1e-4, 0.3, 12],
+        metavar=("MIN", "MAX", "N"),
+    )
     ap.add_argument("--episodes-per-config", type=int, default=20)
     ap.add_argument("--max-steps", type=int, default=40)
     ap.add_argument("--seed", type=int, default=0)
@@ -183,7 +231,9 @@ def main() -> None:
     ap.add_argument("--max-false-advance-rate", type=float, default=0.1)
     ap.add_argument("--other-grid-n", type=int, default=5)
     ap.add_argument(
-        "--params", type=str, default=None,
+        "--params",
+        type=str,
+        default=None,
         help="comma-separated subset of OTHER_PARAMS names to sweep (default: all)",
     )
     ap.add_argument("--out-details", type=str, default=None)
@@ -200,7 +250,9 @@ def main() -> None:
     if args.params is not None:
         unknown = sorted(set(args.params) - set(OTHER_PARAMS))
         if unknown:
-            ap.error(f"unknown --params entries: {unknown}; choices are {sorted(OTHER_PARAMS)}")
+            ap.error(
+                f"unknown --params entries: {unknown}; choices are {sorted(OTHER_PARAMS)}"
+            )
 
     sv_lo, sv_hi, sv_n = args.sigma_visible_grid
     on_lo, on_hi, on_n = args.odom_noise_grid
@@ -210,8 +262,16 @@ def main() -> None:
     timestamp = f"{datetime.datetime.now():%Y%m%d_%H%M%S}"
     results_dir = Path(__file__).resolve().parent / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
-    out_details = Path(args.out_details) if args.out_details else results_dir / f"sigma_min_details_{timestamp}.csv"
-    out_summary = Path(args.out_summary) if args.out_summary else results_dir / f"sigma_min_summary_{timestamp}.csv"
+    out_details = (
+        Path(args.out_details)
+        if args.out_details
+        else results_dir / f"sigma_min_details_{timestamp}.csv"
+    )
+    out_summary = (
+        Path(args.out_summary)
+        if args.out_summary
+        else results_dir / f"sigma_min_summary_{timestamp}.csv"
+    )
 
     points = list(iter_config_points(args))
     pairs_per_point = len(sv_grid) * len(on_grid)
@@ -246,14 +306,8 @@ def main() -> None:
             route_cfg = replace(RouteConfig(), **point["route"])
             env_cfg = replace(EnvConfig(), **point["env"])
 
-            print(
-                f"[{i + 1}/{len(points)}] {point['sweep_param']}={point['sweep_value']} "
-                f"-- starting {pairs_per_point} sigma pairs...",
-                flush=True,
-            )
             detail_rows, best = evaluate_sigma_grid(
-                bank_base, route_cfg, env_cfg, args, sv_grid, on_grid,
-                progress_prefix=f"[{i + 1}/{len(points)}] ",
+                bank_base, route_cfg, env_cfg, args, sv_grid, on_grid
             )
             total_detail_rows += len(detail_rows)
 
@@ -271,11 +325,17 @@ def main() -> None:
 
             other_values = {}
             for name, spec in OTHER_PARAMS.items():
-                cfg_obj = {"bank": bank_base, "route": route_cfg, "env": env_cfg}[spec["kind"]]
+                cfg_obj = {"bank": bank_base, "route": route_cfg, "env": env_cfg}[
+                    spec["kind"]
+                ]
                 val = getattr(cfg_obj, spec["field"])
                 other_values[name] = val[1] if name == "range0" else val
 
-            summary_row = {"sweep_param": point["sweep_param"], "sweep_value": point["sweep_value"], **other_values}
+            summary_row = {
+                "sweep_param": point["sweep_param"],
+                "sweep_value": point["sweep_value"],
+                **other_values,
+            }
             if best is not None:
                 _, best_sv, best_on, best_metrics = best
                 summary_row["min_sigma_visible"] = best_sv
@@ -293,10 +353,8 @@ def main() -> None:
                 progress_msg = "NO VIABLE PAIR"
             summary_rows.append(summary_row)
 
-            elapsed_total = time.time() - run_t0
             print(
-                f"[{i + 1}/{len(points)}] {point['sweep_param']}={point['sweep_value']} -> {progress_msg} "
-                f"(run elapsed: {elapsed_total:.1f}s)",
+                f"[{i + 1}/{len(points)}] {point['sweep_param']}={point['sweep_value']} -> {progress_msg}",
                 flush=True,
             )
 
