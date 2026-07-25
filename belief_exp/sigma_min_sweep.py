@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -119,26 +120,39 @@ def evaluate_sigma_grid(
     args: argparse.Namespace,
     sv_grid: List[float],
     on_grid: List[float],
+    progress_prefix: str = "",
 ) -> Tuple[List[Tuple[float, float, Dict[str, float], bool]], Optional[Tuple[float, float, float, Dict[str, float]]]]:
     detail_rows = []
     best: Optional[Tuple[float, float, float, Dict[str, float]]] = None
-    for sv in sv_grid:
-        for on in on_grid:
-            bank_cfg = replace(bank_base, sigma_visible=sv, odom_noise=on)
-            logs = [
-                run_episode(
-                    bank_cfg, route_cfg, env_cfg, DISABLED_GATE,
-                    np.random.default_rng(args.seed + i), args.max_steps,
-                )
-                for i in range(args.episodes_per_config)
-            ]
-            metrics = compute_metrics(logs, success_radius=route_cfg.success_radius)
-            viable = is_viable(metrics, args)
-            detail_rows.append((sv, on, metrics, viable))
-            if viable:
-                score = sv * on
-                if best is None or score < best[0]:
-                    best = (score, sv, on, metrics)
+    total_pairs = len(sv_grid) * len(on_grid)
+    report_every = max(1, total_pairs // 10)
+    t0 = time.time()
+    for idx, (sv, on) in enumerate(
+        ((sv, on) for sv in sv_grid for on in on_grid), start=1
+    ):
+        bank_cfg = replace(bank_base, sigma_visible=sv, odom_noise=on)
+        logs = [
+            run_episode(
+                bank_cfg, route_cfg, env_cfg, DISABLED_GATE,
+                np.random.default_rng(args.seed + i), args.max_steps,
+            )
+            for i in range(args.episodes_per_config)
+        ]
+        metrics = compute_metrics(logs, success_radius=route_cfg.success_radius)
+        viable = is_viable(metrics, args)
+        detail_rows.append((sv, on, metrics, viable))
+        if viable:
+            score = sv * on
+            if best is None or score < best[0]:
+                best = (score, sv, on, metrics)
+        if idx % report_every == 0 or idx == total_pairs:
+            elapsed = time.time() - t0
+            rate = idx / elapsed if elapsed > 0 else float("inf")
+            print(
+                f"    {progress_prefix}sigma pair {idx}/{total_pairs} "
+                f"({elapsed:.1f}s elapsed, {rate:.1f} pairs/s)",
+                flush=True,
+            )
     return detail_rows, best
 
 
@@ -222,6 +236,7 @@ def main() -> None:
 
     summary_rows: List[Dict] = []
     total_detail_rows = 0
+    run_t0 = time.time()
     with out_details.open("w", newline="") as f_details:
         writer = csv.DictWriter(f_details, fieldnames=detail_fieldnames)
         writer.writeheader()
@@ -231,7 +246,15 @@ def main() -> None:
             route_cfg = replace(RouteConfig(), **point["route"])
             env_cfg = replace(EnvConfig(), **point["env"])
 
-            detail_rows, best = evaluate_sigma_grid(bank_base, route_cfg, env_cfg, args, sv_grid, on_grid)
+            print(
+                f"[{i + 1}/{len(points)}] {point['sweep_param']}={point['sweep_value']} "
+                f"-- starting {pairs_per_point} sigma pairs...",
+                flush=True,
+            )
+            detail_rows, best = evaluate_sigma_grid(
+                bank_base, route_cfg, env_cfg, args, sv_grid, on_grid,
+                progress_prefix=f"[{i + 1}/{len(points)}] ",
+            )
             total_detail_rows += len(detail_rows)
 
             for sv, on, metrics, viable in detail_rows:
@@ -270,7 +293,12 @@ def main() -> None:
                 progress_msg = "NO VIABLE PAIR"
             summary_rows.append(summary_row)
 
-            print(f"[{i + 1}/{len(points)}] {point['sweep_param']}={point['sweep_value']} -> {progress_msg}", flush=True)
+            elapsed_total = time.time() - run_t0
+            print(
+                f"[{i + 1}/{len(points)}] {point['sweep_param']}={point['sweep_value']} -> {progress_msg} "
+                f"(run elapsed: {elapsed_total:.1f}s)",
+                flush=True,
+            )
 
     with out_summary.open("w", newline="") as f_summary:
         writer = csv.DictWriter(f_summary, fieldnames=summary_fieldnames)
@@ -280,6 +308,7 @@ def main() -> None:
 
     print(f"\nwrote {total_detail_rows} detail rows to {out_details}")
     print(f"wrote {len(summary_rows)} summary rows to {out_summary}")
+    print(f"total wall time: {time.time() - run_t0:.1f}s")
     print_summary_table(summary_rows)
 
 
