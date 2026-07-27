@@ -1,0 +1,92 @@
+evaluating 6 config-point(s), 12x12 sigma pairs each (2880 episodes per config-point)
+[1/6] baseline=None -- starting 144 sigma pairs...
+    [1/6] sigma pair 14/144 (0.5s elapsed, 28.1 pairs/s)
+    [1/6] sigma pair 28/144 (1.0s elapsed, 28.2 pairs/s)
+    [1/6] sigma pair 42/144 (1.5s elapsed, 28.2 pairs/s)
+    [1/6] sigma pair 56/144 (2.0s elapsed, 28.2 pairs/s)
+    [1/6] sigma pair 70/144 (2.5s elapsed, 28.1 pairs/s)
+    [1/6] sigma pair 84/144 (3.0s elapsed, 28.0 pairs/s)
+    [1/6] sigma pair 98/144 (3.5s elapsed, 27.9 pairs/s)
+    [1/6] sigma pair 112/144 (4.0s elapsed, 27.8 pairs/s)
+    [1/6] sigma pair 126/144 (4.6s elapsed, 27.5 pairs/s)
+    [1/6] sigma pair 140/144 (5.2s elapsed, 27.1 pairs/s)
+    [1/6] sigma pair 144/144 (5.3s elapsed, 27.0 pairs/s)
+[1/6] baseline=None -> min_sv=0.02259 min_on=0.0001 (run elapsed: 5.3s)
+[2/6] env_odom_noise=0.0 -- starting 144 sigma pairs...
+    [2/6] sigma pair 14/144 (0.5s elapsed, 28.6 pairs/s)
+    [2/6] sigma pair 28/144 (1.0s elapsed, 28.6 pairs/s)
+    [2/6] sigma pair 42/144 (1.5s elapsed, 28.5 pairs/s)
+    [2/6] sigma pair 56/144 (2.0s elapsed, 28.5 pairs/s)
+    [2/6] sigma pair 70/144 (2.5s elapsed, 28.4 pairs/s)
+    [2/6] sigma pair 84/144 (3.0s elapsed, 28.2 pairs/s)
+    [2/6] sigma pair 98/144 (3.5s elapsed, 28.1 pairs/s)
+    [2/6] sigma pair 112/144 (4.0s elapsed, 27.9 pairs/s)
+    [2/6] sigma pair 126/144 (4.6s elapsed, 27.7 pairs/s)
+    [2/6] sigma pair 140/144 (5.1s elapsed, 27.2 pairs/s)
+    [2/6] sigma pair 144/144 (5.3s elapsed, 27.1 pairs/s)
+[2/6] env_odom_noise=0.0 -> min_sv=0.01041 min_on=0.0001 (run elapsed: 10.7s)
+[3/6] env_odom_noise=0.0375 -- starting 144 sigma pairs...
+    [3/6] sigma pair 14/144 (0.5s elapsed, 28.5 pairs/s)
+    [3/6] sigma pair 28/144 (1.0s elapsed, 28.5 pairs/s)
+    [3/6] sigma pair 42/144 (1.5s elapsed, 28.5 pairs/s)
+    [3/6] sigma pair 56/144 (2.0s elapsed, 28.5 pairs/s)
+    [3/6] sigma pair 70/144 (2.5s elapsed, 28.4 pairs/s)
+    [3/6] sigma pair 84/144 (3.0s elapsed, 28.2 pairs/s)
+    [3/6] sigma pair 98/144 (3.5s elapsed, 28.1 pairs/s)
+    [3/6] sigma pair 112/144 (4.0s elapsed, 27.9 pairs/s)
+    [3/6] sigma pair 126/144 (4.6s elapsed, 27.6 pairs/s)
+    [3/6] sigma pair 140/144 (5.1s elapsed, 27.2 pairs/s)
+    [3/6] sigma pair 144/144 (5.3s elapsed, 27.1 pairs/s)
+[3/6] env_odom_noise=0.0375 -> min_sv=0.01041 min_on=0.0001 (run elapsed: 16.0s)
+[4/6] env_odom_noise=0.075 -- starting 144 sigma pairs...
+    [4/6] sigma pair 14/144 (0.5s elapsed, 28.4 pairs/s)
+    [4/6] sigma pair 28/144 (1.0s elapsed, 28.4 pairs/s)
+    [4/6] sigma pair 42/144 (1.5s elapsed, 28.4 pairs/s)
+    [4/6] sigma pair 56/144 (2.0s elapsed, 28.3 pairs/s)
+    [4/6] sigma pair 70/144 (2.5s elapsed, 28.2 pairs/s)
+    [4/6] sigma pair 84/144 (3.0s elapsed, 28.1 pairs/s)
+    [4/6] sigma pair 98/144 (3.5s elapsed, 28.0 pairs/s)
+    [4/6] sigma pair 112/144 (4.0s elapsed, 27.8 pairs/s)
+    [4/6] sigma pair 126/144 (4.6s elapsed, 27.5 pairs/s)
+    [4/6] sigma pair 140/144 (5.2s elapsed, 27.1 pairs/s)
+    [4/6] sigma pair 144/144 (5.3s elapsed, 27.0 pairs/s)
+[4/6] env_odom_noise=0.075 -> min_sv=0.02259 min_on=0.0001 (run elapsed: 21.3s)
+[5/6] env_odom_noise=0.11249999999999999 -- starting 144 sigma pairs...
+    [5/6] sigma pair 14/144 (0.5s elapsed, 28.2 pairs/s)
+    [5/6] sigma pair 28/144 (1.0s elapsed, 28.2 pairs/s)
+    [5/6] sigma pair 42/144 (1.5s elapsed, 28.2 pairs/s)
+    [5/6] sigma pair 56/144 (2.0s elapsed, 28.1 pairs/s)
+    [5/6] sigma pair 70/144 (2.5s elapsed, 28.0 pairs/s)
+    [5/6] sigma pair 84/144 (3.0s elapsed, 27.9 pairs/s)
+    [5/6] sigma pair 98/144 (3.5s elapsed, 27.8 pairs/s)
+    [5/6] sigma pair 112/144 (4.1s elapsed, 27.6 pairs/s)
+    [5/6] sigma pair 126/144 (4.6s elapsed, 27.4 pairs/s)
+    [5/6] sigma pair 140/144 (5.2s elapsed, 27.0 pairs/s)
+    [5/6] sigma pair 144/144 (5.4s elapsed, 26.8 pairs/s)
+[5/6] env_odom_noise=0.11249999999999999 -> min_sv=0.01041 min_on=0.007882 (run elapsed: 26.7s)
+[6/6] env_odom_noise=0.15 -- starting 144 sigma pairs...
+    [6/6] sigma pair 14/144 (0.5s elapsed, 27.8 pairs/s)
+    [6/6] sigma pair 28/144 (1.0s elapsed, 27.8 pairs/s)
+    [6/6] sigma pair 42/144 (1.5s elapsed, 27.8 pairs/s)
+    [6/6] sigma pair 56/144 (2.0s elapsed, 27.7 pairs/s)
+    [6/6] sigma pair 70/144 (2.5s elapsed, 27.7 pairs/s)
+    [6/6] sigma pair 84/144 (3.0s elapsed, 27.6 pairs/s)
+    [6/6] sigma pair 98/144 (3.6s elapsed, 27.5 pairs/s)
+    [6/6] sigma pair 112/144 (4.1s elapsed, 27.3 pairs/s)
+    [6/6] sigma pair 126/144 (4.7s elapsed, 27.1 pairs/s)
+    [6/6] sigma pair 140/144 (5.2s elapsed, 26.7 pairs/s)
+    [6/6] sigma pair 144/144 (5.4s elapsed, 26.6 pairs/s)
+[6/6] env_odom_noise=0.15 -> NO VIABLE PAIR (run elapsed: 32.1s)
+
+wrote 864 detail rows to belief_exp/results/06_seed1_details.csv
+wrote 6 summary rows to belief_exp/results/06_seed1_summary.csv
+total wall time: 32.1s
+
+       sweep_param        sweep_value  min_sigma_visible     min_odom_noise       found_viable
+----------------------------------------------------------------------------------------------
+          baseline               None            0.02259             0.0001               True
+    env_odom_noise                  0            0.01041             0.0001               True
+    env_odom_noise             0.0375            0.01041             0.0001               True
+    env_odom_noise              0.075            0.02259             0.0001               True
+    env_odom_noise             0.1125            0.01041           0.007882               True
+    env_odom_noise               0.15                nan                nan              False

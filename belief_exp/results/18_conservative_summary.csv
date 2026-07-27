@@ -1,0 +1,7 @@
+sweep_param,sweep_value,decay_factor,large_uncertainty,success_radius,env_obs_noise,env_odom_noise,occlusion_mode,p_visible,mean_streak_len,bearing0_deg,range0,dt,min_sigma_visible,min_odom_noise,found_viable,mean_err_visible,mean_err_occluded,calibration_nll,coverage_1sigma,coverage_2sigma,coverage_deviation,mean_final_dist,advance_rate,mean_steps_to_advance,false_advance_rate,n_episodes
+baseline,,0.95,1000.0,0.5,0.1,0.05,markov,0.5,6.0,60.0,10.0,0.5,nan,nan,False,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
+env_odom_noise,0.0,0.95,1000.0,0.5,0.1,0.0,markov,0.5,6.0,60.0,10.0,0.5,nan,nan,False,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
+env_odom_noise,0.0375,0.95,1000.0,0.5,0.1,0.0375,markov,0.5,6.0,60.0,10.0,0.5,nan,nan,False,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
+env_odom_noise,0.075,0.95,1000.0,0.5,0.1,0.075,markov,0.5,6.0,60.0,10.0,0.5,nan,nan,False,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
+env_odom_noise,0.11249999999999999,0.95,1000.0,0.5,0.1,0.11249999999999999,markov,0.5,6.0,60.0,10.0,0.5,nan,nan,False,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
+env_odom_noise,0.15,0.95,1000.0,0.5,0.1,0.15,markov,0.5,6.0,60.0,10.0,0.5,nan,nan,False,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
