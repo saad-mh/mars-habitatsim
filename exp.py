@@ -5,7 +5,7 @@ Run every sigma_min_sweep experiment sequentially.
 
 Run from the repository root:
 
-    conda run -n sam2 python belief_exp/run_all_experiments.py
+    conda run -n sam2 --no-capture-output python exp.py
 
 Outputs are written to
 
@@ -26,11 +26,8 @@ RESULTS.mkdir(parents=True, exist_ok=True)
 PYTHON = sys.executable
 SCRIPT = "belief_exp/sigma_min_sweep.py"
 
-seed = 0
+seed = 30
 
-# ---------------------------------------------------------------------
-# Add, remove or modify experiments here.
-# ---------------------------------------------------------------------
 
 EXPERIMENTS = [
     (
@@ -51,7 +48,7 @@ EXPERIMENTS = [
             "--params",
             "decay_factor,success_radius",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -75,7 +72,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -99,7 +96,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -123,7 +120,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "30",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -136,7 +133,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -145,7 +142,7 @@ EXPERIMENTS = [
             "--params",
             "env_odom_noise",
             "--seed",
-            seed,
+            str(seed),
             "--episodes-per-config",
             "20",
         ],
@@ -162,7 +159,7 @@ EXPERIMENTS = [
             "--max-false-advance-rate",
             "0.05",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -186,7 +183,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -202,7 +199,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            "0",
+            str(seed),
         ],
     ),
     (
@@ -218,7 +215,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -234,7 +231,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -250,7 +247,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -266,7 +263,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -290,7 +287,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "100",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -314,7 +311,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "50",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -332,7 +329,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -348,7 +345,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -365,7 +362,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "30",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -382,7 +379,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "30",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -395,7 +392,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "20",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
     (
@@ -419,7 +416,7 @@ EXPERIMENTS = [
             "--episodes-per-config",
             "200",
             "--seed",
-            seed,
+            str(seed),
         ],
     ),
 ]
@@ -433,9 +430,9 @@ for i, (name, args) in enumerate(EXPERIMENTS, start=1):
     print("=" * 80)
     print(f"[{i}/{len(EXPERIMENTS)}] {name}")
 
-    summary = RESULTS / f"{name}_summary.csv"
-    details = RESULTS / f"{name}_details.csv"
-    logfile = RESULTS / f"{name}.log"
+    summary = RESULTS / f"s{seed}_{name}_summary.csv"
+    details = RESULTS / f"s{seed}_{name}_details.csv"
+    logfile = RESULTS / f"s{seed}_{name}.log"
 
     cmd = [
         PYTHON,
@@ -451,19 +448,27 @@ for i, (name, args) in enumerate(EXPERIMENTS, start=1):
 
     with open(logfile, "w") as log:
 
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            stdout=log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
+
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            log.write(line)
+
+        proc.wait()
 
     elapsed = time.time() - start
 
     if proc.returncode == 0:
-        print(f"✓ Completed in {elapsed:.1f}s")
+        print(f"[cool] Completed in {elapsed:.1f}s")
         passed.append(name)
     else:
-        print(f"✗ FAILED in {elapsed:.1f}s: {proc.returncode}")
+        print(f"[bro] FAILED in {elapsed:.1f}s: err_{proc.returncode}")
         failed.append(name)
 
 print("\n")

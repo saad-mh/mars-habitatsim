@@ -21,10 +21,10 @@ untouched. The continuous speed-caution scaling (strength_sigma_low/high) is a s
 always-on mechanism and stays active.
 
 Smoke test:
-   conda run -n sam2 python belief_exp/sigma_min_sweep.py --episodes-per-config 5  --sigma-visible-grid 1e-3 0.2 4 --odom-noise-grid 1e-3 0.1 4 --other-grid-n 2  --params decay_factor,success_radius
+   conda run -n sam2 --no-capture-output python belief_exp/sigma_min_sweep.py --episodes-per-config 5  --sigma-visible-grid 1e-3 0.2 4 --odom-noise-grid 1e-3 0.1 4 --other-grid-n 2  --params decay_factor,success_radius
 
 Full run (~48 config-points x 144 sigma pairs x 20 episodes):
-    conda run -n sam2 python belief_exp/sigma_min_sweep.py --seed 0
+    conda run -n sam2 --no-capture-output python belief_exp/sigma_min_sweep.py --seed 0
 """
 
 from __future__ import annotations
