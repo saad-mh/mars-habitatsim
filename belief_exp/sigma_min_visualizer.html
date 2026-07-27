@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Sigma-Min Sweep Visualizer</title>
 <style>
-  .viz-root {
+  :root {
     color-scheme: light;
     --surface-1:      #fcfcfb;
     --surface-2:      #f9f9f7;
@@ -22,7 +22,7 @@
     --success-text:   #006300;
   }
   @media (prefers-color-scheme: dark) {
-    :root:where(:not([data-theme="light"])) .viz-root {
+    :root:not([data-theme="light"]) {
       color-scheme: dark;
       --surface-1:      #1a1a19;
       --surface-2:      #0d0d0d;
@@ -39,7 +39,7 @@
       --success-text:   #0ca30c;
     }
   }
-  :root[data-theme="dark"] .viz-root {
+  :root[data-theme="dark"] {
     color-scheme: dark;
     --surface-1:      #1a1a19;
     --surface-2:      #0d0d0d;
