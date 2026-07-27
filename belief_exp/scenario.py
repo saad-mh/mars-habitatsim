@@ -178,8 +178,10 @@ def run_episode(
         log.confidence.append(float(slot.confidence))
         log.visible.append(visible)
 
-        # should_pause = sigma_ale > gate_cfg.sigma_ale_threshold
-        # log.should_pause.append(should_pause)
+        should_pause = (
+            False  # sigma_ale > gate_cfg.sigma_ale_threshold # exchange this later ?
+        )
+        log.should_pause.append(should_pause)
 
         if bool(status["advanced"]):
             log.advanced = True
