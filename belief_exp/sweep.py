@@ -210,7 +210,7 @@ def main() -> None:
         if args.out
         else Path(__file__).resolve().parent
         / "results"
-        / (f"sweep_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv")
+        / (f"sweep_{datetime.datetime.now():%y%m%d_%H%M%S}.csv")
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
