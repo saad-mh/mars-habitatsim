@@ -33,6 +33,10 @@ class RouteManager:
             raise RuntimeError("route is finished; there is no active goal")
         return self.route[self.k]
 
+    def append(self, goal_id: str) -> None:
+        """Grow the route at runtime, e.g. as new goals are discovered mid-episode."""
+        self.route.append(goal_id)
+
     def update(self, robot_position: Sequence[float], belief_bank: Any) -> Dict[str, Any]:
         """Advance the route pointer if the active belief is within radius.
 

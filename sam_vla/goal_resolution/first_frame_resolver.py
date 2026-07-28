@@ -38,6 +38,14 @@ def resolve_verbose(rgb: np.ndarray) -> tuple[GoalSpec, dict, list[Detection]]:
     return goal_spec, vlm_result, detections
 
 
+def resolve_obstacles(rgb: np.ndarray) -> list[Detection]:
+    """Just the SAM2+adapter detection half of resolve(), factored out for the
+    multi-goal path: there, goals come from SAM3+CLIP instead, so every
+    detection here is treated as an obstacle rather than one being picked out
+    as the goal by Qwen."""
+    return _detect(rgb)
+
+
 def resolve_from_path(image_path: str) -> GoalSpec:
     # PIL, to match qwen_client's own __main__ image loading convention.
     rgb = np.array(Image.open(image_path).convert("RGB"))

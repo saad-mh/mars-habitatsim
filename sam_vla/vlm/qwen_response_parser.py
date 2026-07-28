@@ -35,6 +35,31 @@ def parse_select_goal_response(raw_text: str) -> dict:
     return parsed
 
 
+def parse_goal_vocabulary_response(raw_text: str) -> dict:
+    """Parse a build_goal_vocabulary_prompt response: a non-empty list of
+    non-empty string terms plus an instruction sentence."""
+    parsed = _load_json_object(raw_text)
+
+    terms = parsed.get("terms")
+    if not isinstance(terms, list) or not terms:
+        raise ValueError(
+            f"Missing or empty 'terms' list in response\nraw_text={raw_text!r}"
+        )
+    for term in terms:
+        if not isinstance(term, str) or not term.strip():
+            raise ValueError(
+                f"'terms' must be a list of non-empty strings\nraw_text={raw_text!r}"
+            )
+
+    instruction_text = parsed.get("instruction_text")
+    if not isinstance(instruction_text, str) or not instruction_text.strip():
+        raise ValueError(
+            f"Missing or non-string 'instruction_text' in response\nraw_text={raw_text!r}"
+        )
+
+    return parsed
+
+
 DIRECTIONS = ("forward", "turn_left", "turn_right")
 
 

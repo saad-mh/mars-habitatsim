@@ -26,6 +26,30 @@ def build_select_goal_prompt(detections: list[dict]) -> str:
     )
 
 
+def build_goal_vocabulary_prompt() -> str:
+    """For the multi-goal path: instead of picking one detection as the goal,
+    Qwen describes a small open-vocabulary set of goal-worthy object terms
+    visible in the scene (fed to SAM3's per-term text prompting and CLIP's
+    text-embedding bank) plus one instruction sentence covering all of them."""
+    return (
+        "You are the vision system for a Mars rover. The image shows the "
+        "rover's current camera view. The rover will visit multiple "
+        "goal-worthy objects in this scene over the course of the episode, "
+        "not just one.\n\n"
+        "List a small set of short, visually distinct object terms (2-4 "
+        "terms) describing the categories of rocks or other objects in this "
+        "scene that would make good navigation targets, e.g. \"small rock\" "
+        "vs \"big rock\" if there is a clear size distinction, or terms "
+        "based on shape/color if that better separates the objects you see. "
+        "Also give one instruction sentence describing the rover's overall "
+        "task across all of them.\n\n"
+        "Respond with ONLY a JSON object in this exact format, no other "
+        "text:\n"
+        '{"terms": [<str>, ...], "instruction_text": <str>, '
+        '"reasoning": <str, brief explanation>}'
+    )
+
+
 def build_drive_action_prompt(instruction_text: str, frame_idx: int) -> str:
     return (
         "You are the driving policy for a Mars rover. The image is the "

@@ -3,6 +3,8 @@ import math
 import time, datetime
 from pathlib import Path
 
+import numpy as np
+
 from sam_vla.env.habitat_env import HFOV_DEG, MarsHabitatEnv
 from sam_vla.env.sim_utils import distance_to_goal
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
@@ -20,7 +22,7 @@ from sam_vla.core.goal_geometry import (
     mask_pixel_center,
 )
 from sam_vla.core.pose_integrator import integrate_mars
-from sam_vla.core.types import Action
+from sam_vla.core.types import Action, GoalSpec
 from sam_vla.logging.rollout_logger import RolloutLogger
 from sam_vla.perception.semantic_overlay import overlay_semantic_masks
 
@@ -40,6 +42,98 @@ def register_goal_obstacle_masks(env, obs0, goal_spec, goal_position, obj_mask_r
             print(f"[WARN] obstacle[{i}] bbox had no valid depth; skipping obstacle mask", flush=True)
             continue
         env.register_object_mask(obstacle_position, MESH_OBST_ID, obj_mask_radius, out_dir, f"obstacle_{i}")
+
+
+def register_obstacle_masks_only(env, obs0, obstacle_bboxes_norm, obj_mask_radius, out_dir):
+    """Same obstacle-registration body as register_goal_obstacle_masks, minus the
+    goal-mesh half -- used by the multi-goal path, where goals come from live
+    SAM3+CLIP instead of a fixed first-frame bbox, so there's no single
+    goal_position to register a goal mesh for."""
+    for i, obstacle_bbox in enumerate(obstacle_bboxes_norm):
+        obstacle_position = bbox_to_world(obs0, obstacle_bbox, hfov_deg=HFOV_DEG)
+        if obstacle_position is None:
+            print(f"[WARN] obstacle[{i}] bbox had no valid depth; skipping obstacle mask", flush=True)
+            continue
+        env.register_object_mask(obstacle_position, MESH_OBST_ID, obj_mask_radius, out_dir, f"obstacle_{i}")
+
+
+def _body_odom_from_poses(prev_pose, cur_pose):
+    """Realized motion from prev_pose to cur_pose as [forward, left, dtheta] in
+    prev_pose's body frame -- the inverse of pose_integrator.integrate_mars's
+    world-frame projection, same yaw/forward/right convention (see its
+    docstring). Feeds SubgoalBeliefBank.update's odom_delta with already-
+    realized motion (mirroring navdp.deploy.multi_target_runner's pose-diff
+    convention) rather than a forward-looking guess from the not-yet-decided
+    action."""
+    x0, z0, yaw0 = prev_pose
+    x1, z1, yaw1 = cur_pose
+    dx_world = x1 - x0
+    dz_world = z1 - z0
+    cos_yaw, sin_yaw = math.cos(yaw0), math.sin(yaw0)
+    forward = dx_world * cos_yaw + dz_world * sin_yaw
+    right = dx_world * sin_yaw - dz_world * cos_yaw
+    dtheta = (yaw1 - yaw0 + math.pi) % (2.0 * math.pi) - math.pi
+    return [forward, -right, dtheta]
+
+
+def _multi_goal_resegment(
+    sam3_tracker,
+    clip_classifier,
+    multi_goal_spec,
+    route,
+    last_known_masks,
+    rgb,
+    step,
+    clip_goal_thresh,
+    clip_reid_thresh,
+    max_goals,
+):
+    """One periodic SAM3+CLIP cycle: push the live frame, resegment, classify
+    and re-ID each returned mask -- minting a new TrackedGoal (and appending it
+    to the route) the first time a physical object clears clip_goal_thresh and
+    doesn't match an already-tracked goal's embedding. Returns {goal_id: mask}
+    for this cycle, fed to SAMDepthTargetExtractor for the belief-bank update."""
+    from sam_vla.core.types import TrackedGoal
+
+    sam3_tracker.push_frame(rgb)
+    raw_masks = sam3_tracker.resegment(step)
+
+    goal_masks: dict[str, np.ndarray] = {}
+    for mask in raw_masks.values():
+        ys, xs = np.nonzero(mask)
+        if ys.size == 0:
+            continue
+        crop = rgb[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+        category, score, embedding = clip_classifier.classify(crop)
+        if score < clip_goal_thresh:
+            continue
+
+        goal_id = clip_classifier.match_or_mint(embedding, multi_goal_spec.goals, clip_reid_thresh)
+        if goal_id not in multi_goal_spec.goals:
+            if len(multi_goal_spec.goals) >= max_goals:
+                continue
+            height, width = rgb.shape[:2]
+            bbox_norm = (
+                float(xs.min()) / width,
+                float(ys.min()) / height,
+                float(xs.max() + 1) / width,
+                float(ys.max() + 1) / height,
+            )
+            multi_goal_spec.goals[goal_id] = TrackedGoal(
+                goal_id=goal_id,
+                category=category,
+                clip_embedding=embedding,
+                clip_score=score,
+                first_seen_step=step,
+                bbox_norm=bbox_norm,
+            )
+            route.append(goal_id)
+            print(f"[multi-goal] minted goal {goal_id} category={category!r} score={score:.3f}", flush=True)
+
+        goal_masks[goal_id] = mask
+        last_known_masks[goal_id] = mask
+
+    return goal_masks
 
 
 def run(
@@ -83,6 +177,15 @@ def run(
     lost_goal_turn_kp: float = 1.4,
     lost_goal_forward: float = 0.0,
     lost_goal_bearing_deg: float = 30.0,
+    multi_goal: bool = False,
+    seg_interval_steps: int = 13,
+    sam3_window_frames: int = 5,
+    sam3_checkpoint: str = None,
+    clip_goal_thresh: float = 0.24,
+    clip_reid_thresh: float = 0.9,
+    goal_vocab: str = None,
+    stop_on_route_finished: bool = True,
+    max_goals: int = 8,
 ) -> None:
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -104,12 +207,52 @@ def run(
         rock_field_path=rock_field_path,
     ) as env:
         obs0 = env.get_observation(frame_idx=0)
-        goal_spec, goal_vlm_result, sam_detections = first_frame_resolver.resolve_verbose(obs0.rgb)
-        goal_position = backproject_goal_position(obs0, goal_spec, hfov_deg=HFOV_DEG)
-        logger.log_goal_resolution(goal_spec, goal_vlm_result, goal_position)
-        logger.save_sam_first_frame(obs0.rgb, sam_detections, goal_spec, out_dir)
-        print(f"resolved goal_spec: {goal_spec.instruction_text} | goal_position={goal_position}")
-        register_goal_obstacle_masks(env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir)
+
+        # multi-goal state -- left None on the (default) single-goal path, which
+        # takes the exact same code path as before this feature existed.
+        goal_spec = None
+        goal_position = None
+        multi_goal_spec = bank = route = sam3_tracker = clip_classifier = target_extractor = None
+        last_known_masks: dict = {}
+        prev_body_pose = (obs0.pose.x, obs0.pose.z, obs0.pose.yaw)
+
+        if multi_goal:
+            from navdp.extensions import RouteManager, SAMDepthTargetExtractor, SubgoalBeliefBank
+
+            from sam_vla.core.types import MultiGoalSpec
+            from sam_vla.goal_resolution import goal_vocabulary_resolver
+            from sam_vla.goal_resolution.first_frame_resolver import resolve_obstacles
+            from sam_vla.perception.clip_goal_classifier import ClipGoalClassifier
+            from sam_vla.perception.sam3_goal_tracker import Sam3GoalTracker
+
+            cli_vocab = [t.strip() for t in goal_vocab.split(",") if t.strip()] if goal_vocab else None
+            vocab_terms, instruction_text = goal_vocabulary_resolver.resolve_goal_vocabulary(
+                obs0.rgb, cli_vocab, use_qwen=cli_vocab is None
+            )
+            obstacle_detections = resolve_obstacles(obs0.rgb)
+            obstacle_bboxes = [d.bbox_norm for d in obstacle_detections]
+            register_obstacle_masks_only(env, obs0, obstacle_bboxes, obj_mask_radius, out_dir)
+
+            sam3_tracker = Sam3GoalTracker(
+                vocab_terms=vocab_terms, window_frames=sam3_window_frames, checkpoint_path=sam3_checkpoint,
+            )
+            clip_classifier = ClipGoalClassifier(goal_vocabulary=vocab_terms)
+            height0, width0 = obs0.rgb.shape[:2]
+            target_extractor = SAMDepthTargetExtractor(intrinsics_from_hfov(height0, width0, HFOV_DEG))
+            multi_goal_spec = MultiGoalSpec(
+                goals={}, route=[], obstacle_bboxes_norm=obstacle_bboxes,
+                instruction_text=instruction_text, goal_vocabulary=vocab_terms,
+            )
+            bank = SubgoalBeliefBank(goal_ids=[])
+            route = RouteManager(route=[])
+            print(f"[multi-goal] vocabulary={vocab_terms} instruction={instruction_text!r}", flush=True)
+        else:
+            goal_spec, goal_vlm_result, sam_detections = first_frame_resolver.resolve_verbose(obs0.rgb)
+            goal_position = backproject_goal_position(obs0, goal_spec, hfov_deg=HFOV_DEG)
+            logger.log_goal_resolution(goal_spec, goal_vlm_result, goal_position)
+            logger.save_sam_first_frame(obs0.rgb, sam_detections, goal_spec, out_dir)
+            print(f"resolved goal_spec: {goal_spec.instruction_text} | goal_position={goal_position}")
+            register_goal_obstacle_masks(env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir)
 
         # <-- policy plugged in here: NavdpPolicy replaces QwenDiscreteDirectionPolicy.
         # Same act_verbose(..., goal_spec, step) -> (Action, dict) shape as the VLA
@@ -124,9 +267,11 @@ def run(
         # Belief-goal tracking: re-seed a body-frame [forward, left] estimate of the
         # goal from the live rendered mask whenever it's visible, dead-reckon it by
         # odometry the rest of the time -- ported from rollout_navdp_policy.py's
-        # mesh_tracking_mode. avoidance is None unless --cbf is passed (constructed
-        # after NavdpPolicy so navdp.extensions is importable -- see its docstring).
-        belief_tracker = BeliefGoalTracker(
+        # mesh_tracking_mode. In multi-goal mode the real SubgoalBeliefBank (built
+        # above) plays this role per-goal instead. avoidance is None unless --cbf
+        # is passed (constructed after NavdpPolicy so navdp.extensions is
+        # importable -- see its docstring).
+        belief_tracker = None if multi_goal else BeliefGoalTracker(
             hfov_deg=HFOV_DEG, goal_range=belief_goal_range, min_px=lost_goal_min_px,
             odom_noise=belief_odom_noise,
         )
@@ -146,13 +291,57 @@ def run(
         for step in range(max_steps):
             obs = env.get_observation(frame_idx=step)
             semantic = env.get_semantic_frame()
-            raw_action, vla_result = policy.act_verbose(obs, semantic, goal_spec, step)
+
+            active_goal_id = None
+            active_slot = None
+            if multi_goal:
+                goal_masks = {}
+                if step % seg_interval_steps == 0:
+                    goal_masks = _multi_goal_resegment(
+                        sam3_tracker, clip_classifier, multi_goal_spec, route, last_known_masks,
+                        obs.rgb, step, clip_goal_thresh, clip_reid_thresh, max_goals,
+                    )
+                obs_extract = target_extractor.extract(goal_masks, obs.depth) if goal_masks else {}
+                observations = {
+                    gid: obs_extract.get(gid, {"visible": False, "position": None, "confidence": 0.0})
+                    for gid in multi_goal_spec.goals
+                }
+                cur_body_pose = (obs.pose.x, obs.pose.z, obs.pose.yaw)
+                odom_delta = _body_odom_from_poses(prev_body_pose, cur_body_pose)
+                prev_body_pose = cur_body_pose
+                bank.update(observations, odom_delta=odom_delta, step=step)
+                route.update(robot_position=[0.0, 0.0], belief_bank=bank)
+
+                if not route.is_finished():
+                    active_goal_id = route.get_active_goal()
+                    active_slot = bank.get(active_goal_id)
+                goal_visible = bool(active_slot.visible) if active_slot is not None else False
+                goal_bearing = (
+                    math.atan2(float(active_slot.mu[1]), float(active_slot.mu[0]))
+                    if (active_slot is not None and active_slot.initialized)
+                    else None
+                )
+
+                semantic_render = semantic.copy()
+                active_mask = last_known_masks.get(active_goal_id) if active_goal_id else None
+                if active_mask is not None:
+                    semantic_render[active_mask] = MESH_GOAL_ID
+                goal_spec_for_policy = GoalSpec(
+                    goal_bbox_norm=(0.0, 0.0, 1.0, 1.0), obstacle_bboxes_norm=[],
+                    instruction_text=multi_goal_spec.instruction_text,
+                )
+            else:
+                semantic_render = semantic
+                goal_spec_for_policy = goal_spec
+
+            raw_action, vla_result = policy.act_verbose(obs, semantic_render, goal_spec_for_policy, step)
             action = safety_filter_fn(raw_action, obs)
 
-            goal_mask = (semantic == MESH_GOAL_ID).astype("uint8") * 255
-            obstacle_mask = (semantic == MESH_OBST_ID).astype("uint8") * 255
-            goal_visible = belief_tracker.observe(goal_mask, obs.depth)
-            goal_bearing = belief_tracker.bearing()
+            goal_mask = (semantic_render == MESH_GOAL_ID).astype("uint8") * 255
+            obstacle_mask = (semantic_render == MESH_OBST_ID).astype("uint8") * 255
+            if not multi_goal:
+                goal_visible = belief_tracker.observe(goal_mask, obs.depth)
+                goal_bearing = belief_tracker.bearing()
 
             obstacle_point = None
             if avoidance is not None:
@@ -182,7 +371,8 @@ def run(
 
             new_pose = integrate_mars(obs.pose, action, dt)
             env.step(new_pose)
-            belief_tracker.propagate(action, dt)
+            if not multi_goal:
+                belief_tracker.propagate(action, dt)
 
             dist = (
                 distance_to_goal(new_pose, goal_position)
@@ -194,22 +384,39 @@ def run(
                 f"t={step} dist={dist_txt} "
                 f"v=[{action.v_fwd:.2f},{action.v_lat:.2f}] yaw_rate={action.yaw_rate:.2f}"
             )
-            vis_rgb = overlay_semantic_masks(obs.rgb, semantic, text=overlay_text)
-            vla_result = {
-                **vla_result,
-                "belief_forward": None if belief_tracker.belief_g is None else float(belief_tracker.belief_g[0]),
-                "belief_left": None if belief_tracker.belief_g is None else float(belief_tracker.belief_g[1]),
-                "goal_visible": goal_visible,
-                **cbf_info,
-            }
+            vis_rgb = overlay_semantic_masks(obs.rgb, semantic_render, text=overlay_text)
+            if multi_goal:
+                vla_result = {
+                    **vla_result,
+                    "belief_forward": None if active_slot is None else float(active_slot.mu[0]),
+                    "belief_left": None if active_slot is None else float(active_slot.mu[1]),
+                    "goal_visible": goal_visible,
+                    "active_goal_id": active_goal_id,
+                    "route_index": route.get_route_index(),
+                    "num_goals": len(multi_goal_spec.goals),
+                    **cbf_info,
+                }
+            else:
+                vla_result = {
+                    **vla_result,
+                    "belief_forward": None if belief_tracker.belief_g is None else float(belief_tracker.belief_g[0]),
+                    "belief_left": None if belief_tracker.belief_g is None else float(belief_tracker.belief_g[1]),
+                    "goal_visible": goal_visible,
+                    **cbf_info,
+                }
             logger.log_step(obs, action, new_pose, vla_result=vla_result, vis_rgb=vis_rgb)
 
             if step % 10 == 0:
                 goal_pixel = mask_pixel_center(goal_mask)
+                extra = f" active_goal={active_goal_id}" if multi_goal else ""
                 print(
                     f"[traj] step={step} | distance_to_goal={dist} | "
-                    f"goal_pixel={goal_pixel} | action={action}"
+                    f"goal_pixel={goal_pixel} | action={action}{extra}"
                 )
+
+            if multi_goal and stop_on_route_finished and multi_goal_spec.goals and route.is_finished():
+                print(f"[multi-goal] route finished at step={step}", flush=True)
+                break
 
         if avoidance is not None:
             print(f"[CBF diag] blocked_steps={cbf_active_steps} hard_gate_fired={hard_gate_fired_steps}", flush=True)
@@ -281,6 +488,26 @@ if __name__ == "__main__":
     parser.add_argument("--lost-goal-turn-kp", type=float, default=1.4)
     parser.add_argument("--lost-goal-forward", type=float, default=0.0, help="forward speed floor while the goal is fully out of view (pivot recovery)")
     parser.add_argument("--lost-goal-bearing-deg", type=float, default=30.0, help="engage heading assist once |goal bearing| exceeds this angle; 0 disables the angle trigger")
+    parser.add_argument(
+        "--multi-goal",
+        action="store_true",
+        help="Discover multiple goals via periodic SAM3 segmentation + per-mask CLIP instead of "
+        "resolving one goal from the first frame. Additive: unset, behavior is unchanged.",
+    )
+    parser.add_argument(
+        "--seg-interval-steps",
+        type=int,
+        default=13,
+        help="how often (in steps) to re-run the SAM3 batched-re-window resegment cycle; default "
+        "picked from bench_sam3_window.py at --sam3-window-frames=5, dt=0.1 (~1.3s cadence)",
+    )
+    parser.add_argument("--sam3-window-frames", type=int, default=5, help="ring-buffer size for the SAM3 batched-re-window cycle")
+    parser.add_argument("--sam3-checkpoint", default=None, help="Path to a local SAM3.1 checkpoint (default: download from HF)")
+    parser.add_argument("--clip-goal-thresh", type=float, default=0.24, help="min CLIP cosine similarity to accept a mask as goal-worthy; calibrate via calibrate_clip_stock_scene.py")
+    parser.add_argument("--clip-reid-thresh", type=float, default=0.9, help="min CLIP cosine similarity to re-identify a mask as an already-tracked goal rather than minting a new one")
+    parser.add_argument("--goal-vocab", default=None, help="comma-separated goal vocabulary terms; bypasses Qwen's describe_goal_vocabulary call when given")
+    parser.add_argument("--stop-on-route-finished", action=argparse.BooleanOptionalAction, default=True, help="end the episode once every discovered goal has been visited")
+    parser.add_argument("--max-goals", type=int, default=8, help="cap on simultaneously tracked goals in the multi-goal path")
     args = parser.parse_args()
 
     run(
@@ -324,4 +551,13 @@ if __name__ == "__main__":
         lost_goal_turn_kp=args.lost_goal_turn_kp,
         lost_goal_forward=args.lost_goal_forward,
         lost_goal_bearing_deg=args.lost_goal_bearing_deg,
+        multi_goal=args.multi_goal,
+        seg_interval_steps=args.seg_interval_steps,
+        sam3_window_frames=args.sam3_window_frames,
+        sam3_checkpoint=args.sam3_checkpoint,
+        clip_goal_thresh=args.clip_goal_thresh,
+        clip_reid_thresh=args.clip_reid_thresh,
+        goal_vocab=args.goal_vocab,
+        stop_on_route_finished=args.stop_on_route_finished,
+        max_goals=args.max_goals,
     )

@@ -16,11 +16,13 @@ from sam_vla.vlm.qwen_model_runner import load_qwen_model, run_qwen_inference
 from sam_vla.vlm.qwen_prompts import (
     build_direction_prompt,
     build_drive_action_prompt,
+    build_goal_vocabulary_prompt,
     build_select_goal_prompt,
 )
 from sam_vla.vlm.qwen_response_parser import (
     parse_direction_response,
     parse_drive_action_response,
+    parse_goal_vocabulary_response,
     parse_select_goal_response,
 )
 
@@ -67,6 +69,14 @@ def _handle_select_goal(model, processor, payload: dict) -> dict:
     return {"result": result}
 
 
+def _handle_describe_goal_vocabulary(model, processor, payload: dict) -> dict:
+    image = _decode_image(payload["image_b64"])
+    prompt = build_goal_vocabulary_prompt()
+    raw_text = run_qwen_inference(model, processor, image, prompt)
+    result = parse_goal_vocabulary_response(raw_text)
+    return {"result": result}
+
+
 def _handle_drive_action(model, processor, payload: dict) -> dict:
     image = _decode_image(payload["image_b64"])
     instruction_text = payload["instruction_text"]
@@ -104,6 +114,8 @@ def _dispatch(model, processor, message: dict) -> dict:
         return {"status": "ok"}
     if mode == "select_goal":
         return _handle_select_goal(model, processor, payload)
+    if mode == "describe_goal_vocabulary":
+        return _handle_describe_goal_vocabulary(model, processor, payload)
     if mode == "drive_action":
         return _handle_drive_action(model, processor, payload)
     if mode == "drive_direction":

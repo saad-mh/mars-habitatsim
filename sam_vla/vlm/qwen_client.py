@@ -102,6 +102,18 @@ def select_goal_verbose(rgb: np.ndarray, detections: list[Detection]) -> tuple[G
     return _goal_spec_from_result(result, detections), result
 
 
+def describe_goal_vocabulary(rgb: np.ndarray) -> tuple[list[str], str]:
+    """Multi-goal-path counterpart to select_goal: instead of picking one
+    detection as the goal, asks Qwen for a small open-vocabulary set of
+    goal-worthy terms (seeds SAM3's per-term prompts and CLIP's text bank)
+    plus one instruction sentence covering all of them."""
+    response = _send_request("describe_goal_vocabulary", {"image_b64": _encode_image(rgb)})
+    if "error" in response:
+        raise ValueError(f"describe_goal_vocabulary failed: {response['error']}")
+    result = response["result"]
+    return result["terms"], result["instruction_text"]
+
+
 def _drive_action_result(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> dict:
     response = _send_request(
         "drive_action",

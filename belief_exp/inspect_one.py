@@ -14,7 +14,38 @@ import argparse
 import numpy as np
 
 from metrics import compute_metrics
+from multi_goal_metrics import compute_multi_goal_metrics
+from multi_goal_scenario import run_multi_episode
 from scenario import BankConfig, EnvConfig, GateConfig, RouteConfig, run_episode
+
+
+def print_multi_trace(log) -> None:
+    """Per-goal mu/Sigma/confidence trace plus a route advance-step timeline,
+    the multi-goal analogue of print_trace."""
+    header = f"{'t':>3}  {'active':>8}  " + "  ".join(
+        f"{gid + '(vis,err,conf)':>28}" for gid in log.route_order
+    )
+    print(header)
+    print("-" * len(header))
+    for i in range(len(log.t)):
+        row = [f"{log.t[i]:>3}", f"{(log.active_goal_id[i] or '-'):>8}"]
+        for gid in log.route_order:
+            mu = log.mu[i][gid]
+            tg = log.true_goals[i][gid]
+            err = float(np.linalg.norm(mu - tg))
+            vis = "Y" if log.visible[i][gid] else "."
+            conf = log.confidence[i][gid]
+            row.append(f"{vis:>3} err={err:>6.2f} conf={conf:>4.2f}".rjust(28))
+        print("  ".join(row))
+
+    print(f"\nroute_order: {log.route_order}")
+    if log.finished:
+        print(f"route finished; final_route_index={log.final_route_index}/{len(log.route_order)}")
+    else:
+        print(f"route NOT finished within max_steps; final_route_index={log.final_route_index}/{len(log.route_order)}")
+    for gid in log.route_order:
+        step = log.advance_steps.get(gid)
+        print(f"  {gid}: {'advanced at step ' + str(step) if step is not None else 'never reached'}")
 
 
 def print_trace(log) -> None:
@@ -73,6 +104,13 @@ def main() -> None:
         help="episodes to run; only the first is traced",
     )
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--multi-goal",
+        action="store_true",
+        help="run multi_goal_scenario.run_multi_episode (N goals, fixed visiting order) "
+        "instead of the single-goal scenario.run_episode",
+    )
+    ap.add_argument("--n-goals", type=int, default=3, help="--multi-goal only: number of goals in the route")
     args = ap.parse_args()
 
     bank_cfg = BankConfig(
@@ -94,6 +132,22 @@ def main() -> None:
         mean_streak_len=args.mean_streak_len,
         dt=args.dt,
     )
+
+    if args.multi_goal:
+        logs = [
+            run_multi_episode(
+                bank_cfg, route_cfg, env_cfg, gate_cfg,
+                np.random.default_rng(args.seed + i), n_goals=args.n_goals, max_steps=args.max_steps,
+            )
+            for i in range(args.episodes)
+        ]
+        print_multi_trace(logs[0])
+
+        metrics = compute_multi_goal_metrics(logs)
+        print(f"\nmetrics over {args.episodes} episode(s):")
+        for k, v in metrics.items():
+            print(f"  {k:>22} = {v:.4f}")
+        return
 
     logs = [
         run_episode(
