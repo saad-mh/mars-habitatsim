@@ -20,13 +20,22 @@ import subprocess
 import time
 import sys
 
+prev = time.time()
+
 RESULTS = Path("belief_exp/results")
 RESULTS.mkdir(parents=True, exist_ok=True)
 
 PYTHON = sys.executable
 SCRIPT = "belief_exp/sigma_min_sweep.py"
 
-seed = 30
+seed = 10
+
+
+def calculate_time(now):
+    elapsed = now - prev
+    hours, rem = divmod(elapsed, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
 
 
 EXPERIMENTS = [
@@ -436,6 +445,7 @@ for i, (name, args) in enumerate(EXPERIMENTS, start=1):
 
     cmd = [
         PYTHON,
+        "-u",
         SCRIPT,
         *args,
         "--out-summary",
@@ -476,7 +486,7 @@ for i, (name, args) in enumerate(EXPERIMENTS, start=1):
 
 print("\n")
 print("=" * 80)
-print("Finished.")
+print(f"Finished. in {calculate_time(time.time())}")
 print(f"Passed : {len(passed)}")
 print(f"Failed : {len(failed)}")
 
