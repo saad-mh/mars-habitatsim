@@ -460,6 +460,9 @@ for i, (name, args) in enumerate(EXPERIMENTS, start=1):
             sys.stdout.write(line)
             log.write(line)
 
+        proc.stdin.close()
+        proc.stdout.close()
+        proc.stderr.close()
         proc.wait()
 
     elapsed = time.time() - start
