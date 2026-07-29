@@ -96,9 +96,10 @@ WORK_DIR="$(mktemp -d /tmp/calib_clip_stock_scene.XXXXXX)"
 ANNOTATED_DIR="$WORK_DIR/annotated"
 
 cleanup() {
-  if [[ -z "$SAVE_FRAMES_DIR" ]]; then
-    rm -rf "$WORK_DIR"
-  fi
+  # WORK_DIR is always scratch: when --save-frames is given, the copy into
+  # SAVE_FRAMES_DIR already happened earlier in the script body, before this
+  # EXIT trap fires -- so the tmp copy is redundant and always removed.
+  rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 
