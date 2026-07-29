@@ -1,9 +1,149 @@
-1. Next stage is to have multiple goals.
-2. Current implementation takes in one goal from the first frame, remembers and tracks it using belief.
-3. For the next part, firstly, run segmentation model every second(or some set length), and per segmentation mark, run a clip
+# Manual Mesh Segmentation → Synthetic Dataset Pipeline
 
-### References
+## Context
 
-The plan is approved and saved to /home/gpu/.claude/plans/formulate-the-plan-next-md-stateless-thimble.md.this is a large, multi-file change touching a live production pipeline plus two new dependencies (SAM3, CLIP).
+Part of the `sam_vla` Mars rover autonomy pipeline. Goal: generate a labeled
+segmentation dataset (RGB frame ↔ per-pixel category mask) directly from
+simulation ground-truth geometry, instead of manual pixel annotation.
 
-A sensible starting point per the plan would be the SAM3 "batched re-window" spike (sam_vla/perception/bench_sam3_window.py) since it's the biggest confirmed integration risk — everything else is lower-risk, mostly-additive wiring. Let me know when/how you'd like to proceed (e.g. start with the spike, start with the belief_exp synthetic side since it has no GPU-pipeline risk, or something else).
+Terrain meshes are manually divided into category groups by a human (mentor's
+requirement — auto-segmentation of natural rock/terrain is unreliable). Each
+divided sub-mesh gets a convex hull, which **defines the mask boundary**
+directly (not just a physics/collision proxy). Hull overshoot on jagged
+rocks is accepted as small label noise, to be handled at a later cleanup
+stage — not solved at generation time.
+
+Categories (up to 4, TBD which are actually used):
+
+- small_rock
+- big_rock
+- bedrock
+- hole_in_ground
+
+---
+
+## Pipeline Steps
+
+### 1. Manual mesh division + convex hull authoring
+
+- Cut the terrain/scene mesh into disjoint sub-meshes along category
+  boundaries (Blender or in-engine editor).
+- Compute a convex hull per sub-mesh. This hull **is** the mask boundary —
+  not just used for raycast/collision simplification.
+- Keep each category's pieces as separate objects, not one merged mesh —
+  per-object mesh IDs are required downstream.
+- Accept that hulls overshoot jagged/irregular rocks slightly. This is
+  fine — treat as label noise, not a blocker.
+
+### 2. Mesh ID → category registry
+
+- Assign a stable unique `mesh_id` to every sub-mesh at import/build time.
+  Do not rely on engine-runtime instance IDs alone if they aren't stable
+  across reloads — assign your own persistent ID and store it as
+  metadata/custom property on the mesh object if the engine supports it.
+- Maintain a standalone JSON registry, decoupled from the sim scene file,
+  so it survives re-exports:
+
+```json
+{
+  "mesh_id_map": {
+    "1024": { "category": "small_rock", "name": "rock_cluster_A_03" },
+    "1025": { "category": "bedrock", "name": "bedrock_slab_01" },
+    "1026": { "category": "hole_in_ground", "name": "crater_02" }
+  }
+}
+```
+
+### 3. Per-frame ground truth extraction
+
+Two approaches — pick based on engine support (Habitat-Sim likely supports
+approach B natively via its semantic sensor; confirm before committing):
+
+**A. Raycast-based**
+
+- Cast a ray per pixel (or sampled grid) from camera through scene per
+  captured frame.
+- Each hit resolves to a `mesh_id` → look up category → paint mask.
+- Cost: expensive at full pixel density; best used offline per recorded
+  frame, or for sparse validation (e.g. "what did the rover's forward
+  ray hit"), not as the primary dense-mask method.
+
+**B. Instance/semantic buffer rendering (preferred for dense masks)**
+
+- Render an instance-ID buffer alongside RGB in the same pass (rasterized,
+  not per-pixel raycast) — each pixel encodes the mesh ID directly.
+- Vectorized lookup through `mesh_id_map` → category mask. Much cheaper
+  than raycasting per pixel, exact edges.
+- **Action item:** check whether Habitat-Sim's semantic sensor already
+  outputs this directly — likely yes, since it's built for this exact
+  use case. If so, skip building custom raycast-per-pixel infra entirely.
+
+**Suggested split:** use B for dense per-frame masks, A only for sparse
+runtime validation/interaction checks (reuse whatever raycast infra
+already exists for the CBF safety layer / obstacle detection, rather than
+building a second raycast system just for this).
+
+### 4. Frame ↔ mesh ↔ category record
+
+Emit one record per captured frame, structurally similar to the existing
+`EpisodeLogger` JSONL pattern — reuse that infra instead of building a
+parallel logging system:
+
+```json
+{
+  "frame_id": "ep003_00042",
+  "rgb_path": "frames/ep003_00042.png",
+  "instance_mask_path": "masks/ep003_00042_instance.png",
+  "objects": [
+    {"mesh_id": 1024, "category": "small_rock", "pixel_count": 812, "bbox": [x, y, w, h]},
+    {"mesh_id": 1026, "category": "hole_in_ground", "pixel_count": 3021, "bbox": [x, y, w, h]}
+  ],
+  "camera_pose": {"...": "..."}
+}
+```
+
+### 5. Mask / dataset export
+
+- Collapse instance mask → category mask (N classes + background) via the
+  `mesh_id_map` lookup. This is the actual training target.
+- Export in a standard format rather than a bespoke loader:
+  - COCO-style instance/panoptic JSON, **or**
+  - Plain PNG category masks (simplest; compatible with torchvision,
+    mmsegmentation, etc.)
+- Keep the instance-level mask in addition to the category mask — cheap to
+  store now, useful later if instance segmentation (not just semantic) is
+  ever needed. Don't discard it after collapsing to category.
+
+### 6. Sanity checks before scaling up
+
+- Manually spot-check ~20 frames: does the projected mask actually align
+  with the RGB rock silhouette?
+- Check class imbalance early — bedrock/ground will dominate pixel count
+  vs. small rocks. This matters for loss weighting at training time, so
+  it's worth knowing before generating the full dataset, not after.
+- Decide a concrete tolerance for hull-overshoot noise (e.g. "boundary
+  drift under N px is fine") so "small negligible noise" has an actual
+  definition before it needs debugging later.
+
+---
+
+## Suggestions / Open Items
+
+- **Engine choice for the ID buffer:** confirm Habitat-Sim's semantic
+  sensor output format (per-pixel instance ID vs. per-pixel semantic
+  class) before writing any raycast code — this single check could remove
+  an entire pipeline branch (Step 3A as primary method).
+- **Mesh ID stability:** verify IDs survive scene reload/re-export before
+  building the registry around them. If not stable, assign IDs manually
+  via custom mesh properties at authoring time instead of trusting
+  runtime-assigned IDs.
+- **Reuse over rebuild:** both the per-frame record format (Step 4) and
+  the raycast infra (Step 3A) have existing counterparts in the `sam_vla`
+  codebase (`EpisodeLogger`, CBF safety layer raycasts) — extend those
+  rather than writing parallel systems.
+- **Storage:** keep both instance and category masks per frame. Instance
+  masks are cheap to store and expensive to regenerate later if only
+  category masks were kept.
+- **Noise tolerance:** define the acceptable hull-overshoot threshold
+  explicitly (even a rough pixel/percentage number) so it's a known
+  parameter rather than an undefined "handle it later."
