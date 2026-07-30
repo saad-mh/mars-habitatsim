@@ -23,7 +23,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 _SENTINEL = object()
 
@@ -62,7 +62,7 @@ def make_run_id(config: Dict[str, Any], timestamp: Optional[datetime] = None) ->
 
 
 class EpisodeLogger:
-    _JSONL_FILES = ("frames", "qwen_queries", "cbf_events")
+    _JSONL_FILES = ("frames", "qwen_queries", "cbf_events", "segmentation_frames")
 
     def __init__(
         self,
@@ -264,6 +264,33 @@ class EpisodeLogger:
         prev = self._closest_approach.get(obstacle_id)
         if prev is None or distance < prev:
             self._closest_approach[obstacle_id] = distance
+
+    def log_segmentation_frame(
+        self,
+        frame_id: str,
+        rgb_path: str,
+        instance_mask_path: str,
+        category_mask_path: str,
+        objects: List[Dict[str, Any]],
+        camera_pose: Dict[str, float],
+    ) -> None:
+        """One next.md Step 4 record per captured frame (mesh_id -> category
+        segmentation dataset generation). Mirrors log_cbf_event/log_qwen_query
+        exactly: cheap dict construction + enqueue, no disk I/O on this thread
+        -- the background drain loop appends to segmentation_frames.jsonl.
+        Pixel data (PNGs) must already be written by the caller (see
+        perception.segmentation_capture.write_segmentation_assets) before
+        calling this -- this method only persists the metadata record,
+        keeping it agnostic to how/where the caller chose to save pixels."""
+        entry = {
+            "frame_id": frame_id,
+            "rgb_path": rgb_path,
+            "instance_mask_path": instance_mask_path,
+            "category_mask_path": category_mask_path,
+            "objects": objects,
+            "camera_pose": camera_pose,
+        }
+        self._enqueue("segmentation_frames", entry)
 
     def finalize(self, summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Write summary.json (caller-provided fields win over computed ones)

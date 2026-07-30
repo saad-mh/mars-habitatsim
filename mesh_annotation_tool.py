@@ -46,6 +46,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 import matplotlib
+
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -75,6 +76,7 @@ RAY_EPS = 1e-8
 # --------------------------------------------------------------------------
 # Mesh loading / building
 # --------------------------------------------------------------------------
+
 
 def color_for_category(category: str) -> str:
     if category in CATEGORY_COLORS:
@@ -114,8 +116,16 @@ class SceneMesh:
     facecolors: Optional[np.ndarray] = None  # terrain only
 
 
-def _sample_grid_bilinear(arr: np.ndarray, xs: np.ndarray, zs: np.ndarray, size_x: float, size_z: float,
-                           flip_x: bool, flip_z: bool, swap_xz: bool) -> np.ndarray:
+def _sample_grid_bilinear(
+    arr: np.ndarray,
+    xs: np.ndarray,
+    zs: np.ndarray,
+    size_x: float,
+    size_z: float,
+    flip_x: bool,
+    flip_z: bool,
+    swap_xz: bool,
+) -> np.ndarray:
     """Vectorized bilinear sample of a (h, w) or (h, w, C) source array at
     world (xs, zs) (2D grids of matching shape), using the exact same
     world->uv convention as HeightmapGrid._to_uv/bilinear_sample -- so
@@ -174,17 +184,27 @@ def build_terrain_mesh(
     xs = np.linspace(-size_x / 2.0, size_x / 2.0, grid_res)
     zs = np.linspace(-size_z / 2.0, size_z / 2.0, grid_res)
     X, Z = np.meshgrid(xs, zs)
-    Y = _sample_grid_bilinear(grid._height, X, Z, size_x, size_z, flip_x, flip_z, swap_xz)
+    Y = _sample_grid_bilinear(
+        grid._height, X, Z, size_x, size_z, flip_x, flip_z, swap_xz
+    )
 
     facecolors = None
     if texture_path is not None and texture_path.exists():
         from PIL import Image
 
-        tex = np.asarray(Image.open(texture_path).convert("RGB")).astype(np.float32) / 255.0
-        vertex_colors = _sample_grid_bilinear(tex, X, Z, size_x, size_z, flip_x, flip_z, swap_xz)
+        tex = (
+            np.asarray(Image.open(texture_path).convert("RGB")).astype(np.float32)
+            / 255.0
+        )
+        vertex_colors = _sample_grid_bilinear(
+            tex, X, Z, size_x, size_z, flip_x, flip_z, swap_xz
+        )
         # Per-quad facecolor = average of its 4 corners.
         fc_rgb = 0.25 * (
-            vertex_colors[:-1, :-1] + vertex_colors[1:, :-1] + vertex_colors[:-1, 1:] + vertex_colors[1:, 1:]
+            vertex_colors[:-1, :-1]
+            + vertex_colors[1:, :-1]
+            + vertex_colors[:-1, 1:]
+            + vertex_colors[1:, 1:]
         )
 
         # Lambertian shading from the actual 3D surface normal, so rock/crater
@@ -210,7 +230,9 @@ def build_terrain_mesh(
     # Flatten grid into a vertex array + triangle list for ray picking.
     verts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=-1)
 
-    row, col = np.meshgrid(np.arange(grid_res - 1), np.arange(grid_res - 1), indexing="ij")
+    row, col = np.meshgrid(
+        np.arange(grid_res - 1), np.arange(grid_res - 1), indexing="ij"
+    )
     i0 = (row * grid_res + col).ravel()
     i1 = (row * grid_res + col + 1).ravel()
     i2 = ((row + 1) * grid_res + col + 1).ravel()
@@ -228,11 +250,9 @@ def build_terrain_mesh(
     )
 
 
-# --------------------------------------------------------------------------
-# Ray picking
-# --------------------------------------------------------------------------
-
-def ray_triangle_intersect_batch(origin: np.ndarray, direction: np.ndarray, tris: np.ndarray, t_min: float = RAY_EPS):
+def ray_triangle_intersect_batch(
+    origin: np.ndarray, direction: np.ndarray, tris: np.ndarray, t_min: float = RAY_EPS
+):
     """Vectorized Moeller-Trumbore against all triangles. Returns the closest
     hit point (3,) or None. `tris` has shape (K, 3, 3) = (tri, vertex, xyz).
     `t_min` is the smallest acceptable distance-along-ray-from-`origin` --
@@ -288,7 +308,11 @@ def unproject_ray(ax, xdata: float, ydata: float):
     direction = p2 - p1
     direction /= np.linalg.norm(direction)
     center = np.array(
-        [sum(ax.get_xlim3d()) / 2.0, sum(ax.get_ylim3d()) / 2.0, sum(ax.get_zlim3d()) / 2.0]
+        [
+            sum(ax.get_xlim3d()) / 2.0,
+            sum(ax.get_ylim3d()) / 2.0,
+            sum(ax.get_zlim3d()) / 2.0,
+        ]
     )
     t0 = np.dot(center - p1, direction)
     origin = p1 + t0 * direction
@@ -296,7 +320,15 @@ def unproject_ray(ax, xdata: float, ydata: float):
     return origin, direction, t_min
 
 
-def world_to_uv(x: float, z: float, size_x: float, size_z: float, flip_x: bool, flip_z: bool, swap_xz: bool):
+def world_to_uv(
+    x: float,
+    z: float,
+    size_x: float,
+    size_z: float,
+    flip_x: bool,
+    flip_z: bool,
+    swap_xz: bool,
+):
     """Mirrors HeightmapGrid._to_uv exactly -- world (x, z) -> texture (u, v)
     in [0, 1], for placing markers on the 2D texture reference panel."""
     if swap_xz:
@@ -310,7 +342,15 @@ def world_to_uv(x: float, z: float, size_x: float, size_z: float, flip_x: bool, 
     return float(np.clip(u, 0.0, 1.0)), float(np.clip(v, 0.0, 1.0))
 
 
-def uv_to_world(u: float, v: float, size_x: float, size_z: float, flip_x: bool, flip_z: bool, swap_xz: bool):
+def uv_to_world(
+    u: float,
+    v: float,
+    size_x: float,
+    size_z: float,
+    flip_x: bool,
+    flip_z: bool,
+    swap_xz: bool,
+):
     """Inverse of world_to_uv -- a click on the 2D texture panel back to
     world (x, z) (height is then looked up separately via the terrain
     mesh's own grid, see bilinear_height_query)."""
@@ -325,7 +365,9 @@ def uv_to_world(u: float, v: float, size_x: float, size_z: float, flip_x: bool, 
     return float(x), float(z)
 
 
-def bilinear_height_query(mesh: "SceneMesh", xq: np.ndarray, zq: np.ndarray) -> np.ndarray:
+def bilinear_height_query(
+    mesh: "SceneMesh", xq: np.ndarray, zq: np.ndarray
+) -> np.ndarray:
     """Vectorized bilinear height sample over a terrain SceneMesh's own
     (grid_res x grid_res) display grid -- deliberately the same resolution
     that's rendered/picked against, not the full-res heightmap, so a click
@@ -346,7 +388,13 @@ def bilinear_height_query(mesh: "SceneMesh", xq: np.ndarray, zq: np.ndarray) -> 
     return h0 * (1 - tz) + h1 * tz
 
 
-def raymarch_terrain(mesh: "SceneMesh", origin_render: np.ndarray, direction_render: np.ndarray, t_min: float, steps: int = 800):
+def raymarch_terrain(
+    mesh: "SceneMesh",
+    origin_render: np.ndarray,
+    direction_render: np.ndarray,
+    t_min: float,
+    steps: int = 800,
+):
     """Ray-march a (render-order x,z,y) camera ray against the terrain's own
     height grid and return (world_xyz_hit, t) or None.
 
@@ -392,13 +440,20 @@ def raymarch_terrain(mesh: "SceneMesh", origin_render: np.ndarray, direction_ren
     d_a, d_b = diff[i], diff[i + 1]
     frac = d_a / (d_a - d_b) if (d_a - d_b) != 0 else 0.5
     t_hit = ts[i] + frac * (ts[i + 1] - ts[i])
-    hit = np.array([origin[0] + t_hit * direction[0], origin[1] + t_hit * direction[1], origin[2] + t_hit * direction[2]])
+    hit = np.array(
+        [
+            origin[0] + t_hit * direction[0],
+            origin[1] + t_hit * direction[1],
+            origin[2] + t_hit * direction[2],
+        ]
+    )
     return hit, t_hit
 
 
 # --------------------------------------------------------------------------
 # Session / registry persistence
 # --------------------------------------------------------------------------
+
 
 def sanitize_name(name: str) -> str:
     name = re.sub(r"[^A-Za-z0-9_\-]+", "_", name.strip())
@@ -457,7 +512,9 @@ class SessionStore:
         pending_points = data.get("pending_points", [])
         return objects, next_id, pending_points
 
-    def save(self, objects: list[AnnotatedObject], next_mesh_id: int, pending_points: list):
+    def save(
+        self, objects: list[AnnotatedObject], next_mesh_id: int, pending_points: list
+    ):
         self.session_path.write_text(
             json.dumps(
                 {
@@ -473,7 +530,8 @@ class SessionStore:
             json.dumps(
                 {
                     "mesh_id_map": {
-                        str(o.mesh_id): {"category": o.category, "name": o.name} for o in objects
+                        str(o.mesh_id): {"category": o.category, "name": o.name}
+                        for o in objects
                     }
                 },
                 indent=2,
@@ -517,6 +575,7 @@ def compute_hull(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # GUI
 # --------------------------------------------------------------------------
 
+
 class MeshAnnotatorApp:
     def __init__(
         self,
@@ -533,7 +592,9 @@ class MeshAnnotatorApp:
         self.root = root
         self.meshes = meshes
         self.store = SessionStore(out_dir)
-        self.uv_params = dict(size_x=size_x, size_z=size_z, flip_x=flip_x, flip_z=flip_z, swap_xz=swap_xz)
+        self.uv_params = dict(
+            size_x=size_x, size_z=size_z, flip_x=flip_x, flip_z=flip_z, swap_xz=swap_xz
+        )
 
         self.objects, self.next_mesh_id, pending = self.store.load()
         self.current_points: list[list[float]] = [list(p) for p in pending]
@@ -552,7 +613,9 @@ class MeshAnnotatorApp:
             self.tex_img = Image.open(texture_path).convert("RGB")
         self.tex_center = None  # (px, py) in source-image pixels; set on first layout
         self.tex_zoom = None  # source pixels per canvas pixel
-        self.tex_crop_box = None  # last-rendered (left, top, right, bottom) in source pixels
+        self.tex_crop_box = (
+            None  # last-rendered (left, top, right, bottom) in source pixels
+        )
         self._tex_photo = None  # keep a reference so Tk doesn't GC the PhotoImage
         self._tex_pan_xy = None
 
@@ -570,8 +633,14 @@ class MeshAnnotatorApp:
         # `_pick_point`.
         self.terrain_meshes = [m for m in meshes if m.grid_xyz is not None]
         obj_meshes = [m for m in meshes if m.grid_xyz is None]
-        tri_arrays = [m.vertices[m.triangles][:, :, [0, 2, 1]] for m in obj_meshes if len(m.triangles)]
-        self.pick_tris = np.concatenate(tri_arrays, axis=0) if tri_arrays else np.zeros((0, 3, 3))
+        tri_arrays = [
+            m.vertices[m.triangles][:, :, [0, 2, 1]]
+            for m in obj_meshes
+            if len(m.triangles)
+        ]
+        self.pick_tris = (
+            np.concatenate(tri_arrays, axis=0) if tri_arrays else np.zeros((0, 3, 3))
+        )
 
         self.pick_mode = tk.BooleanVar(value=False)
         self._press_xy = None
@@ -580,8 +649,10 @@ class MeshAnnotatorApp:
         self._refresh_listbox()
         self._redraw()
         if self.objects or self.current_points:
-            self._status(f"Resumed session: {len(self.objects)} object(s), "
-                         f"{len(self.current_points)} pending point(s).")
+            self._status(
+                f"Resumed session: {len(self.objects)} object(s), "
+                f"{len(self.current_points)} pending point(s)."
+            )
 
     # -- UI construction ---------------------------------------------------
 
@@ -609,9 +680,9 @@ class MeshAnnotatorApp:
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
 
         if self.tex_img is not None:
-            ttk.Label(texture_frame, text="Full-res texture (reference + click to mark)").pack(
-                anchor="w", padx=4, pady=(4, 0)
-            )
+            ttk.Label(
+                texture_frame, text="Full-res texture (reference + click to mark)"
+            ).pack(anchor="w", padx=4, pady=(4, 0))
             self.tex_canvas = tk.Canvas(texture_frame, bg="#222", highlightthickness=0)
             self.tex_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
             self.tex_canvas.bind("<Configure>", self._on_tex_configure)
@@ -623,25 +694,34 @@ class MeshAnnotatorApp:
             self.tex_canvas.bind("<Button-5>", self._on_tex_scroll)  # Linux wheel down
 
         # -- controls --
-        ttk.Checkbutton(control_frame, text="Pick points (click mesh to add)", variable=self.pick_mode).pack(
-            anchor="w", padx=8, pady=(10, 2)
-        )
+        ttk.Checkbutton(
+            control_frame,
+            text="Pick points (click mesh to add)",
+            variable=self.pick_mode,
+        ).pack(anchor="w", padx=8, pady=(10, 2))
         ttk.Label(
             control_frame,
             text="3D: scroll = zoom, drag = orbit. Texture: scroll = zoom, right-drag = pan.",
-            foreground="#666", wraplength=300,
+            foreground="#666",
+            wraplength=300,
         ).pack(anchor="w", padx=8, pady=(0, 8))
 
-        self.point_count_label = ttk.Label(control_frame, text="Current object: 0 points")
+        self.point_count_label = ttk.Label(
+            control_frame, text="Current object: 0 points"
+        )
         self.point_count_label.pack(anchor="w", padx=8, pady=(0, 4))
 
         btn_frame = ttk.Frame(control_frame)
         btn_frame.pack(fill=tk.X, padx=8, pady=2)
-        ttk.Button(btn_frame, text="Undo last point", command=self.undo_point).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="Cancel current object", command=self.cancel_current).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="Finish object -> hull + label", command=self.finish_object).pack(
-            fill=tk.X, pady=(2, 10)
+        ttk.Button(btn_frame, text="Undo last point", command=self.undo_point).pack(
+            fill=tk.X, pady=2
         )
+        ttk.Button(
+            btn_frame, text="Cancel current object", command=self.cancel_current
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            btn_frame, text="Finish object -> hull + label", command=self.finish_object
+        ).pack(fill=tk.X, pady=(2, 10))
 
         ttk.Separator(control_frame).pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(control_frame, text="Finished objects:").pack(anchor="w", padx=8)
@@ -653,17 +733,22 @@ class MeshAnnotatorApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.config(yscrollcommand=scrollbar.set)
 
-        ttk.Button(control_frame, text="Delete selected object", command=self.delete_selected).pack(
-            fill=tk.X, padx=8, pady=(2, 10)
-        )
+        ttk.Button(
+            control_frame, text="Delete selected object", command=self.delete_selected
+        ).pack(fill=tk.X, padx=8, pady=(2, 10))
 
         ttk.Separator(control_frame).pack(fill=tk.X, padx=8, pady=4)
-        ttk.Button(control_frame, text="Save session now", command=self._save).pack(fill=tk.X, padx=8, pady=2)
+        ttk.Button(control_frame, text="Save session now", command=self._save).pack(
+            fill=tk.X, padx=8, pady=2
+        )
 
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(control_frame, textvariable=self.status_var, wraplength=300, foreground="#345").pack(
-            anchor="w", padx=8, pady=(10, 8)
-        )
+        ttk.Label(
+            control_frame,
+            textvariable=self.status_var,
+            wraplength=300,
+            foreground="#345",
+        ).pack(anchor="w", padx=8, pady=(10, 8))
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -683,17 +768,33 @@ class MeshAnnotatorApp:
                 X, Z, Y = mesh.grid_xyz
                 if mesh.facecolors is not None:
                     self.ax.plot_surface(
-                        X, Z, Y, facecolors=mesh.facecolors, rstride=1, cstride=1, shade=False,
-                        linewidth=0, antialiased=False,
+                        X,
+                        Z,
+                        Y,
+                        facecolors=mesh.facecolors,
+                        rstride=1,
+                        cstride=1,
+                        shade=False,
+                        linewidth=0,
+                        antialiased=False,
                     )
                 else:
                     self.ax.plot_surface(
-                        X, Z, Y, cmap="terrain", rstride=1, cstride=1, linewidth=0, antialiased=False,
+                        X,
+                        Z,
+                        Y,
+                        cmap="terrain",
+                        rstride=1,
+                        cstride=1,
+                        linewidth=0,
+                        antialiased=False,
                     )
             else:
                 verts = mesh.vertices[mesh.triangles]  # (K,3,3) in (x,y,z)
                 verts_render = verts[:, :, [0, 2, 1]]  # plot as (x, z, y)
-                poly = Poly3DCollection(verts_render, facecolor="#c98a55", edgecolor="none", alpha=0.9)
+                poly = Poly3DCollection(
+                    verts_render, facecolor="#c98a55", edgecolor="none", alpha=0.9
+                )
                 self.ax.add_collection3d(poly)
 
         for obj in self.objects:
@@ -701,23 +802,31 @@ class MeshAnnotatorApp:
 
         if self.current_points:
             pts = np.array(self.current_points)
-            self.ax.scatter(pts[:, 0], pts[:, 2], pts[:, 1], color="red", s=40, depthshade=False)
+            self.ax.scatter(
+                pts[:, 0], pts[:, 2], pts[:, 1], color="red", s=40, depthshade=False
+            )
             if len(pts) > 1:
                 loop = np.vstack([pts, pts[:1]])
-                self.ax.plot(loop[:, 0], loop[:, 2], loop[:, 1], color="red", linewidth=1.5)
+                self.ax.plot(
+                    loop[:, 0], loop[:, 2], loop[:, 1], color="red", linewidth=1.5
+                )
 
         self.ax.set_xlabel("x")
         self.ax.set_ylabel("z")
         self.ax.set_zlabel("y (height)")
         self.canvas.draw_idle()
-        self.point_count_label.config(text=f"Current object: {len(self.current_points)} points")
+        self.point_count_label.config(
+            text=f"Current object: {len(self.current_points)} points"
+        )
 
     def _draw_object(self, obj: AnnotatedObject):
         pts = np.array(obj.hull_points)
         faces = np.array(obj.hull_faces)
         color = color_for_category(obj.category)
         tris = pts[faces][:, :, [0, 2, 1]]
-        poly = Poly3DCollection(tris, facecolor=color, edgecolor="black", linewidth=0.3, alpha=0.55)
+        poly = Poly3DCollection(
+            tris, facecolor=color, edgecolor="black", linewidth=0.3, alpha=0.55
+        )
         self.ax.add_collection3d(poly)
 
     def _refresh_listbox(self):
@@ -744,8 +853,16 @@ class MeshAnnotatorApp:
         cw, ch = self.tex_canvas.winfo_width(), self.tex_canvas.winfo_height()
         tw, th = self.tex_img.size
         half_w, half_h = cw * self.tex_zoom / 2.0, ch * self.tex_zoom / 2.0
-        cx = min(max(self.tex_center[0], half_w), tw - half_w) if tw > 2 * half_w else tw / 2.0
-        cy = min(max(self.tex_center[1], half_h), th - half_h) if th > 2 * half_h else th / 2.0
+        cx = (
+            min(max(self.tex_center[0], half_w), tw - half_w)
+            if tw > 2 * half_w
+            else tw / 2.0
+        )
+        cy = (
+            min(max(self.tex_center[1], half_h), th - half_h)
+            if th > 2 * half_h
+            else th / 2.0
+        )
         self.tex_center = [cx, cy]
         left, top = cx - half_w, cy - half_h
         right, bottom = cx + half_w, cy + half_h
@@ -777,13 +894,21 @@ class MeshAnnotatorApp:
             color = color_for_category(obj.category)
             for x, _y, z in obj.hull_points:
                 cx, cy = to_canvas_xy(x, z)
-                self.tex_canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=color, outline="")
+                self.tex_canvas.create_oval(
+                    cx - 3, cy - 3, cx + 3, cy + 3, fill=color, outline=""
+                )
         for x, _y, z in self.current_points:
             cx, cy = to_canvas_xy(x, z)
-            self.tex_canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="red", outline="white")
+            self.tex_canvas.create_oval(
+                cx - 4, cy - 4, cx + 4, cy + 4, fill="red", outline="white"
+            )
 
     def _on_tex_scroll(self, event):
-        factor = 0.9 if (getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4) else 1.1
+        factor = (
+            0.9
+            if (getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4)
+            else 1.1
+        )
         tw, th = self.tex_img.size
         cw, ch = self.tex_canvas.winfo_width(), self.tex_canvas.winfo_height()
         min_zoom = 0.02
@@ -818,7 +943,11 @@ class MeshAnnotatorApp:
         if not self.terrain_meshes:
             self._status("No terrain mesh loaded to sample height from.")
             return
-        y = float(bilinear_height_query(self.terrain_meshes[0], np.array([x]), np.array([z]))[0])
+        y = float(
+            bilinear_height_query(self.terrain_meshes[0], np.array([x]), np.array([z]))[
+                0
+            ]
+        )
         self.current_points.append([x, y, z])
         self._redraw()
         self._status(f"Added point at ({x:.2f}, {y:.2f}, {z:.2f}) from texture panel.")
@@ -871,11 +1000,15 @@ class MeshAnnotatorApp:
                 best_world, best_t = result
 
         if self.pick_tris.shape[0] > 0:
-            hit = ray_triangle_intersect_batch(origin, direction, self.pick_tris, t_min=t_min)
+            hit = ray_triangle_intersect_batch(
+                origin, direction, self.pick_tris, t_min=t_min
+            )
             if hit is not None:
                 t_hit = float(np.dot(hit - origin, direction))
                 if t_hit < best_t:
-                    best_world = np.array([hit[0], hit[2], hit[1]])  # render (x,z,y) -> world (x,y,z)
+                    best_world = np.array(
+                        [hit[0], hit[2], hit[1]]
+                    )  # render (x,z,y) -> world (x,y,z)
                     best_t = t_hit
 
         if best_world is None:
@@ -884,7 +1017,9 @@ class MeshAnnotatorApp:
         world = (float(best_world[0]), float(best_world[1]), float(best_world[2]))
         self.current_points.append([world[0], world[1], world[2]])
         self._redraw()
-        self._status(f"Added point at ({world[0]:.2f}, {world[1]:.2f}, {world[2]:.2f}).")
+        self._status(
+            f"Added point at ({world[0]:.2f}, {world[1]:.2f}, {world[2]:.2f})."
+        )
 
     # -- object lifecycle --------------------------------------------------
 
@@ -903,14 +1038,19 @@ class MeshAnnotatorApp:
 
     def finish_object(self):
         if len(self.current_points) < 3:
-            messagebox.showwarning("Not enough points", "Mark at least 3 points before finishing an object.")
+            messagebox.showwarning(
+                "Not enough points",
+                "Mark at least 3 points before finishing an object.",
+            )
             return
 
         points = np.array(self.current_points)
         try:
             hull_points, hull_faces = compute_hull(points)
         except QhullError as exc:
-            messagebox.showerror("Hull failed", f"Could not compute a convex hull: {exc}")
+            messagebox.showerror(
+                "Hull failed", f"Could not compute a convex hull: {exc}"
+            )
             return
 
         dialog = LabelDialog(self.root, default_name=f"object_{self.next_mesh_id}")
@@ -945,7 +1085,9 @@ class MeshAnnotatorApp:
         if not sel:
             return
         obj = self.objects[sel[0]]
-        if not messagebox.askyesno("Delete object", f"Delete '{obj.name}' (mesh_id {obj.mesh_id})?"):
+        if not messagebox.askyesno(
+            "Delete object", f"Delete '{obj.name}' (mesh_id {obj.mesh_id})?"
+        ):
             return
         self.store.delete_hull_obj(obj)
         del self.objects[sel[0]]
@@ -972,12 +1114,18 @@ class LabelDialog:
         self.top.transient(parent)
         self.top.grab_set()
 
-        ttk.Label(self.top, text="Category:").grid(row=0, column=0, sticky="w", padx=8, pady=(10, 2))
+        ttk.Label(self.top, text="Category:").grid(
+            row=0, column=0, sticky="w", padx=8, pady=(10, 2)
+        )
         self.category_var = tk.StringVar(value=CATEGORIES[0])
-        combo = ttk.Combobox(self.top, textvariable=self.category_var, values=CATEGORIES)
+        combo = ttk.Combobox(
+            self.top, textvariable=self.category_var, values=CATEGORIES
+        )
         combo.grid(row=1, column=0, sticky="ew", padx=8)
 
-        ttk.Label(self.top, text="Name:").grid(row=2, column=0, sticky="w", padx=8, pady=(10, 2))
+        ttk.Label(self.top, text="Name:").grid(
+            row=2, column=0, sticky="w", padx=8, pady=(10, 2)
+        )
         self.name_var = tk.StringVar(value=default_name)
         name_entry = ttk.Entry(self.top, textvariable=self.name_var)
         name_entry.grid(row=3, column=0, sticky="ew", padx=8)
@@ -985,7 +1133,9 @@ class LabelDialog:
 
         btn_frame = ttk.Frame(self.top)
         btn_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=12)
-        ttk.Button(btn_frame, text="Cancel", command=self._cancel).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=self._cancel).pack(
+            side=tk.RIGHT, padx=4
+        )
         ttk.Button(btn_frame, text="OK", command=self._ok).pack(side=tk.RIGHT, padx=4)
 
         self.top.columnconfigure(0, weight=1)
@@ -997,7 +1147,9 @@ class LabelDialog:
         category = self.category_var.get().strip()
         name = self.name_var.get().strip()
         if not category or not name:
-            messagebox.showwarning("Missing info", "Both category and name are required.", parent=self.top)
+            messagebox.showwarning(
+                "Missing info", "Both category and name are required.", parent=self.top
+            )
             return
         self.result = (category, name)
         self.top.destroy()
@@ -1011,8 +1163,11 @@ class LabelDialog:
 # CLI
 # --------------------------------------------------------------------------
 
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--heightmap", default=str(DEFAULT_HEIGHTMAP))
     ap.add_argument("--texture", default=str(DEFAULT_TEXTURE))
     ap.add_argument("--size-x", type=float, default=50.0)
@@ -1022,9 +1177,16 @@ def main():
     ap.add_argument("--flip-z", action="store_true", default=True)
     ap.add_argument("--no-flip-z", dest="flip_z", action="store_false")
     ap.add_argument("--swap-xz", action="store_true", default=False)
-    ap.add_argument("--grid-res", type=int, default=140, help="Terrain display/pick grid resolution per axis")
     ap.add_argument(
-        "--obj-glob", action="append", default=[],
+        "--grid-res",
+        type=int,
+        default=140,
+        help="Terrain display/pick grid resolution per axis",
+    )
+    ap.add_argument(
+        "--obj-glob",
+        action="append",
+        default=[],
         help="Glob for extra OBJ meshes to load into the scene (e.g. rock_envs/run1/rocks/*.obj). Repeatable.",
     )
     ap.add_argument("--out-dir", default="annotations/mesh_segmentation")
@@ -1035,7 +1197,9 @@ def main():
         raise FileNotFoundError(f"heightmap not found: {heightmap}")
     texture = Path(args.texture) if args.texture else None
 
-    print(f"[1/2] building terrain mesh from {heightmap} (grid_res={args.grid_res}) ...")
+    print(
+        f"[1/2] building terrain mesh from {heightmap} (grid_res={args.grid_res}) ..."
+    )
     meshes = [
         build_terrain_mesh(
             heightmap,
@@ -1064,10 +1228,15 @@ def main():
 
     root = tk.Tk()
     MeshAnnotatorApp(
-        root, meshes, Path(args.out_dir),
+        root,
+        meshes,
+        Path(args.out_dir),
         texture_path=texture,
-        size_x=args.size_x, size_z=args.size_z,
-        flip_x=args.flip_x, flip_z=args.flip_z, swap_xz=args.swap_xz,
+        size_x=args.size_x,
+        size_z=args.size_z,
+        flip_x=args.flip_x,
+        flip_z=args.flip_z,
+        swap_xz=args.swap_xz,
     )
     root.mainloop()
 

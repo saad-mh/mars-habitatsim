@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import habitat_sim
 import numpy as np
@@ -12,6 +12,7 @@ from habitat_sim.agent import AgentConfiguration
 from sam_vla.core.goal_geometry import GoalPosition, terrain_patch_mesh
 from sam_vla.core.lifecycle import ServiceRegistry
 from sam_vla.core.types import Observation, Pose
+from sam_vla.env.annotation_meshes import load_mesh_id_map, register_annotation_meshes
 from sam_vla.env.terrain import SIZE_X, SIZE_Y, SIZE_Z, HeightmapGrid, Terrain
 from sam_vla.env.sim_utils import make_sensor, register_semantic_mesh, rgb_depth, save_obj, set_agent_pose
 from sam_vla.env.rock_generation import RockSpec, load_rock_field, register_rocks
@@ -39,6 +40,8 @@ class MarsHabitatEnv:
         spawn_terrain_radius: float = SPAWN_TERRAIN_RADIUS_M,
         with_semantic: bool = False,
         rock_field_path: Optional[str] = None,
+        annotations_dir: Optional[str] = None,
+        annotation_categories: Optional[Sequence[str]] = None,
     ):
         self._scene_path = Path(scene_path)
         self._heightmap_path = Path(heightmap_path)
@@ -56,7 +59,10 @@ class MarsHabitatEnv:
         self._spawn_terrain_radius = spawn_terrain_radius
         self._with_semantic = with_semantic
         self._rock_field_path = Path(rock_field_path) if rock_field_path else None
+        self._annotations_dir = Path(annotations_dir) if annotations_dir else None
+        self._annotation_categories = annotation_categories
         self.rocks: List[RockSpec] = []
+        self.annotation_mesh_id_map: dict = {}
 
     def __enter__(self) -> "MarsHabitatEnv":
         sim_cfg = habitat_sim.SimulatorConfiguration()
@@ -105,6 +111,10 @@ class MarsHabitatEnv:
             self.rocks, _rock_config = load_rock_field(self._rock_field_path)
             register_rocks(self._sim, self.rocks)
 
+        if self._annotations_dir is not None:
+            self.annotation_mesh_id_map = load_mesh_id_map(self._annotations_dir)
+            register_annotation_meshes(self._sim, str(self._annotations_dir), self._annotation_categories)
+
         self._registry.start_all()
         return self
 
@@ -127,6 +137,24 @@ class MarsHabitatEnv:
         yaw = float(quaternion.as_rotation_vector(state.rotation)[1])
         pose = Pose(x=x, y=float(state.position[1]), z=z, yaw=yaw)
         return Observation(rgb=rgb, depth=depth, pose=pose, frame_idx=frame_idx)
+
+    def get_full_observation(self, frame_idx: int) -> Observation:
+        """One `sim.get_sensor_observations()` call returning rgb+depth+pose
+        (as get_observation does) AND the semantic id buffer (as
+        get_semantic_frame does), from a single render pass instead of two.
+        get_observation() and get_semantic_frame() each trigger their own
+        render call; a caller needing both -- e.g. the segmentation capture
+        pipeline -- must use this instead, or render cost silently doubles.
+        `.semantic` is None if with_semantic=False (mirrors
+        get_semantic_frame's precondition)."""
+        obs = self._sim.get_sensor_observations()
+        rgb, depth = rgb_depth(obs)
+        state = self._agent.get_state()
+        x, _y, z = (float(v) for v in state.position)
+        yaw = float(quaternion.as_rotation_vector(state.rotation)[1])
+        pose = Pose(x=x, y=float(state.position[1]), z=z, yaw=yaw)
+        semantic = np.asarray(obs["semantic"]) if self._with_semantic else None
+        return Observation(rgb=rgb, depth=depth, pose=pose, frame_idx=frame_idx, semantic=semantic)
 
     def get_semantic_frame(self) -> np.ndarray:
         """Raw per-pixel semantic-id image (H, W) from the semantic sensor:

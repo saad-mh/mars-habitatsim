@@ -18,6 +18,7 @@ class Observation:
     depth: Optional[np.ndarray]
     pose: Pose
     frame_idx: int
+    semantic: Optional[np.ndarray] = None
 
 
 @dataclass
