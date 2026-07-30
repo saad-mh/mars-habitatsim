@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import magnum as mn
 import numpy as np
 import quaternion
 import habitat_sim
@@ -83,9 +84,21 @@ def distance_to_goal(pose: Pose, goal_position: Tuple[float, float, float]) -> f
     return float(np.linalg.norm(np.asarray([pose.x - gx, pose.z - gz], dtype=np.float32)))
 
 
-def register_semantic_mesh(sim, mesh_path: str, semantic_id: int):
+def register_semantic_mesh(sim, mesh_path: str, semantic_id: int, y_offset: float = 0.0):
     """Add a render-only (kinematic, non-collidable) mesh carrying a semantic
-    id, so the semantic sensor renders it as a distinct mask."""
+    id, so the semantic sensor renders it as a distinct mask.
+
+    `y_offset` lifts the object straight up in world Y after it's added
+    (default 0, no change). These meshes are terrain-following patches whose
+    vertices already sit exactly at the heightmap's sampled ground height
+    (see mesh_annotation_tool.compute_tight_boundary_mesh / sim_utils'
+    terrain_patch_mesh callers) -- coplanar with the real render terrain, a
+    classic z-fighting setup where the semantic id randomly loses the depth
+    test almost everywhere it should render. A small uniform lift (e.g.
+    0.05m) is cheap insurance: since every vertex already encodes
+    terrain_height(x, z), translating the whole object gives
+    terrain_height(x, z) + y_offset for free, no per-vertex resampling
+    needed."""
     otm = sim.get_object_template_manager()
     rom = sim.get_rigid_object_manager()
     template = otm.create_new_template(mesh_path)
@@ -97,4 +110,6 @@ def register_semantic_mesh(sim, mesh_path: str, semantic_id: int):
     obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC
     obj.collidable = False
     obj.semantic_id = int(semantic_id)
+    if y_offset:
+        obj.translation = obj.translation + mn.Vector3(0.0, float(y_offset), 0.0)
     return obj

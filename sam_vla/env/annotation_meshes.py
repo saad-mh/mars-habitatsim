@@ -15,6 +15,13 @@ from sam_vla.env.sim_utils import register_semantic_mesh
 
 RESERVED_SEMANTIC_IDS = {0, MESH_GOAL_ID, MESH_OBST_ID, ROCK_SEMANTIC_ID}
 
+# Annotation hulls are terrain-following patches whose vertices already sit
+# exactly at the heightmap's sampled ground height -- coplanar with the real
+# render terrain, which z-fights almost everywhere instead of rendering the
+# semantic id (see sim_utils.register_semantic_mesh). Lifting the whole
+# object a few cm clears that without touching any saved mesh/annotation.
+DEFAULT_Y_LIFT = 0.05
+
 
 def load_mesh_id_map(annotations_dir: Path) -> Dict[str, Dict[str, str]]:
     """Read annotations_dir/mesh_id_map.json -> {"1024": {"category": ..., "name": ...}, ...}."""
@@ -24,7 +31,10 @@ def load_mesh_id_map(annotations_dir: Path) -> Dict[str, Dict[str, str]]:
 
 
 def register_annotation_meshes(
-    sim, annotations_dir: str, categories: Optional[Sequence[str]] = None,
+    sim,
+    annotations_dir: str,
+    categories: Optional[Sequence[str]] = None,
+    y_lift: float = DEFAULT_Y_LIFT,
 ) -> Dict[int, Any]:
     """Load subobjects/mesh_{id}_object_{id}.obj as render-only semantic
     objects tagged with their registry mesh_id, via
@@ -59,6 +69,6 @@ def register_annotation_meshes(
             raise FileNotFoundError(
                 f"mesh_id_map references missing hull mesh {mesh_path} for mesh_id {mesh_id}"
             )
-        objects[mesh_id] = register_semantic_mesh(sim, str(mesh_path), mesh_id)
+        objects[mesh_id] = register_semantic_mesh(sim, str(mesh_path), mesh_id, y_offset=y_lift)
 
     return objects

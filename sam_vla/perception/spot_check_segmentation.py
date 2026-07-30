@@ -56,25 +56,62 @@ def overlay_category_mask(
     return np.clip(overlaid, 0, 255).astype(np.uint8)
 
 
+def _draw_mask_outline(
+    draw: ImageDraw.ImageDraw,
+    instance_mask: np.ndarray,
+    mesh_id: int,
+    color: Tuple[int, int, int],
+    width: int = 1,
+) -> None:
+    """Outlines the exact instance-mask silhouette for one object (mesh_id ==
+    pixel value in instance_mask, per segmentation_capture.capture_frame_record)
+    -- tighter than an axis-aligned bbox and, unlike the bbox, distinguishes
+    overlapping same-category objects instead of drawing the same box shape
+    over both."""
+    import cv2
+
+    mask = (np.asarray(instance_mask) == mesh_id).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        points = [tuple(p) for p in contour.reshape(-1, 2).tolist()]
+        if len(points) >= 2:
+            draw.line(points + [points[0]], fill=color, width=width)
+
+
 def draw_object_labels(
     image: np.ndarray,
     objects: List[dict],
     palette: Dict[str, Tuple[int, int, int]],
     min_label_area: int = 150,
+    draw_mode: str = "bbox",
+    instance_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Draws a bounding box + `"<mesh_id> <category>"` label for every object
+    """Draws an outline + `"<mesh_id> <category>"` label for every object
     record (as stored in segmentation_frames.jsonl -- mesh_id, category, bbox),
     color-matched to the same per-class palette used for the mask blend.
-    Objects smaller than `min_label_area` px get the outline only, no text --
-    a scene can have 100+ small_rock hulls in one frame, and unconditional
-    text labels there just overlap into unreadable clutter; the outline
-    alone still shows where every detection landed."""
+    draw_mode="bbox" (default, legacy behavior) outlines the axis-aligned
+    bbox; draw_mode="mask" outlines the object's actual instance-mask
+    silhouette instead, which needs `instance_mask` (the frame's
+    masks_instance/ PNG, mesh_id per pixel) passed in.
+    Objects smaller than `min_label_area` px (by bbox area, in either mode)
+    get the outline only, no text -- a scene can have 100+ small_rock hulls
+    in one frame, and unconditional text labels there just overlap into
+    unreadable clutter; the outline alone still shows where every detection
+    landed."""
+    if draw_mode not in ("bbox", "mask"):
+        raise ValueError(f"draw_mode must be 'bbox' or 'mask', got {draw_mode!r}")
+    if draw_mode == "mask" and instance_mask is None:
+        raise ValueError("draw_mode='mask' requires instance_mask")
+
     img = Image.fromarray(image)
     draw = ImageDraw.Draw(img)
     for obj in objects:
         x, y, w, h = obj["bbox"]
         color = palette.get(obj["category"], (255, 255, 255))
-        draw.rectangle([x, y, x + w, y + h], outline=color, width=1)
+        if draw_mode == "mask":
+            _draw_mask_outline(draw, instance_mask, obj["mesh_id"], color)
+        else:
+            draw.rectangle([x, y, x + w, y + h], outline=color, width=1)
         if w * h < min_label_area:
             continue
         label = f"{obj['mesh_id']} {obj['category']}"
@@ -85,11 +122,18 @@ def draw_object_labels(
 
 
 def spot_check_run(
-    run_dir: Path, out_dir: Optional[Path] = None, n: int = 20, seed: int = 0
+    run_dir: Path,
+    out_dir: Optional[Path] = None,
+    n: int = 20,
+    seed: int = 0,
+    draw_mode: str = "bbox",
 ) -> List[Path]:
     """Sample up to `n` frames from run_dir/segmentation_frames.jsonl, render
     mask-overlay + per-object labels for each, and write them to
-    out_dir (default run_dir/spot_check/). Returns the written paths."""
+    out_dir (default run_dir/spot_check/). draw_mode picks how each object is
+    outlined -- "bbox" (default, legacy) for the axis-aligned box, "mask" for
+    the object's actual instance-mask silhouette (loads masks_instance/ too).
+    Returns the written paths."""
     import imageio.v3 as iio
 
     run_dir = Path(run_dir)
@@ -109,7 +153,12 @@ def spot_check_run(
         rgb = iio.imread(run_dir / rec["rgb_path"])
         category_mask = iio.imread(run_dir / rec["category_mask_path"])
         overlaid = overlay_category_mask(rgb, category_mask, class_names, palette)
-        annotated = draw_object_labels(overlaid, rec["objects"], palette)
+        instance_mask = (
+            iio.imread(run_dir / rec["instance_mask_path"]) if draw_mode == "mask" else None
+        )
+        annotated = draw_object_labels(
+            overlaid, rec["objects"], palette, draw_mode=draw_mode, instance_mask=instance_mask
+        )
 
         out_path = out_dir / f"{rec['frame_id']}.png"
         iio.imwrite(out_path, annotated)
@@ -128,6 +177,13 @@ if __name__ == "__main__":
     ap.add_argument("--out-dir", default=None, help="default: <run-dir>/spot_check/")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--draw-mode",
+        choices=["bbox", "mask"],
+        default="bbox",
+        help="bbox (default) outlines each object's axis-aligned box; "
+        "mask outlines its actual instance-mask silhouette instead",
+    )
     args = ap.parse_args()
 
     written = spot_check_run(
@@ -135,6 +191,7 @@ if __name__ == "__main__":
         Path(args.out_dir) if args.out_dir else None,
         args.n,
         args.seed,
+        args.draw_mode,
     )
     out_dir = (
         written[0].parent
