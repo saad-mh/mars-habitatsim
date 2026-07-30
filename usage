@@ -22,3 +22,9 @@ python rollout_navdp_policy.py \
   BUT SEE FIRST FRAME
   When it sees first frame, then it remembers ok its here then maybe at frame n because of obstacle avoidance it will go beyond the fov then i will have a 
   "belief" that it was there then my policy will resteer it back
+
+
+
+numbers: generated 2304 images in 2m 21.7s 
+
+mesh_annotation_tool -> python -m sam_vla.run_segmentation_sweep --out-dir output/ -> python3 -m sam_vla.perception.filter_empty_segmentation_frames --run-dir -> python -m sam_vla.perception.spot_check_segmentation --run-dir ->
