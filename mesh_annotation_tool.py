@@ -168,7 +168,9 @@ def uv_to_world(
     return float(x), float(z)
 
 
-def points_in_polygon(px: np.ndarray, pz: np.ndarray, poly_xz: np.ndarray) -> np.ndarray:
+def points_in_polygon(
+    px: np.ndarray, pz: np.ndarray, poly_xz: np.ndarray
+) -> np.ndarray:
     """Vectorized even-odd point-in-polygon test. `px`/`pz` are arrays of
     matching shape, `poly_xz` is (K, 2). Standard crossing-number rule,
     looped over the (small, K <= a few dozen) polygon edges."""
@@ -329,17 +331,22 @@ class SessionStore:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.subobj_dir.mkdir(parents=True, exist_ok=True)
 
-    def load(self) -> tuple[list[AnnotatedObject], int, list]:
+    def load(self) -> tuple[list[AnnotatedObject], int, list, str]:
         if not self.session_path.exists():
-            return [], 1000, []
+            return [], 1000, [], ""
         data = json.loads(self.session_path.read_text())
         objects = [AnnotatedObject.from_json(d) for d in data.get("objects", [])]
         next_id = data.get("next_mesh_id", 1000)
         pending_points = data.get("pending_points", [])
-        return objects, next_id, pending_points
+        last_category = data.get("last_category", "")
+        return objects, next_id, pending_points, last_category
 
     def save(
-        self, objects: list[AnnotatedObject], next_mesh_id: int, pending_points: list
+        self,
+        objects: list[AnnotatedObject],
+        next_mesh_id: int,
+        pending_points: list,
+        last_category: str = "",
     ):
         self.session_path.write_text(
             json.dumps(
@@ -347,6 +354,7 @@ class SessionStore:
                     "next_mesh_id": next_mesh_id,
                     "pending_points": pending_points,
                     "objects": [o.to_json() for o in objects],
+                    "last_category": last_category,
                     "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 },
                 indent=2,
@@ -418,8 +426,18 @@ class MeshAnnotatorApp:
         self.mesh_spacing = mesh_spacing
         self.mesh_max_res = mesh_max_res
 
-        self.objects, self.next_mesh_id, pending = self.store.load()
+        self.objects, self.next_mesh_id, pending, last_category = self.store.load()
         self.current_points: list[list[float]] = [list(p) for p in pending]
+        self.last_category = last_category or CATEGORIES[0]
+
+        # Editing an already-finished object's points: the object is pulled
+        # out of self.objects (so it renders as the live in-progress outline
+        # instead of the finished one) and its original index/data are kept
+        # so "Cancel" can restore it unchanged.
+        self._editing_orig: Optional[AnnotatedObject] = None
+        self._editing_orig_idx: Optional[int] = None
+        self._dragging_idx: Optional[int] = None
+        self._highlighted_mesh_id: Optional[int] = None
 
         # Full-resolution texture image is the only picking surface -- no 3D
         # view. Clicking marks a point via uv_to_world + a direct heightmap
@@ -457,12 +475,15 @@ class MeshAnnotatorApp:
         paned.add(control_frame, weight=2)
 
         ttk.Label(
-            texture_frame, text="Full-res texture -- click to mark boundary points"
+            texture_frame, text="Texture map - click to mark boundary points"
         ).pack(anchor="w", padx=4, pady=(4, 0))
         self.tex_canvas = tk.Canvas(texture_frame, bg="#222", highlightthickness=0)
         self.tex_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self.tex_canvas.bind("<Configure>", self._on_tex_configure)
-        self.tex_canvas.bind("<Button-1>", self._on_tex_click)
+        self.tex_canvas.bind("<Button-1>", self._on_tex_press)
+        self.tex_canvas.bind("<B1-Motion>", self._on_tex_drag)
+        self.tex_canvas.bind("<ButtonRelease-1>", self._on_tex_release)
+        self.tex_canvas.bind("<Double-Button-1>", self._on_tex_double_click)
         self.tex_canvas.bind("<ButtonPress-3>", self._on_tex_pan_press)
         self.tex_canvas.bind("<B3-Motion>", self._on_tex_pan_move)
         self.tex_canvas.bind("<MouseWheel>", self._on_tex_scroll)  # Windows/Mac
@@ -470,22 +491,24 @@ class MeshAnnotatorApp:
         self.tex_canvas.bind("<Button-5>", self._on_tex_scroll)  # Linux wheel down
 
         # -- controls --
-        mode_desc = (
-            f"Mesh mode: {self.mesh_mode}"
-            + (f" (spacing={self.mesh_spacing}m)" if self.mesh_mode == "tight_boundary" else "")
+        mode_desc = f"Mesh mode: {self.mesh_mode}" + (
+            f" (spacing={self.mesh_spacing}m)"
+            if self.mesh_mode == "tight_boundary"
+            else ""
         )
         ttk.Label(control_frame, text=mode_desc, foreground="#345").pack(
             anchor="w", padx=8, pady=(10, 2)
         )
         ttk.Checkbutton(
             control_frame,
-            text="Pick points (click texture to add)",
+            text="Pick points (click texture panel to add)",
             variable=self.pick_mode,
         ).pack(anchor="w", padx=8, pady=(4, 2))
         ttk.Label(
             control_frame,
             text="Scroll = zoom, right-drag = pan. Click points in order around "
-            "an object's outline, then Finish.",
+            "an object's outline (drag a point to move it, double-click a "
+            "point to delete it), then Finish.",
             foreground="#666",
             wraplength=300,
         ).pack(anchor="w", padx=8, pady=(0, 8))
@@ -508,15 +531,23 @@ class MeshAnnotatorApp:
         ).pack(fill=tk.X, pady=(2, 10))
 
         ttk.Separator(control_frame).pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(control_frame, text="Finished objects:").pack(anchor="w", padx=8)
+        ttk.Label(
+            control_frame, text="Finished objects (double-click to highlight):"
+        ).pack(anchor="w", padx=8)
         list_frame = ttk.Frame(control_frame)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         self.listbox = tk.Listbox(list_frame)
         self.listbox.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        self.listbox.bind("<Double-Button-1>", self._on_listbox_double_click)
         scrollbar = ttk.Scrollbar(list_frame, command=self.listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.config(yscrollcommand=scrollbar.set)
 
+        ttk.Button(
+            control_frame,
+            text="Edit selected object's points",
+            command=self.edit_selected,
+        ).pack(fill=tk.X, padx=8, pady=(2, 2))
         ttk.Button(
             control_frame, text="Delete selected object", command=self.delete_selected
         ).pack(fill=tk.X, padx=8, pady=(2, 10))
@@ -606,24 +637,21 @@ class MeshAnnotatorApp:
         self.tex_canvas.delete("all")
         self.tex_canvas.create_image(0, 0, anchor="nw", image=self._tex_photo)
 
-        def to_canvas_xy(x, z):
-            u, v = world_to_uv(x, z, **self.uv_params)
-            tw, th = self.tex_img.size
-            px, py = u * (tw - 1), v * (th - 1)
-            return (px - left) / self.tex_zoom, (py - top) / self.tex_zoom
-
         for obj in self.objects:
-            color = color_for_category(obj.category)
-            pts2d = [to_canvas_xy(x, z) for x, _y, z in obj.points]
+            highlighted = obj.mesh_id == self._highlighted_mesh_id
+            color = "#ffff00" if highlighted else color_for_category(obj.category)
+            pts2d = [self._world_to_canvas_xy(x, z) for x, _y, z in obj.points]
             if len(pts2d) >= 2:
                 flat = [c for xy in pts2d for c in xy]
-                self.tex_canvas.create_polygon(flat, outline=color, fill="", width=2)
+                self.tex_canvas.create_polygon(
+                    flat, outline=color, fill="", width=4 if highlighted else 2
+                )
             for cx, cy in pts2d:
                 self.tex_canvas.create_oval(
                     cx - 3, cy - 3, cx + 3, cy + 3, fill=color, outline=""
                 )
 
-        pts2d = [to_canvas_xy(x, z) for x, _y, z in self.current_points]
+        pts2d = [self._world_to_canvas_xy(x, z) for x, _y, z in self.current_points]
         if len(pts2d) >= 2:
             flat = [c for xy in pts2d for c in xy]
             self.tex_canvas.create_polygon(
@@ -660,21 +688,118 @@ class MeshAnnotatorApp:
         self._tex_pan_xy = (event.x, event.y)
         self._redraw_texture_panel()
 
-    def _on_tex_click(self, event):
-        if not self.pick_mode.get() or self.tex_crop_box is None:
-            return
+    def _world_to_canvas_xy(self, x: float, z: float) -> tuple[float, float]:
+        left, top, _right, _bottom = self.tex_crop_box
+        u, v = world_to_uv(x, z, **self.uv_params)
+        tw, th = self.tex_img.size
+        px, py = u * (tw - 1), v * (th - 1)
+        return (px - left) / self.tex_zoom, (py - top) / self.tex_zoom
+
+    def _canvas_to_world(self, event) -> Optional[tuple[float, float]]:
         left, top, _right, _bottom = self.tex_crop_box
         tw, th = self.tex_img.size
         px = left + event.x * self.tex_zoom
         py = top + event.y * self.tex_zoom
         u, v = px / (tw - 1), py / (th - 1)
         if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+            return None
+        return uv_to_world(u, v, **self.uv_params)
+
+    def _hit_test_current_point(
+        self, event, threshold_px: float = 10.0
+    ) -> Optional[int]:
+        """Index of the current-object point whose on-screen marker is
+        closest to the click, if within `threshold_px` canvas pixels."""
+        best_idx, best_dist = None, threshold_px
+        for i, (x, _y, z) in enumerate(self.current_points):
+            cx, cy = self._world_to_canvas_xy(x, z)
+            dist = ((cx - event.x) ** 2 + (cy - event.y) ** 2) ** 0.5
+            if dist < best_dist:
+                best_idx, best_dist = i, dist
+        return best_idx
+
+    def _on_tex_press(self, event):
+        if not self.pick_mode.get() or self.tex_crop_box is None:
             return
-        x, z = uv_to_world(u, v, **self.uv_params)
+        hit = self._hit_test_current_point(event)
+        if hit is not None:
+            # Starting a drag on an existing marker -- don't also add a
+            # new point.
+            self._dragging_idx = hit
+            return
+        self._dragging_idx = None
+        world = self._canvas_to_world(event)
+        if world is None:
+            return
+        x, z = world
         y = float(self.terrain_grid(x, z))
         self.current_points.append([x, y, z])
         self._redraw()
         self._status(f"Added point at ({x:.2f}, {y:.2f}, {z:.2f}).")
+
+    def _on_tex_drag(self, event):
+        if self._dragging_idx is None or not self.pick_mode.get():
+            return
+        world = self._canvas_to_world(event)
+        if world is None:
+            return
+        x, z = world
+        y = float(self.terrain_grid(x, z))
+        self.current_points[self._dragging_idx] = [x, y, z]
+        self._redraw()
+
+    def _on_tex_release(self, _event):
+        if self._dragging_idx is not None:
+            x, y, z = self.current_points[self._dragging_idx]
+            self._status(f"Moved point to ({x:.2f}, {y:.2f}, {z:.2f}).")
+        self._dragging_idx = None
+
+    def _on_tex_double_click(self, event):
+        if not self.pick_mode.get() or self.tex_crop_box is None:
+            return
+        hit = self._hit_test_current_point(event)
+        if hit is None:
+            return
+        self.current_points.pop(hit)
+        self._dragging_idx = None
+        self._redraw()
+        self._status("Deleted point.")
+
+    def _on_listbox_double_click(self, _event):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        self._highlight_object(self.objects[sel[0]])
+
+    def _highlight_object(self, obj: AnnotatedObject):
+        pts = np.array(obj.points)
+        xs, zs = pts[:, 0], pts[:, 2]
+        cx_world = (xs.min() + xs.max()) / 2.0
+        cz_world = (zs.min() + zs.max()) / 2.0
+        span = max(xs.max() - xs.min(), zs.max() - zs.min(), 1e-3) * 3.0
+
+        tw, th = self.tex_img.size
+        u, v = world_to_uv(cx_world, cz_world, **self.uv_params)
+        self.tex_center = [u * (tw - 1), v * (th - 1)]
+
+        cw, ch = self.tex_canvas.winfo_width(), self.tex_canvas.winfo_height()
+        u0, v0 = world_to_uv(cx_world - span / 2, cz_world - span / 2, **self.uv_params)
+        u1, v1 = world_to_uv(cx_world + span / 2, cz_world + span / 2, **self.uv_params)
+        span_px = max(abs(u1 - u0) * tw, abs(v1 - v0) * th)
+        min_zoom = 0.02
+        max_zoom = max(tw / max(cw, 1), th / max(ch, 1))
+        self.tex_zoom = float(
+            np.clip(span_px / max(min(cw, ch), 1), min_zoom, max_zoom)
+        )
+
+        self._highlighted_mesh_id = obj.mesh_id
+        self._redraw_texture_panel()
+        self._status(f"Highlighting mesh_id {obj.mesh_id} '{obj.name}'.")
+        self.root.after(1500, self._clear_highlight)
+
+    def _clear_highlight(self):
+        self._highlighted_mesh_id = None
+        self._redraw_texture_panel()
 
     # -- mesh building -------------------------------------------------------
 
@@ -696,13 +821,60 @@ class MeshAnnotatorApp:
             self.current_points.pop()
             self._redraw()
 
+    def _restore_editing_if_any(self):
+        """If an existing object was pulled out for editing, put it back
+        into self.objects unchanged (used by cancel and by starting a new
+        edit/close while one is already in progress)."""
+        if self._editing_orig is None:
+            return
+        idx = (
+            self._editing_orig_idx
+            if self._editing_orig_idx is not None
+            else len(self.objects)
+        )
+        idx = min(idx, len(self.objects))
+        self.objects.insert(idx, self._editing_orig)
+        self._editing_orig = None
+        self._editing_orig_idx = None
+        self._refresh_listbox()
+
+    def edit_selected(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        obj = self.objects[sel[0]]
+        if self.current_points and not messagebox.askyesno(
+            "Discard current points?",
+            f"You have {len(self.current_points)} unfinished point(s). Editing "
+            "another object will discard them. Continue?",
+        ):
+            return
+        self._restore_editing_if_any()
+        idx = next(i for i, o in enumerate(self.objects) if o is obj)
+        del self.objects[idx]
+        self._editing_orig = obj
+        self._editing_orig_idx = idx
+        self.current_points = [list(p) for p in obj.points]
+        self.pick_mode.set(True)
+        self._refresh_listbox()
+        self._redraw()
+        self._status(
+            f"Editing mesh_id {obj.mesh_id} '{obj.name}': drag a point to move it, "
+            "double-click a point to delete it, click empty space to add one, "
+            "then Finish object to save."
+        )
+
     def cancel_current(self):
         if self.current_points and not messagebox.askyesno(
             "Cancel object", f"Discard {len(self.current_points)} marked point(s)?"
         ):
             return
         self.current_points = []
+        was_editing = self._editing_orig is not None
+        self._restore_editing_if_any()
         self._redraw()
+        if was_editing:
+            self._status("Cancelled edit; object restored unchanged.")
 
     def finish_object(self):
         if len(self.current_points) < 3:
@@ -719,16 +891,29 @@ class MeshAnnotatorApp:
             messagebox.showerror("Mesh failed", f"Could not build mesh: {exc}")
             return
 
-        dialog = LabelDialog(self.root, default_name=f"object_{self.next_mesh_id}")
+        editing = self._editing_orig
+        default_category = editing.category if editing else self.last_category
+        default_name = editing.name if editing else f"object_{self.next_mesh_id}"
+        dialog = LabelDialog(
+            self.root, default_name=default_name, default_category=default_category
+        )
         self.root.wait_window(dialog.top)
         if dialog.result is None:
             return  # cancelled, keep points as-is
         category, name = dialog.result
         name = sanitize_name(name)
+        self.last_category = category
 
-        mesh_id = self.next_mesh_id
-        self.next_mesh_id += 1
-        obj_path = f"subobjects/mesh_{mesh_id}_{name}.obj"
+        if editing:
+            mesh_id = editing.mesh_id
+            obj_path = f"subobjects/mesh_{mesh_id}_{name}.obj"
+            if obj_path != editing.obj_path:
+                self.store.delete_hull_obj(editing)
+        else:
+            mesh_id = self.next_mesh_id
+            self.next_mesh_id += 1
+            obj_path = f"subobjects/mesh_{mesh_id}_{name}.obj"
+
         obj = AnnotatedObject(
             mesh_id=mesh_id,
             name=name,
@@ -739,12 +924,21 @@ class MeshAnnotatorApp:
             obj_path=obj_path,
         )
         self.store.write_hull_obj(obj)
-        self.objects.append(obj)
+        insert_idx = (
+            self._editing_orig_idx
+            if editing and self._editing_orig_idx is not None
+            else len(self.objects)
+        )
+        insert_idx = min(insert_idx, len(self.objects))
+        self.objects.insert(insert_idx, obj)
         self.current_points = []
+        self._editing_orig = None
+        self._editing_orig_idx = None
         self._refresh_listbox()
         self._redraw()
         self._save()
-        self._status(f"Saved mesh_id {mesh_id} '{name}' ({category}) -> {obj_path}")
+        verb = "Updated" if editing else "Saved"
+        self._status(f"{verb} mesh_id {mesh_id} '{name}' ({category}) -> {obj_path}")
 
     def recompute_all(self):
         """Rebuilds every object's mesh from its already-recorded raw click
@@ -796,9 +990,17 @@ class MeshAnnotatorApp:
         self._status(f"Deleted mesh_id {obj.mesh_id}.")
 
     def _save(self):
-        self.store.save(self.objects, self.next_mesh_id, self.current_points)
+        self.store.save(
+            self.objects, self.next_mesh_id, self.current_points, self.last_category
+        )
 
     def _on_close(self):
+        if self._editing_orig is not None:
+            # An in-progress edit has no persisted identity of its own (only
+            # finished objects + raw pending points are saved) -- discard the
+            # edit rather than silently losing the original object on resume.
+            self.current_points = []
+            self._restore_editing_if_any()
         self._save()
         self.root.destroy()
 
@@ -806,7 +1008,9 @@ class MeshAnnotatorApp:
 class LabelDialog:
     """Modal category + name prompt used when finishing an object."""
 
-    def __init__(self, parent, default_name: str):
+    def __init__(
+        self, parent, default_name: str, default_category: str = CATEGORIES[0]
+    ):
         self.result = None
         self.top = tk.Toplevel(parent)
         self.top.title("Label object")
@@ -816,7 +1020,7 @@ class LabelDialog:
         ttk.Label(self.top, text="Category:").grid(
             row=0, column=0, sticky="w", padx=8, pady=(10, 2)
         )
-        self.category_var = tk.StringVar(value=CATEGORIES[0])
+        self.category_var = tk.StringVar(value=default_category)
         combo = ttk.Combobox(
             self.top, textvariable=self.category_var, values=CATEGORIES
         )
