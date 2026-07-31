@@ -98,6 +98,7 @@ DEFAULT_LORA_TARGET_MODULES = ("qkv", "proj")
 DEFAULT_FOCAL_WEIGHT = 20.0
 DEFAULT_DICE_WEIGHT = 1.0
 
+prev = time.time()
 
 # ---------------------------------------------------------------------------
 # Datasets
@@ -711,6 +712,7 @@ def train(args: argparse.Namespace) -> Path:
     print(
         f"[{time.strftime('%H:%M:%S')}]][wakeup tem] done. best val_mIoU={best_miou:.4f}, final checkpoint -> {out_dir / 'final'}"
     )
+    print(f"training took {time.time() - prev:.2f} seconds")
 
     model.eval()
     cm = torch.zeros((num_classes, num_classes), dtype=torch.int64)
@@ -733,16 +735,22 @@ def train(args: argparse.Namespace) -> Path:
 
         full_ds = ConcatDataset([train_ds, val_ds])
         sample_idx = random.Random(args.seed + 1).sample(range(len(full_ds)), n_random)
-        print(f"\n[eval] pixel accuracy on {n_random} random image(s) from the dataset:")
+        print(
+            f"\n[eval] pixel accuracy on {n_random} random image(s) from the dataset:"
+        )
         accs = []
         with torch.no_grad():
             for i in sample_idx:
                 image, mask = full_ds[i]
-                pred = model(image.unsqueeze(0).to(device)).argmax(dim=1).squeeze(0).cpu()
+                pred = (
+                    model(image.unsqueeze(0).to(device)).argmax(dim=1).squeeze(0).cpu()
+                )
                 acc = (pred == mask).float().mean().item()
                 accs.append(acc)
                 print(f"    idx={i:>6}  accuracy={acc:.4f}")
-        print(f"[eval] mean accuracy over {n_random} random image(s): {np.mean(accs):.4f}")
+        print(
+            f"[eval] mean accuracy over {n_random} random image(s): {np.mean(accs):.4f}"
+        )
 
     return out_dir
 
