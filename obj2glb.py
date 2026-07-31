@@ -118,6 +118,14 @@ def export_glb(filepath):
         export_materials="EXPORT",
         export_image_format="AUTO",
         export_apply=True,
+        # See dem2glb.py: Habitat has no .stage_config.json for this asset, so
+        # it falls back to orient_up=[0,0,1] and rotates as raw Z-up. The
+        # glTF-spec Y-up conversion (export_yup default True) double-rotates
+        # it, putting the ground plane on X/Z and height on Y -- the camera
+        # ends up looking at empty space (black-void renders, zero objects
+        # detected). export_yup=False keeps Blender's native Z-up axes so
+        # Habitat's rotation lands the mesh correctly.
+        export_yup=False,
     )
 
 

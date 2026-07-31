@@ -103,6 +103,7 @@ DEFAULT_DICE_WEIGHT = 1.0
 # Datasets
 # ---------------------------------------------------------------------------
 
+
 def _load_and_resize_rgb(path: Path, image_size: int) -> np.ndarray:
     import cv2
 
@@ -129,7 +130,9 @@ class SegmentationRunDataset(Dataset):
     target, no polygon round-trip needed.
     """
 
-    def __init__(self, run_dir: Path, frame_ids: Sequence[str], image_size: int = IMAGE_SIZE):
+    def __init__(
+        self, run_dir: Path, frame_ids: Sequence[str], image_size: int = IMAGE_SIZE
+    ):
         self.run_dir = Path(run_dir)
         self.frame_ids = list(frame_ids)
         self.image_size = image_size
@@ -141,11 +144,20 @@ class SegmentationRunDataset(Dataset):
         import cv2
 
         frame_id = self.frame_ids[idx]
-        rgb = _load_and_resize_rgb(self.run_dir / "rgb" / f"{frame_id}.png", self.image_size)
-        mask = cv2.imread(str(self.run_dir / "masks_category" / f"{frame_id}.png"), cv2.IMREAD_GRAYSCALE)
+        rgb = _load_and_resize_rgb(
+            self.run_dir / "rgb" / f"{frame_id}.png", self.image_size
+        )
+        mask = cv2.imread(
+            str(self.run_dir / "masks_category" / f"{frame_id}.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
         if mask is None:
-            raise FileNotFoundError(f"could not read category mask for frame '{frame_id}' in {self.run_dir}")
-        mask = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+            raise FileNotFoundError(
+                f"could not read category mask for frame '{frame_id}' in {self.run_dir}"
+            )
+        mask = cv2.resize(
+            mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST
+        )
         return _normalize_image(rgb), torch.from_numpy(mask.astype(np.int64))
 
 
@@ -172,12 +184,16 @@ class CocoPolygonDataset(Dataset):
     needed; unannotated pixels default to 0 (background).
     """
 
-    def __init__(self, coco_json: Path, images_root: Path, image_size: int = IMAGE_SIZE):
+    def __init__(
+        self, coco_json: Path, images_root: Path, image_size: int = IMAGE_SIZE
+    ):
         self.images_root = Path(images_root)
         self.image_size = image_size
 
         coco = json.loads(Path(coco_json).read_text())
-        self.class_names = ["background"] + [c["name"] for c in sorted(coco["categories"], key=lambda c: c["id"])]
+        self.class_names = ["background"] + [
+            c["name"] for c in sorted(coco["categories"], key=lambda c: c["id"])
+        ]
 
         self.images_by_id = {img["id"]: img for img in coco["images"]}
         self.anns_by_image: Dict[int, List[dict]] = {}
@@ -196,14 +212,23 @@ class CocoPolygonDataset(Dataset):
         image_rec = self.images_by_id[image_id]
         orig_w, orig_h = image_rec["width"], image_rec["height"]
 
-        rgb = _load_and_resize_rgb(self.images_root / image_rec["file_name"], self.image_size)
+        rgb = _load_and_resize_rgb(
+            self.images_root / image_rec["file_name"], self.image_size
+        )
 
         mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
         for ann in self.anns_by_image.get(image_id, []):
             for polygon in ann["segmentation"]:
-                pts = np.array(polygon, dtype=np.float64).reshape(-1, 2).round().astype(np.int32)
+                pts = (
+                    np.array(polygon, dtype=np.float64)
+                    .reshape(-1, 2)
+                    .round()
+                    .astype(np.int32)
+                )
                 cv2.fillPoly(mask, [pts], color=int(ann["category_id"]))
-        mask = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+        mask = cv2.resize(
+            mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST
+        )
 
         return _normalize_image(rgb), torch.from_numpy(mask.astype(np.int64))
 
@@ -225,7 +250,9 @@ def build_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset, List[str
             class_names,
         )
 
-    images_root = Path(args.images_root) if args.images_root else Path(args.coco_json).parents[2]
+    images_root = (
+        Path(args.images_root) if args.images_root else Path(args.coco_json).parents[2]
+    )
     full = CocoPolygonDataset(Path(args.coco_json), images_root, args.image_size)
     rng = random.Random(args.seed)
     indices = list(range(len(full)))
@@ -254,6 +281,7 @@ def build_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset, List[str
 # LoRA wrapping
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class LoraSettings:
     rank: int = 8
@@ -262,7 +290,9 @@ class LoraSettings:
     target_modules: Tuple[str, ...] = DEFAULT_LORA_TARGET_MODULES
 
 
-def apply_lora_to_image_encoder(image_encoder: nn.Module, settings: LoraSettings) -> nn.Module:
+def apply_lora_to_image_encoder(
+    image_encoder: nn.Module, settings: LoraSettings
+) -> nn.Module:
     """Wraps the Hiera trunk's attention Linear layers (attn.qkv, attn.proj
     -- see hieradet.MultiScaleAttention) with LoRA adapters via peft, and
     freezes everything else in the encoder. target_modules matches by
@@ -286,7 +316,13 @@ def apply_lora_to_image_encoder(image_encoder: nn.Module, settings: LoraSettings
 # Model assembly
 # ---------------------------------------------------------------------------
 
-def build_model(num_classes: int, encoder_mode: str, lora_settings: Optional[LoraSettings], device: str) -> SimpleSAM2Seg:
+
+def build_model(
+    num_classes: int,
+    encoder_mode: str,
+    lora_settings: Optional[LoraSettings],
+    device: str,
+) -> SimpleSAM2Seg:
     """Reuses sam2_custom_head's backbone builder + SimpleSAM2Seg
     architecture (drop-in with the deployed model) rather than
     reimplementing it. num_classes/CLASS ordering come from the dataset's
@@ -307,7 +343,9 @@ def build_model(num_classes: int, encoder_mode: str, lora_settings: Optional[Lor
         for p in model.image_encoder.parameters():
             p.requires_grad = False
         assert lora_settings is not None
-        model.image_encoder = apply_lora_to_image_encoder(model.image_encoder, lora_settings)
+        model.image_encoder = apply_lora_to_image_encoder(
+            model.image_encoder, lora_settings
+        )
     elif encoder_mode == "full":
         for p in model.image_encoder.parameters():
             p.requires_grad = True
@@ -327,13 +365,22 @@ def build_model(num_classes: int, encoder_mode: str, lora_settings: Optional[Lor
 # since there's no per-object binary mask here.
 # ---------------------------------------------------------------------------
 
-def multiclass_focal_loss(logits: torch.Tensor, target: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
+
+def multiclass_focal_loss(
+    logits: torch.Tensor, target: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0
+) -> torch.Tensor:
     ce = F.cross_entropy(logits, target, reduction="none")
     pt = torch.exp(-ce)
     return (alpha * (1 - pt).pow(gamma) * ce).mean()
 
 
-def multiclass_dice_loss(logits: torch.Tensor, target: torch.Tensor, num_classes: int, exclude_background: bool = False, eps: float = 1.0) -> torch.Tensor:
+def multiclass_dice_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    exclude_background: bool = False,
+    eps: float = 1.0,
+) -> torch.Tensor:
     probs = F.softmax(logits, dim=1)
     one_hot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
     start = 1 if exclude_background else 0
@@ -352,7 +399,9 @@ def seg_loss(
     dice_exclude_background: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     focal = multiclass_focal_loss(logits, target)
-    dice = multiclass_dice_loss(logits, target, num_classes, exclude_background=dice_exclude_background)
+    dice = multiclass_dice_loss(
+        logits, target, num_classes, exclude_background=dice_exclude_background
+    )
     total = focal_weight * focal + dice_weight * dice
     return total, {"focal": focal.item(), "dice": dice.item(), "total": total.item()}
 
@@ -361,12 +410,17 @@ def seg_loss(
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_miou(pred: torch.Tensor, target: torch.Tensor, num_classes: int) -> Tuple[float, List[float]]:
+
+def compute_miou(
+    pred: torch.Tensor, target: torch.Tensor, num_classes: int
+) -> Tuple[float, List[float]]:
     ious = []
     for cls in range(num_classes):
         pred_cls, target_cls = pred == cls, target == cls
         union = (pred_cls | target_cls).sum().item()
-        ious.append((pred_cls & target_cls).sum().item() / union if union > 0 else float("nan"))
+        ious.append(
+            (pred_cls & target_cls).sum().item() / union if union > 0 else float("nan")
+        )
     valid = [v for v in ious if not np.isnan(v)]
     return (sum(valid) / len(valid) if valid else 0.0), ious
 
@@ -375,7 +429,16 @@ def compute_miou(pred: torch.Tensor, target: torch.Tensor, num_classes: int) -> 
 # Checkpointing
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(out_dir: Path, model: SimpleSAM2Seg, encoder_mode: str, class_names: List[str], args: argparse.Namespace, epoch: int, val_metrics: dict) -> None:
+
+def save_checkpoint(
+    out_dir: Path,
+    model: SimpleSAM2Seg,
+    encoder_mode: str,
+    class_names: List[str],
+    args: argparse.Namespace,
+    epoch: int,
+    val_metrics: dict,
+) -> None:
     """Saves adapters/heads separately, never merged into the base
     checkpoint, so swapping the base SAM2 checkpoint later stays possible:
       lora_adapter/    -- peft's own save_pretrained output (encoder_mode=lora only)
@@ -399,8 +462,14 @@ def save_checkpoint(out_dir: Path, model: SimpleSAM2Seg, encoder_mode: str, clas
         "image_size": args.image_size,
         "encoder_mode": encoder_mode,
         "lora": (
-            {"rank": args.lora_rank, "alpha": args.lora_alpha, "dropout": args.lora_dropout, "target_modules": args.lora_target_modules}
-            if encoder_mode == "lora" else None
+            {
+                "rank": args.lora_rank,
+                "alpha": args.lora_alpha,
+                "dropout": args.lora_dropout,
+                "target_modules": args.lora_target_modules,
+            }
+            if encoder_mode == "lora"
+            else None
         ),
         "sam2_root": str(SAM2_ROOT),
         "sam2_config": SAM2_MODEL_CONFIG,
@@ -429,12 +498,18 @@ def load_finetuned_model(checkpoint_dir: Path, device: str = "cuda") -> SimpleSA
     if encoder_mode == "lora":
         from peft import PeftModel
 
-        model.image_encoder = PeftModel.from_pretrained(model.image_encoder, checkpoint_dir / "lora_adapter")
+        model.image_encoder = PeftModel.from_pretrained(
+            model.image_encoder, checkpoint_dir / "lora_adapter"
+        )
     elif encoder_mode == "full":
-        state = torch.load(checkpoint_dir / "encoder_full.pt", map_location=device, weights_only=True)
+        state = torch.load(
+            checkpoint_dir / "encoder_full.pt", map_location=device, weights_only=True
+        )
         model.image_encoder.load_state_dict(state)
 
-    seg_head_state = torch.load(checkpoint_dir / "seg_head.pt", map_location=device, weights_only=True)
+    seg_head_state = torch.load(
+        checkpoint_dir / "seg_head.pt", map_location=device, weights_only=True
+    )
     model.seg_head.load_state_dict(seg_head_state)
     model.eval()
     return model
@@ -444,28 +519,55 @@ def load_finetuned_model(checkpoint_dir: Path, device: str = "cuda") -> SimpleSA
 # Training loop
 # ---------------------------------------------------------------------------
 
+
 def train(args: argparse.Namespace) -> Path:
     device = args.device
     train_ds, val_ds, class_names = build_datasets(args)
     num_classes = len(class_names)
-    print(f"[finetune_sam2_lora] classes: {class_names} ({num_classes})")
-    print(f"[finetune_sam2_lora] train: {len(train_ds)} frames, val: {len(val_ds)} frames")
+    print(f"[input] classes: {class_names} ({num_classes})")
+    print(f"[input] train: {len(train_ds)} frames, val: {len(val_ds)} frames")
 
     if args.dry_run:
-        print("[finetune_sam2_lora] dry run -- dataset/config validated, stopping before model build")
+        print(
+            "[input] dry run -- dataset/config validated, stopping before model build"
+        )
         return Path(args.out_dir)
 
-    lora_settings = LoraSettings(args.lora_rank, args.lora_alpha, args.lora_dropout, tuple(args.lora_target_modules))
-    model = build_model(num_classes, args.encoder_mode, lora_settings if args.encoder_mode == "lora" else None, device)
+    lora_settings = LoraSettings(
+        args.lora_rank,
+        args.lora_alpha,
+        args.lora_dropout,
+        tuple(args.lora_target_modules),
+    )
+    model = build_model(
+        num_classes,
+        args.encoder_mode,
+        lora_settings if args.encoder_mode == "lora" else None,
+        device,
+    )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"[finetune_sam2_lora] encoder_mode={args.encoder_mode}, trainable params: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
+    print(
+        f"[config] encoder_mode={args.encoder_mode}, trainable params: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)"
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=len(train_ds) > args.batch_size)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=len(train_ds) > args.batch_size,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+    )
 
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     start_epoch = 1
 
     if args.resume:
@@ -473,7 +575,7 @@ def train(args: argparse.Namespace) -> Path:
         model.load_state_dict(state["model"], strict=False)
         optimizer.load_state_dict(state["optimizer"])
         start_epoch = state["epoch"] + 1
-        print(f"[finetune_sam2_lora] resumed from {args.resume} at epoch {start_epoch}")
+        print(f"[bro] resumed from {args.resume} at epoch {start_epoch}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -485,12 +587,23 @@ def train(args: argparse.Namespace) -> Path:
         epoch_losses: List[float] = []
         t0 = time.monotonic()
         for images, masks in train_loader:
-            images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+            images, masks = images.to(device, non_blocking=True), masks.to(
+                device, non_blocking=True
+            )
             logits = model(images)
-            loss, parts = seg_loss(logits, masks, num_classes, args.focal_weight, args.dice_weight, args.dice_exclude_background)
+            loss, parts = seg_loss(
+                logits,
+                masks,
+                num_classes,
+                args.focal_weight,
+                args.dice_weight,
+                args.dice_exclude_background,
+            )
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_((p for p in model.parameters() if p.requires_grad), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in model.parameters() if p.requires_grad), max_norm=1.0
+            )
             optimizer.step()
             epoch_losses.append(parts["total"])
 
@@ -499,21 +612,36 @@ def train(args: argparse.Namespace) -> Path:
         val_ious: List[List[float]] = []
         with torch.no_grad():
             for images, masks in val_loader:
-                images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+                images, masks = images.to(device, non_blocking=True), masks.to(
+                    device, non_blocking=True
+                )
                 logits = model(images)
-                _, parts = seg_loss(logits, masks, num_classes, args.focal_weight, args.dice_weight, args.dice_exclude_background)
+                _, parts = seg_loss(
+                    logits,
+                    masks,
+                    num_classes,
+                    args.focal_weight,
+                    args.dice_weight,
+                    args.dice_exclude_background,
+                )
                 val_losses.append(parts["total"])
                 pred = logits.argmax(dim=1)
                 _, per_class = compute_miou(pred, masks, num_classes)
                 val_ious.append(per_class)
 
         per_class_arr = np.array(val_ious, dtype=np.float64)
-        per_class_miou = np.nanmean(per_class_arr, axis=0).tolist() if len(val_ious) else [float("nan")] * num_classes
+        per_class_miou = (
+            np.nanmean(per_class_arr, axis=0).tolist()
+            if len(val_ious)
+            else [float("nan")] * num_classes
+        )
         mean_iou = float(np.nanmean(per_class_miou)) if per_class_miou else 0.0
 
         metrics = {
             "epoch": epoch,
-            "train_loss": float(np.mean(epoch_losses)) if epoch_losses else float("nan"),
+            "train_loss": (
+                float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+            ),
             "val_loss": float(np.mean(val_losses)) if val_losses else float("nan"),
             "val_mean_iou": mean_iou,
             "val_class_iou": dict(zip(class_names, per_class_miou)),
@@ -522,19 +650,46 @@ def train(args: argparse.Namespace) -> Path:
         with log_path.open("a") as f:
             f.write(json.dumps(metrics) + "\n")
         print(
-            f"[finetune_sam2_lora] epoch {epoch}/{args.epochs} "
+            f"[{time.strftime('%H:%M:%S')}]][ninni tem] epoch {epoch}/{args.epochs} "
             f"train_loss={metrics['train_loss']:.4f} val_loss={metrics['val_loss']:.4f} val_mIoU={mean_iou:.4f}"
         )
 
-        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch}, out_dir / "training_state.pt")
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+            },
+            out_dir / "training_state.pt",
+        )
 
         if mean_iou > best_miou:
             best_miou = mean_iou
-            save_checkpoint(out_dir / "best", model, args.encoder_mode, class_names, args, epoch, metrics)
-            print(f"[finetune_sam2_lora]   saved new best (val_mIoU={mean_iou:.4f}) -> {out_dir / 'best'}")
+            save_checkpoint(
+                out_dir / "best",
+                model,
+                args.encoder_mode,
+                class_names,
+                args,
+                epoch,
+                metrics,
+            )
+            print(
+                f"[{time.strftime('%H:%M:%S')}]][ninni tem] saved new best (val_mIoU={mean_iou:.4f}) -> {out_dir / 'best'}"
+            )
 
-    save_checkpoint(out_dir / "final", model, args.encoder_mode, class_names, args, args.epochs, metrics)
-    print(f"[finetune_sam2_lora] done. best val_mIoU={best_miou:.4f}, final checkpoint -> {out_dir / 'final'}")
+    save_checkpoint(
+        out_dir / "final",
+        model,
+        args.encoder_mode,
+        class_names,
+        args,
+        args.epochs,
+        metrics,
+    )
+    print(
+        f"[{time.strftime('%H:%M:%S')}]][wakeup tem] done. best val_mIoU={best_miou:.4f}, final checkpoint -> {out_dir / 'final'}"
+    )
     return out_dir
 
 
@@ -542,24 +697,46 @@ def train(args: argparse.Namespace) -> Path:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _build_argparser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
 
     source = ap.add_mutually_exclusive_group(required=True)
-    source.add_argument("--run-dir", default=None, help="a run directory produced by run_segmentation_sweep.py (preferred, lossless)")
-    source.add_argument("--coco-json", default=None, help="an export_annotations coco/instances.json (fallback when run_dir isn't available)")
-    ap.add_argument("--images-root", default=None, help="root that --coco-json's file_name paths are relative to (default: two levels up, i.e. the run_dir)")
+    source.add_argument(
+        "--run-dir",
+        default=None,
+        help="a run directory produced by run_segmentation_sweep.py (preferred, lossless)",
+    )
+    source.add_argument(
+        "--coco-json",
+        default=None,
+        help="an export_annotations coco/instances.json (fallback when run_dir isn't available)",
+    )
+    ap.add_argument(
+        "--images-root",
+        default=None,
+        help="root that --coco-json's file_name paths are relative to (default: two levels up, i.e. the run_dir)",
+    )
 
     ap.add_argument("--out-dir", required=True, help="where to write checkpoints/logs")
     ap.add_argument("--image-size", type=int, default=IMAGE_SIZE)
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=0)
 
-    ap.add_argument("--encoder-mode", choices=["lora", "frozen", "full"], default="lora", help="lora: LoRA-adapt trunk attention (default); frozen: matches sam/train_sam2_simple_fast.py's original decoder-only default; full: full encoder finetune")
+    ap.add_argument(
+        "--encoder-mode",
+        choices=["lora", "frozen", "full"],
+        default="lora",
+        help="lora: LoRA-adapt trunk attention (default); frozen: matches sam/train_sam2_simple_fast.py's original decoder-only default; full: full encoder finetune",
+    )
     ap.add_argument("--lora-rank", type=int, default=8)
     ap.add_argument("--lora-alpha", type=int, default=16)
     ap.add_argument("--lora-dropout", type=float, default=0.05)
-    ap.add_argument("--lora-target-modules", nargs="+", default=list(DEFAULT_LORA_TARGET_MODULES))
+    ap.add_argument(
+        "--lora-target-modules", nargs="+", default=list(DEFAULT_LORA_TARGET_MODULES)
+    )
 
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=8)
@@ -568,18 +745,32 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--focal-weight", type=float, default=DEFAULT_FOCAL_WEIGHT)
     ap.add_argument("--dice-weight", type=float, default=DEFAULT_DICE_WEIGHT)
-    ap.add_argument("--dice-exclude-background", action="store_true", help="drop background from the dice term's class average -- background/bedrock pixel counts dominate a scene (next.md's noted class imbalance), this keeps dice from being swamped by it")
+    ap.add_argument(
+        "--dice-exclude-background",
+        action="store_true",
+        help="drop background from the dice term's class average -- background/bedrock pixel counts dominate a scene (next.md's noted class imbalance), this keeps dice from being swamped by it",
+    )
 
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--resume", default=None, help="path to a training_state.pt to resume from")
-    ap.add_argument("--dry-run", action="store_true", help="validate dataset/class list and stop before building the model or training")
+    ap.add_argument(
+        "--resume", default=None, help="path to a training_state.pt to resume from"
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate dataset/class list and stop before building the model or training",
+    )
 
     return ap
 
 
 if __name__ == "__main__":
     parsed = _build_argparser().parse_args()
-    if parsed.coco_json and not parsed.images_root and len(Path(parsed.coco_json).parents) < 3:
+    if (
+        parsed.coco_json
+        and not parsed.images_root
+        and len(Path(parsed.coco_json).parents) < 3
+    ):
         raise SystemExit(
             "--coco-json path too shallow to infer --images-root (need "
             "<run_dir>/annotations_export/coco/instances.json or deeper); pass --images-root explicitly"

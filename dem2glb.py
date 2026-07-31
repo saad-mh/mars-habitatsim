@@ -68,9 +68,15 @@ def build_mesh(data, size_x, size_y, size_z):
 
     # Gazebo/SDF heightmap convention: raw pixel values are normalized
     # (min..max of the data) then scaled to size_z, mid-level at the mean.
+    # Must match sam_vla/env/terrain.py's HeightmapGrid normalization exactly
+    # (scale then subtract the mean) -- that module is the sole source of the
+    # rover/camera's world-Y at every pose, computed independently from this
+    # mesh. Any deviation shifts this mesh vertically relative to where the
+    # camera thinks the ground is, at every point on the map.
     z_min, z_max = data.min(), data.max()
     z_range = z_max - z_min if z_max > z_min else 1.0
-    heights = (data - z_min) / z_range * size_z  # 0..size_z
+    heights = (data - z_min) / z_range * size_z
+    heights = heights - heights.mean()
 
     xs = np.linspace(-size_x / 2.0, size_x / 2.0, res)
     ys = np.linspace(-size_y / 2.0, size_y / 2.0, res)

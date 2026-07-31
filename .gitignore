@@ -37,6 +37,9 @@ samples
 logs
 results
 output
+sam_lora_runs/
+
 assets/marsyard2022_bak.glb
 marsyard2022.glb
 marsyard2022_terrain.glb
+assets/marsyard2022n.glb

@@ -20,7 +20,11 @@ from sam_vla.core.types import Pose
 from sam_vla.env.habitat_env import MarsHabitatEnv
 from sam_vla.env.pose_sweep import PoseSweepConfig, sample_sweep_poses
 from sam_vla.logging.episode_logger import EpisodeLogger, make_run_id
-from sam_vla.perception.segmentation_capture import build_category_lut, capture_frame_record, write_segmentation_assets
+from sam_vla.perception.segmentation_capture import (
+    build_category_lut,
+    capture_frame_record,
+    write_segmentation_assets,
+)
 from sam_vla.perception.spot_check_segmentation import spot_check_run
 
 ALL_CATEGORIES = ["small_rock", "big_rock", "bedrock", "hole_in_ground"]
@@ -68,32 +72,54 @@ def run_sweep(args: argparse.Namespace) -> dict:
         rock_field_path=args.rock_field_path,
     ) as env:
         mesh_id_map = env.annotation_mesh_id_map
-        lut, class_names = build_category_lut(mesh_id_map, categories, args.background_category)
+        lut, class_names = build_category_lut(
+            mesh_id_map, categories, args.background_category
+        )
 
         for i, (x, z, yaw) in enumerate(poses):
             env.step(Pose(x=x, y=0.0, z=z, yaw=yaw))
-            obs = env.get_full_observation(frame_idx=i)  # one render call: rgb+depth+semantic+pose
+            obs = env.get_full_observation(
+                frame_idx=i
+            )  # one render call: rgb+depth+semantic+pose
 
-            category_mask, objects = capture_frame_record(obs.rgb, obs.semantic, mesh_id_map, lut, class_names)
+            category_mask, objects = capture_frame_record(
+                obs.rgb, obs.semantic, mesh_id_map, lut, class_names
+            )
 
             frame_id = f"sweep_{i:06d}"
             paths = write_segmentation_assets(
-                logger.run_dir, frame_id, obs.rgb, obs.semantic.astype(np.uint16), category_mask
+                logger.run_dir,
+                frame_id,
+                obs.rgb,
+                obs.semantic.astype(np.uint16),
+                category_mask,
             )
             logger.log_segmentation_frame(
                 frame_id=frame_id,
                 objects=[asdict(o) for o in objects],
-                camera_pose={"x": obs.pose.x, "y": obs.pose.y, "z": obs.pose.z, "yaw": obs.pose.yaw},
+                camera_pose={
+                    "x": obs.pose.x,
+                    "y": obs.pose.y,
+                    "z": obs.pose.z,
+                    "yaw": obs.pose.yaw,
+                },
                 **paths,
             )
+            print(f"[!] wrote -> {i}")
 
     elapsed_s = time.monotonic() - start_time
-    summary = logger.finalize({"total_frames": len(poses), "class_names": class_names, "elapsed_s": elapsed_s})
-    print(f"generated {len(poses)} images in {_format_duration(elapsed_s)} -> {logger.run_dir}")
+    summary = logger.finalize(
+        {"total_frames": len(poses), "class_names": class_names, "elapsed_s": elapsed_s}
+    )
+    print(
+        f"generated {len(poses)} images in {_format_duration(elapsed_s)} -> {logger.run_dir}"
+    )
 
     if args.spot_check_n > 0:
         written = spot_check_run(logger.run_dir, n=args.spot_check_n, seed=args.seed)
-        print(f"wrote {len(written)} spot-check overlays -> {logger.run_dir / 'spot_check'}")
+        print(
+            f"wrote {len(written)} spot-check overlays -> {logger.run_dir / 'spot_check'}"
+        )
 
     return summary
 
@@ -102,10 +128,21 @@ if __name__ == "__main__":
     HERE = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--scene-path", default=str(HERE / "assets" / "marsyard2022.glb"))
-    ap.add_argument("--heightmap-path", default=str(HERE / "marsyard2022_terrain_hm_1025.tif"))
-    ap.add_argument("--annotations-dir", default=str(HERE / "annotations" / "mesh_segmentation"))
-    ap.add_argument("--out-dir", default=f"segmentation_sweep_{datetime.datetime.now().strftime('%d%m%y%H%M')}")
-    ap.add_argument("--rock-field-path", default=None, help="optional procedural rock field, for visual diversity only -- rocks always fold into background in the mask")
+    ap.add_argument(
+        "--heightmap-path", default=str(HERE / "marsyard2022_terrain_hm_1025.tif")
+    )
+    ap.add_argument(
+        "--annotations-dir", default=str(HERE / "annotations" / "mesh_segmentation")
+    )
+    ap.add_argument(
+        "--out-dir",
+        default=f"segmentation_sweep_{datetime.datetime.now().strftime('%d%m%y%H%M')}",
+    )
+    ap.add_argument(
+        "--rock-field-path",
+        default=None,
+        help="optional procedural rock field, for visual diversity only -- rocks always fold into background in the mask",
+    )
     ap.add_argument("--mode", choices=["grid", "random"], default="grid")
     ap.add_argument("--grid-spacing", type=float, default=2.0)
     ap.add_argument("--num-yaws-per-cell", type=int, default=4)
@@ -113,16 +150,19 @@ if __name__ == "__main__":
     ap.add_argument("--boundary-margin", type=float, default=2.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
-        "--categories", default=",".join(ALL_CATEGORIES),
+        "--categories",
+        default=",".join(ALL_CATEGORIES),
         help="comma-separated include-list; only these categories are registered into the sim and "
-             "given their own class in the mask (e.g. --categories small_rock isolates small rocks, "
-             "everything else -- other categories and unlabeled terrain -- becomes background)",
+        "given their own class in the mask (e.g. --categories small_rock isolates small rocks, "
+        "everything else -- other categories and unlabeled terrain -- becomes background)",
     )
     ap.add_argument("--background-category", default="background")
     ap.add_argument(
-        "--spot-check-n", type=int, default=0,
+        "--spot-check-n",
+        type=int,
+        default=0,
         help="if > 0, after generation render this many mask-overlay+label images "
-             "(sam_vla.perception.spot_check_segmentation) into <out-dir>/spot_check/",
+        "(sam_vla.perception.spot_check_segmentation) into <out-dir>/spot_check/",
     )
     args = ap.parse_args()
 
