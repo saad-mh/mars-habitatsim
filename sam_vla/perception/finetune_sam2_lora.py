@@ -425,6 +425,27 @@ def compute_miou(
     return (sum(valid) / len(valid) if valid else 0.0), ious
 
 
+def compute_confusion_matrix(
+    pred: torch.Tensor, target: torch.Tensor, num_classes: int
+) -> torch.Tensor:
+    """Pixel-level confusion matrix, rows = ground truth class, columns =
+    predicted class. pred/target expected on CPU."""
+    idx = (target.reshape(-1) * num_classes + pred.reshape(-1)).to(torch.int64)
+    cm = torch.bincount(idx, minlength=num_classes * num_classes)
+    return cm.reshape(num_classes, num_classes)
+
+
+def print_confusion_matrix(cm: torch.Tensor, class_names: List[str]) -> None:
+    cm = cm.cpu().numpy()
+    col_w = 12
+    name_w = max(len(n) for n in class_names) + 2
+    header = " " * name_w + "".join(f"{n[:col_w - 2]:>{col_w}}" for n in class_names)
+    print(header)
+    for i, name in enumerate(class_names):
+        row = "".join(f"{cm[i, j]:>{col_w},}" for j in range(len(class_names)))
+        print(f"{name:<{name_w}}{row}")
+
+
 # ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
@@ -690,6 +711,39 @@ def train(args: argparse.Namespace) -> Path:
     print(
         f"[{time.strftime('%H:%M:%S')}]][wakeup tem] done. best val_mIoU={best_miou:.4f}, final checkpoint -> {out_dir / 'final'}"
     )
+
+    model.eval()
+    cm = torch.zeros((num_classes, num_classes), dtype=torch.int64)
+    with torch.no_grad():
+        for images, masks in val_loader:
+            images = images.to(device, non_blocking=True)
+            pred = model(images).argmax(dim=1).cpu()
+            cm += compute_confusion_matrix(pred, masks, num_classes)
+    print(f"\n[eval] confusion matrix on validation set ({len(val_ds)} frames):")
+    print_confusion_matrix(cm, class_names)
+    total_pixels = cm.sum().item()
+    if total_pixels:
+        print(
+            f"[eval] overall pixel accuracy (val set): {cm.diagonal().sum().item() / total_pixels:.4f}"
+        )
+
+    n_random = min(args.n_random_images, len(train_ds) + len(val_ds))
+    if n_random > 0:
+        from torch.utils.data import ConcatDataset
+
+        full_ds = ConcatDataset([train_ds, val_ds])
+        sample_idx = random.Random(args.seed + 1).sample(range(len(full_ds)), n_random)
+        print(f"\n[eval] pixel accuracy on {n_random} random image(s) from the dataset:")
+        accs = []
+        with torch.no_grad():
+            for i in sample_idx:
+                image, mask = full_ds[i]
+                pred = model(image.unsqueeze(0).to(device)).argmax(dim=1).squeeze(0).cpu()
+                acc = (pred == mask).float().mean().item()
+                accs.append(acc)
+                print(f"    idx={i:>6}  accuracy={acc:.4f}")
+        print(f"[eval] mean accuracy over {n_random} random image(s): {np.mean(accs):.4f}")
+
     return out_dir
 
 
@@ -759,6 +813,13 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="validate dataset/class list and stop before building the model or training",
+    )
+    ap.add_argument(
+        "--n-random-images",
+        type=int,
+        default=10,
+        help="after training, report per-image pixel accuracy on this many random images "
+        "sampled from the full (train+val) dataset",
     )
 
     return ap
