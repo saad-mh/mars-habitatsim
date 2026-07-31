@@ -125,6 +125,63 @@ parallel logging system:
   drift under N px is fine") so "small negligible noise" has an actual
   definition before it needs debugging later.
 
+### 7. LoRA finetuning (segmentation model)
+
+`sam_vla.perception.finetune_sam2_lora` closes the loop: it finetunes the
+SAM2-backed segmentation model that `sam_vla.perception.sam_segmenter`
+actually runs at inference time (`sam2_custom_head.SimpleSAM2Seg` -- SAM2.1
+Hiera-L's image encoder as a feature backbone + a small from-scratch conv
+head predicting dense per-pixel class logits directly, no
+points/boxes/mask prompts, no video/memory-bank state -- run_segmentation_sweep
+samples independent camera poses, not sequences). There's no promptable
+mask decoder anywhere in this pipeline's SAM2 usage to LoRA-adapt, so LoRA
+targets the one pretrained component actually in play: the Hiera trunk's
+attention projections (`attn.qkv` / `attn.proj`). The task head is
+random-init and always trained in full regardless of encoder mode.
+
+Reads `masks_category/<frame_id>.png` + `segmentation_frames.jsonl` +
+`summary.json` straight out of a `run_segmentation_sweep` run directory --
+the same dense per-class-index masks Step 5 already writes, before
+`export_annotations` ever runs -- rather than round-tripping through
+`export_annotations`' COCO/YOLO output (built for box/polygon consumers,
+not dense-mask training). A COCO-polygon-rasterizing dataset path exists
+as a fallback for when only a portable export (no raw run_dir) is
+available; YOLO/YOLO-seg aren't supported as inputs here (no mask info /
+redundant with COCO).
+
+Needs `torch`/`peft`/`cv2` only -- no `habitat_sim` -- so it runs in the
+`sam2` conda env (already used for SAM2 work here, see `sam2.yml`),
+decoupled from the `habitat` env the sweep stage needs, same split as
+`run_dataset_pipeline.py` shelling the sweep out to a separate
+interpreter.
+
+```
+python -m sam_vla.perception.finetune_sam2_lora \
+    --run-dir output/<run_id> --out-dir sam_lora_runs/exp1 \
+    --encoder-mode lora --lora-rank 8 --lora-alpha 16 \
+    --epochs 20 --batch-size 8
+```
+
+Saves LoRA adapter weights (`peft`'s own `save_pretrained` output) and the
+task head separately under `<out-dir>/best/` and `<out-dir>/final/` --
+never merged into the base checkpoint, so the base SAM2 checkpoint stays
+swappable. Loss is dice + focal (multi-class generalization of SAM2's own
+reference training loss, `sam2/training/loss_fns.py`), weighted 20:1
+focal:dice matching Meta's own `sam2.1_hiera_b+_MOSE_finetune.yaml`.
+
+**Manual / TODO, not covered by this module:**
+- Wiring a trained LoRA adapter into `sam_weights_loader.load_sam_model` /
+  `sam_segmenter` for actual rollout use -- currently a separate,
+  deliberate step (`finetune_sam2_lora.load_finetuned_model` is the
+  loading-side reference, not yet called from the production path).
+- Hyperparameter sweep (rank/alpha/lr) and a held-out eval harness beyond
+  per-epoch val mIoU -- only a train/val split from one run is done here,
+  no cross-run generalization check.
+- `--encoder-mode full` (full encoder finetune, no LoRA) and `frozen`
+  (decoder-only, matching `sam/train_sam2_simple_fast.py`'s original
+  default) exist as CLI options for comparison but weren't benchmarked
+  against `lora` here.
+
 ---
 
 ## Suggestions / Open Items

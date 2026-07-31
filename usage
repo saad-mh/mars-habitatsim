@@ -27,4 +27,7 @@ python rollout_navdp_policy.py \
 
 numbers: generated 2304 images in 2m 21.7s 
 
-mesh_annotation_tool -> python -m sam_vla.run_segmentation_sweep --out-dir output/ -> python3 -m sam_vla.perception.filter_empty_segmentation_frames --run-dir -> python -m sam_vla.perception.spot_check_segmentation --run-dir ->
+mesh_annotation_tool -> python -m sam_vla.run_segmentation_sweep --out-dir output/ -> python3 -m sam_vla.perception.filter_empty_segmentation_frames --run-dir -> python -m sam_vla.perception.spot_check_segmentation --run-dir -> python -m sam_vla.perception.export_annotations --run-dir
+
+LoRA finetune the segmentation model (sam2 conda env, reads run_dir directly -- does not need export_annotations to have run first):
+python -m sam_vla.perception.finetune_sam2_lora --run-dir output/<run_id> --out-dir sam_lora_runs/exp1 --encoder-mode lora --epochs 20

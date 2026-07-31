@@ -74,7 +74,7 @@ class HeightmapGrid:
         self.flip_z = bool(flip_z)
         self.swap_xz = bool(swap_xz)
 
-        arr = np.asarray(Image.open(heightmap_path))
+        arr = self._load_array(heightmap_path)
         if arr.ndim == 3:
             arr = arr[:, :, 0]
         arr = arr.astype(np.float32)
@@ -83,6 +83,27 @@ class HeightmapGrid:
         y = y - float(np.mean(y))
         self._height = y
         self._h, self._w = self._height.shape
+
+    @staticmethod
+    def _load_array(heightmap_path: Path) -> np.ndarray:
+        """Loads the raw heightmap pixels. Most heightmaps (PNG, 8/16/32-bit
+        TIFF) decode fine via PIL; GeoTIFF DEMs with 64-bit float samples
+        aren't supported by Pillow's TIFF codec, so those fall back to
+        rasterio."""
+        try:
+            return np.asarray(Image.open(heightmap_path))
+        except Exception:
+            if heightmap_path.suffix.lower() not in (".tif", ".tiff"):
+                raise
+            try:
+                import rasterio
+            except ImportError as exc:
+                raise ImportError(
+                    f"PIL could not decode {heightmap_path} and rasterio is not "
+                    "installed; install rasterio to load this GeoTIFF heightmap"
+                ) from exc
+            with rasterio.open(heightmap_path) as src:
+                return src.read(1)
 
     def _to_uv(self, x: float, z: float) -> Tuple[float, float]:
         if self.swap_xz:
