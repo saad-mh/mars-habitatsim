@@ -203,7 +203,7 @@ if __name__ == "__main__":
 
     HERE = Path(__file__).resolve().parent.parent.parent
     ap = argparse.ArgumentParser(description="Generate a seeded, non-overlapping rock field on the Mars terrain.")
-    ap.add_argument("--heightmap", default=str(HERE / "marsyard2022_terrain_hm.png"))
+    ap.add_argument("--heightmap", default=str(HERE / "marsyard2022_terrain_hm_1025.tif"))
     ap.add_argument("--out-dir", default=str(HERE / "rock_envs" / "default"))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--num-rocks", type=int, default=12)

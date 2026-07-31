@@ -173,6 +173,15 @@ def main():
         export_format="GLB",
         use_selection=True,
         export_apply=True,
+        # Habitat loads this stage with no .stage_config.json, so it falls back
+        # to its default orient_up=[0,0,1] and rotates the asset as if it were
+        # raw Z-up. Exporting with the glTF-spec Y-up conversion (the default)
+        # double-rotates it -- ground plane ends up on X/Y, height on Z, and
+        # collision raycasts miss the mesh entirely. export_yup=False keeps the
+        # raw Blender axes (height on Z, ground plane on X/Y) so Habitat's
+        # rotation lands the mesh correctly, matching the previously-working
+        # marsyard2022_bak.glb export.
+        export_yup=False,
     )
     print("done.")
 

@@ -10,7 +10,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-SAM2_ROOT = Path(os.environ.get("SAM2_ROOT", "/home/nahar/Desktop/pineapple/packages/sam2"))
+SAM2_ROOT = Path(
+    os.environ.get("SAM2_ROOT", "/home/gpu/Desktop/pineapple/packages/sam2")
+)
 if str(SAM2_ROOT) not in sys.path:
     sys.path.insert(0, str(SAM2_ROOT))
 
@@ -38,17 +40,14 @@ class SimpleSegHead(nn.Module):
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-
             nn.Conv2d(256, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-
             nn.Conv2d(128, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
-
             nn.Conv2d(64, num_classes, 1),
         )
 
@@ -72,7 +71,9 @@ class SimpleSAM2Seg(nn.Module):
             dummy = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
             enc_out = self.image_encoder(dummy)
             if isinstance(enc_out, dict):
-                feat = enc_out.get("vision_features", enc_out.get("backbone_fpn", [None])[0])
+                feat = enc_out.get(
+                    "vision_features", enc_out.get("backbone_fpn", [None])[0]
+                )
             else:
                 feat = enc_out[0] if isinstance(enc_out, (list, tuple)) else enc_out
             embed_dim = feat.shape[1] if isinstance(feat, torch.Tensor) else 256
@@ -82,13 +83,20 @@ class SimpleSAM2Seg(nn.Module):
     def forward(self, x):
         enc_out = self.image_encoder(x)
         if isinstance(enc_out, dict):
-            features = enc_out.get("vision_features", enc_out.get("backbone_fpn", [None])[0])
+            features = enc_out.get(
+                "vision_features", enc_out.get("backbone_fpn", [None])[0]
+            )
         else:
             features = enc_out[0] if isinstance(enc_out, (list, tuple)) else enc_out
 
         logits = self.seg_head(features)
         if logits.shape[-2:] != (IMAGE_SIZE, IMAGE_SIZE):
-            logits = F.interpolate(logits, size=(IMAGE_SIZE, IMAGE_SIZE), mode="bilinear", align_corners=False)
+            logits = F.interpolate(
+                logits,
+                size=(IMAGE_SIZE, IMAGE_SIZE),
+                mode="bilinear",
+                align_corners=False,
+            )
         return logits
 
 
@@ -105,7 +113,9 @@ def build_sam2_backbone(device: str = "cuda") -> nn.Module:
         OmegaConf.resolve(cfg)
         sam2_model = instantiate(cfg.model, _recursive_=True)
 
-    checkpoint = torch.load(str(SAM2_BACKBONE_CHECKPOINT), map_location=device, weights_only=False)
+    checkpoint = torch.load(
+        str(SAM2_BACKBONE_CHECKPOINT), map_location=device, weights_only=False
+    )
     state_dict = checkpoint.get("model", checkpoint)
     sam2_model.load_state_dict(state_dict, strict=False)
 

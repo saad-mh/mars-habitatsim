@@ -102,7 +102,7 @@ if __name__ == "__main__":
     HERE = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--scene-path", default=str(HERE / "assets" / "marsyard2022.glb"))
-    ap.add_argument("--heightmap-path", default=str(HERE / "marsyard2022_terrain_hm.png"))
+    ap.add_argument("--heightmap-path", default=str(HERE / "marsyard2022_terrain_hm_1025.tif"))
     ap.add_argument("--annotations-dir", default=str(HERE / "annotations" / "mesh_segmentation"))
     ap.add_argument("--out-dir", default=f"segmentation_sweep_{datetime.datetime.now().strftime('%d%m%y%H%M')}")
     ap.add_argument("--rock-field-path", default=None, help="optional procedural rock field, for visual diversity only -- rocks always fold into background in the mask")

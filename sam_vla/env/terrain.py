@@ -167,7 +167,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("usage: python -m sam_vla.env.terrain <heightmap.png> [x z]")
+        print("usage: python -m sam_vla.env.terrain <heightmap.png|.tif> [x z]")
         raise SystemExit(1)
     grid = HeightmapGrid(Path(sys.argv[1]))
     terrain = Terrain(grid)

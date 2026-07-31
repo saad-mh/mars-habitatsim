@@ -27,8 +27,8 @@ from conda_env import resolve_conda_base
 
 HERE = Path(__file__).resolve().parent
 
-SCENE = str(HERE / "marsyard2022_tri.glb")
-HEIGHTMAP = str(HERE / "marsyard2022_terrain_hm.png")
+SCENE = str(HERE / "marsyard2022.glb")
+HEIGHTMAP = str(HERE / "marsyard2022_terrain_hm_1025.tif")
 
 OUT_DIR = str(HERE / "vlm_nav_out")
 ANNOTATIONS_DIR = str(HERE / "annotations")
@@ -104,6 +104,7 @@ Requirements:
 
 """VLM_PROMPT = "Identify the most scientifically significant test subject among the detected objects. Output strictly in JSON format with keys: 'object_id', 'label', 'coordinates2Darray', 'reasoning'."""
 
+
 # Heightmap utilities
 def load_heightmap(path):
     """Load and normalize heightmap from PNG."""
@@ -154,9 +155,11 @@ def terrain_height_at(x, z):
     h1 = h01 * (1.0 - dx) + h11 * dx
     return float(h0 * (1.0 - dy) + h1 * dy)
 
+
 # Default heightmap sampler, captured before any local shadowing (e.g. the
 # `terrain_height_at` override parameter on make_local_height_patch_mesh).
 _DEFAULT_TERRAIN_HEIGHT_AT = terrain_height_at
+
 
 # Sensor and simulator setup
 def make_sensor(uuid, sensor_type):
@@ -184,9 +187,8 @@ def make_sim():
     agent_cfg = AgentConfiguration()
     agent_cfg.sensor_specifications = [rgb, depth, semantic]
 
-    return habitat_sim.Simulator(
-        habitat_sim.Configuration(sim_cfg, [agent_cfg])
-    )
+    return habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
+
 
 def rgb_depth_from_obs(obs):
     """Extract and process RGB and depth from sensor observation."""
@@ -197,6 +199,7 @@ def rgb_depth_from_obs(obs):
 
     depth = obs["depth"]
     return rgb, depth
+
 
 def semantic_from_obs(obs):
     """
@@ -212,6 +215,7 @@ def semantic_from_obs(obs):
     semantic = np.asarray(obs["semantic"])
     return semantic.astype(np.uint8)
 
+
 def semantic_to_masks(semantic_img):
     """
     Convert a per-pixel semantic ID image into binary goal/obstacle masks.
@@ -226,8 +230,11 @@ def semantic_to_masks(semantic_img):
         current camera pose is reflected automatically - no bbox involved.
     """
     goal_mask = np.where(semantic_img == SEMANTIC_ID_GOAL, 255, 0).astype(np.uint8)
-    obstacle_mask = np.where(semantic_img == SEMANTIC_ID_OBSTACLE, 255, 0).astype(np.uint8)
+    obstacle_mask = np.where(semantic_img == SEMANTIC_ID_OBSTACLE, 255, 0).astype(
+        np.uint8
+    )
     return goal_mask, obstacle_mask
+
 
 def save_frame(obs, frame_idx):
     """Save RGB, depth, semantic, and derived goal/obstacle mask frames to disk."""
@@ -268,12 +275,14 @@ def save_frame(obs, frame_idx):
 
     return rgb_path
 
+
 def save_pose(frame_idx, x, y, z, yaw):
     """Persist the agent pose active when a frame was captured, for later back-projection."""
     pose_path = f"{OUT_DIR}/pose_{frame_idx:04d}.json"
     with open(pose_path, "w") as f:
         json.dump({"x": x, "y": y, "z": z, "yaw": yaw}, f, indent=2)
     return pose_path
+
 
 def load_pose(frame_idx):
     """Load the pose saved for a frame, falling back to the fixed start pose for older captures."""
@@ -291,6 +300,7 @@ def load_pose(frame_idx):
         "yaw": float(np.deg2rad(START_YAW_DEG)),
     }
 
+
 def load_depth_frame(frame_idx):
     """Load raw metric depth for a frame, reconstructing from the 8-bit visualization if needed."""
     npy_path = f"{OUT_DIR}/depth_{frame_idx:04d}.npy"
@@ -298,10 +308,13 @@ def load_depth_frame(frame_idx):
         return np.load(npy_path)
 
     png_path = f"{OUT_DIR}/depth_{frame_idx:04d}.png"
-    print(f"[warn] no raw depth for frame {frame_idx}, reconstructing from {png_path} "
-          f"(precision limited to the 0-10m visualization clip range)")
+    print(
+        f"[warn] no raw depth for frame {frame_idx}, reconstructing from {png_path} "
+        f"(precision limited to the 0-10m visualization clip range)"
+    )
     depth_vis = np.array(Image.open(png_path)).astype(np.float32)
     return depth_vis / 255.0 * 10.0
+
 
 def load_detected_shapes(frame_idx):
     """
@@ -324,6 +337,7 @@ def load_detected_shapes(frame_idx):
         data = json.load(f)
     return {shape["id"]: shape for shape in data["shapes"]}
 
+
 def validate_annotation_json(json_path):
     """
     Validate labelme annotation JSON structure.
@@ -338,7 +352,7 @@ def validate_annotation_json(json_path):
         return False, f"annotation file not found: {json_path}"
 
     try:
-        with open(json_path, 'r') as f:
+        with open(json_path, "r") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         return False, f"invalid JSON: {e}"
@@ -346,7 +360,14 @@ def validate_annotation_json(json_path):
         return False, f"error reading file: {e}"
 
     # Validate required top-level keys
-    required_keys = ["version", "flags", "shapes", "imagePath", "imageHeight", "imageWidth"]
+    required_keys = [
+        "version",
+        "flags",
+        "shapes",
+        "imagePath",
+        "imageHeight",
+        "imageWidth",
+    ]
     missing_keys = [k for k in required_keys if k not in data]
     if missing_keys:
         return False, f"missing required keys: {missing_keys}"
@@ -379,6 +400,7 @@ def validate_annotation_json(json_path):
 
     return True, "accepted"
 
+
 # Bounding box overlay
 BOX_COLOR_PALETTE = [
     (231, 76, 60),
@@ -389,14 +411,17 @@ BOX_COLOR_PALETTE = [
     (26, 188, 156),
 ]
 
+
 def load_labels(labels_path=LABELS_FILE):
     """Load ordered label list; list index is the class id."""
     with open(labels_path, "r") as f:
         return [line.strip() for line in f if line.strip()]
 
+
 def color_for_class(class_id):
     """Deterministic color per class id."""
     return BOX_COLOR_PALETTE[class_id % len(BOX_COLOR_PALETTE)]
+
 
 def assign_object_ids(annotation_path):
     """
@@ -423,6 +448,7 @@ def assign_object_ids(annotation_path):
         json.dump(data, f, indent=2)
 
     return data
+
 
 def draw_annotation_overlay(image_path, annotation_path, output_path):
     """
@@ -474,6 +500,7 @@ def draw_annotation_overlay(image_path, annotation_path, output_path):
 
     return output_path
 
+
 # Labelme launch
 def launch_labelme_on_frame(rgb_path, frame_idx):
     """
@@ -492,9 +519,11 @@ def launch_labelme_on_frame(rgb_path, frame_idx):
     cmd = [
         LABELME_BIN,
         rgb_path,
-        "--labels", LABELS_FILE,
-        "--output", ANNOTATIONS_DIR,
-        "--no-sort-labels"
+        "--labels",
+        LABELS_FILE,
+        "--output",
+        ANNOTATIONS_DIR,
+        "--no-sort-labels",
     ]
 
     print(f"\n[info] Launching labelme...")
@@ -516,6 +545,7 @@ def launch_labelme_on_frame(rgb_path, frame_idx):
     is_valid, status_msg = validate_annotation_json(annotation_path)
 
     return is_valid, annotation_path, status_msg
+
 
 # VLM query
 def query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PROMPT):
@@ -539,12 +569,17 @@ def query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PRO
     out_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_vlm.txt"
 
     cmd = [
-        VLM_PYTHON_BIN, VLM_SCRIPT,
-        "--rgb", rgb_path,
+        VLM_PYTHON_BIN,
+        VLM_SCRIPT,
+        "--rgb",
+        rgb_path,
         # "--overlay", overlay_path,
-        "--annotation", annotation_path,
-        "--prompt", prompt,
-        "--out", out_path,
+        "--annotation",
+        annotation_path,
+        "--prompt",
+        prompt,
+        "--out",
+        out_path,
     ]
 
     print(f"\n[info] Querying VLM")
@@ -560,6 +595,7 @@ def query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PRO
         return False, None, f"error launching VLM: {e}"
 
     return True, out_path, "accepted"
+
 
 # Bbox -> world position, and facing the chosen object
 def parse_vlm_response(vlm_out_path):
@@ -577,6 +613,7 @@ def parse_vlm_response(vlm_out_path):
         raise ValueError(f"no JSON object found in {vlm_out_path}")
     return json.loads(match.group(0))
 
+
 def coords2d_to_bbox_xyxy(coords2d):
     """
     Reduce the VLM's 2D coordinates into an axis-aligned (x1, y1, x2, y2)
@@ -593,11 +630,13 @@ def coords2d_to_bbox_xyxy(coords2d):
     x2, y2 = pts.max(axis=0)
     return float(x1), float(y1), float(x2), float(y2)
 
+
 def camera_intrinsics():
     """Pinhole intrinsics for the RGB/depth sensors (square pixels, matching hfov below)."""
     h, w = RGBD_RESOLUTION
     f = (w / 2.0) / np.tan(np.deg2rad(HFOV_DEG) / 2.0)
     return f, f, w / 2.0, h / 2.0
+
 
 def pixel_to_world(u, v, depth_value, pose):
     """
@@ -648,7 +687,11 @@ def make_local_height_patch_mesh(
         [x, y, z] positions; faces is an (M, 3) int array of 0-based
         vertex indices, wound so the normal points toward +Y (up).
     """
-    height_fn = terrain_height_at if terrain_height_at is not None else _DEFAULT_TERRAIN_HEIGHT_AT
+    height_fn = (
+        terrain_height_at
+        if terrain_height_at is not None
+        else _DEFAULT_TERRAIN_HEIGHT_AT
+    )
 
     cx, _, cz = center_world
     n = max(int(np.ceil(radius / resolution)), 1)
@@ -678,8 +721,14 @@ def make_local_height_patch_mesh(
             faces.append((v00, v01, v11))
             faces.append((v00, v11, v10))
 
-    verts = np.array(verts, dtype=np.float64) if verts else np.empty((0, 3), dtype=np.float64)
-    faces = np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
+    verts = (
+        np.array(verts, dtype=np.float64)
+        if verts
+        else np.empty((0, 3), dtype=np.float64)
+    )
+    faces = (
+        np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
+    )
     return verts, faces
 
 
@@ -753,9 +802,15 @@ class SemanticMeshRegistry:
         template.collision_asset_handle = mesh_path
         template.is_collidable = False
 
-        template_name = f"semantic_{role}_{len(self._object_ids)}_{os.path.basename(mesh_path)}"
-        template_id = self.object_template_manager.register_template(template, template_name)
-        template_handle = self.object_template_manager.get_template_handle_by_id(template_id)
+        template_name = (
+            f"semantic_{role}_{len(self._object_ids)}_{os.path.basename(mesh_path)}"
+        )
+        template_id = self.object_template_manager.register_template(
+            template, template_name
+        )
+        template_handle = self.object_template_manager.get_template_handle_by_id(
+            template_id
+        )
 
         obj = self.rigid_object_manager.add_object_by_template_handle(template_handle)
         obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC
@@ -768,8 +823,10 @@ class SemanticMeshRegistry:
                 obj.rotation = rotation
 
         self._object_ids.append(obj.object_id)
-        print(f"[semantic] registered {role} mesh '{mesh_path}' as "
-              f"object_id={obj.object_id} semantic_id={semantic_id}")
+        print(
+            f"[semantic] registered {role} mesh '{mesh_path}' as "
+            f"object_id={obj.object_id} semantic_id={semantic_id}"
+        )
         return obj
 
     def clear(self):
@@ -828,10 +885,16 @@ def selected_bbox_to_object_mesh(
         selected_obj, depth, pose, pixel_to_world, terrain_height_at, detected_shapes
     )
 
-    safe_label = re.sub(r"[^a-zA-Z0-9]+", "_", label.strip().lower()).strip("_") or "object"
-    mesh_path = os.path.join(output_dir, f"rgb_{frame_idx:04d}_{role}_{safe_label}_r{radius:.2f}.obj")
+    safe_label = (
+        re.sub(r"[^a-zA-Z0-9]+", "_", label.strip().lower()).strip("_") or "object"
+    )
+    mesh_path = os.path.join(
+        output_dir, f"rgb_{frame_idx:04d}_{role}_{safe_label}_r{radius:.2f}.obj"
+    )
 
-    verts, faces = make_local_height_patch_mesh(seed_world, radius=radius, terrain_height_at=terrain_height_at)
+    verts, faces = make_local_height_patch_mesh(
+        seed_world, radius=radius, terrain_height_at=terrain_height_at
+    )
     save_obj(mesh_path, verts, faces)
     print(f"[mesh] saved {mesh_path} ({len(verts)} verts, {len(faces)} faces)")
 
@@ -879,7 +942,9 @@ def extract_obstacle_entries(response, goal_entry=None):
     return entries
 
 
-def _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height_at, detected_shapes=None):
+def _resolve_entry_seed_world(
+    entry, depth, pose, pixel_to_world, terrain_height_at, detected_shapes=None
+):
     """
     Resolve a single VLM object entry's bbox to a world-space seed point.
     Shared by `entry_world_position` (plain position lookups) and
@@ -911,8 +976,10 @@ def _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height
         label = shape.get("label", entry.get("label", "?"))
         bbox_xyxy = coords2d_to_bbox_xyxy(shape["points"])
     else:
-        print(f"[warn] object_id={object_id} not found in SAM annotation; "
-              f"falling back to the VLM's own coordinates2D (unreliable)")
+        print(
+            f"[warn] object_id={object_id} not found in SAM annotation; "
+            f"falling back to the VLM's own coordinates2D (unreliable)"
+        )
         label = entry.get("label", "?")
         bbox_xyxy = coords2d_to_bbox_xyxy(entry["coordinates2D"])
 
@@ -924,15 +991,19 @@ def _resolve_entry_seed_world(entry, depth, pose, pixel_to_world, terrain_height
     py = int(np.clip(round(v), 0, h - 1))
     depth_value = float(depth[py, px])
     if not np.isfinite(depth_value) or depth_value <= 0.0:
-        print(f"[warn] non-positive/invalid depth ({depth_value}) at bbox-center pixel ({px},{py}) "
-              f"for '{label}'; result will be unreliable")
+        print(
+            f"[warn] non-positive/invalid depth ({depth_value}) at bbox-center pixel ({px},{py}) "
+            f"for '{label}'; result will be unreliable"
+        )
     world = pixel_to_world(u, v, depth_value, pose)
     grounded_y = terrain_height_at(world[0], world[2])
     seed_world = np.array([world[0], grounded_y, world[2]], dtype=np.float64)
 
-    print(f"[object] '{label}' object_id={object_id} bbox={tuple(round(c, 1) for c in bbox_xyxy)} "
-          f"center=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
-          f"seed=({seed_world[0]:.2f}, {seed_world[1]:.2f}, {seed_world[2]:.2f})")
+    print(
+        f"[object] '{label}' object_id={object_id} bbox={tuple(round(c, 1) for c in bbox_xyxy)} "
+        f"center=({u:.1f},{v:.1f}) depth={depth_value:.2f}m "
+        f"seed=({seed_world[0]:.2f}, {seed_world[1]:.2f}, {seed_world[2]:.2f})"
+    )
 
     return seed_world, bbox_xyxy, label
 
@@ -1010,8 +1081,15 @@ def resolve_mission_meshes(frame_idx, response, radius=0.5, obstacle_limit=None)
     goal_mesh = None
     if goal_entry:
         goal_mesh = selected_bbox_to_object_mesh(
-            goal_entry, depth, pose, frame_idx, "goal",
-            pixel_to_world, terrain_height_at, OUT_DIR, radius=radius,
+            goal_entry,
+            depth,
+            pose,
+            frame_idx,
+            "goal",
+            pixel_to_world,
+            terrain_height_at,
+            OUT_DIR,
+            radius=radius,
             detected_shapes=detected_shapes,
         )
 
@@ -1024,20 +1102,37 @@ def resolve_mission_meshes(frame_idx, response, radius=0.5, obstacle_limit=None)
         role = "obstacle" if i == 0 else f"obstacle{i}"
         try:
             mesh_meta = selected_bbox_to_object_mesh(
-                obstacle, depth, pose, frame_idx, role,
-                pixel_to_world, terrain_height_at, OUT_DIR, radius=radius,
+                obstacle,
+                depth,
+                pose,
+                frame_idx,
+                role,
+                pixel_to_world,
+                terrain_height_at,
+                OUT_DIR,
+                radius=radius,
                 detected_shapes=detected_shapes,
             )
         except Exception as e:
             oid = obstacle.get("object_id", "?") if isinstance(obstacle, dict) else "?"
-            print(f"[warn] skipping obstacle {i} (object_id={oid}): could not resolve position ({e})")
+            print(
+                f"[warn] skipping obstacle {i} (object_id={oid}): could not resolve position ({e})"
+            )
             continue
         obstacle_meshes.append(mesh_meta)
 
     return goal_mesh, obstacle_meshes
 
 
-def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, prompt=VLM_PROMPT, radius=0.5, obstacle_limit=None):
+def resolve_vlm_selection(
+    rgb_path,
+    overlay_path,
+    annotation_path,
+    frame_idx,
+    prompt=VLM_PROMPT,
+    radius=0.5,
+    obstacle_limit=None,
+):
     """
     Query the VLM for its goal/obstacle object selection on an annotated
     frame, then back-project the chosen bbox(es) through depth + camera
@@ -1062,7 +1157,9 @@ def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, pr
         (success, result, status_message). On success, result is
         (response, goal_mesh, obstacle_meshes); on failure, result is None.
     """
-    vlm_success, vlm_out_path, vlm_status = query_vlm(rgb_path, overlay_path, annotation_path, frame_idx, prompt)
+    vlm_success, vlm_out_path, vlm_status = query_vlm(
+        rgb_path, overlay_path, annotation_path, frame_idx, prompt
+    )
     if not vlm_success:
         return False, None, vlm_status
 
@@ -1071,7 +1168,9 @@ def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, pr
     except Exception as e:
         return False, None, f"could not parse VLM response {vlm_out_path}: {e}"
 
-    goal_mesh, obstacle_meshes = resolve_mission_meshes(frame_idx, response, radius=radius, obstacle_limit=obstacle_limit)
+    goal_mesh, obstacle_meshes = resolve_mission_meshes(
+        frame_idx, response, radius=radius, obstacle_limit=obstacle_limit
+    )
     if goal_mesh is None:
         return False, None, f"no goal_object in {vlm_out_path}"
 
@@ -1079,7 +1178,12 @@ def resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, pr
 
 
 def save_mission_metadata(
-    frame_idx, vlm_response, goal_mesh, obstacle_meshes, goal_target_world, semantic_paths=None
+    frame_idx,
+    vlm_response,
+    goal_mesh,
+    obstacle_meshes,
+    goal_target_world,
+    semantic_paths=None,
 ):
     """
     Persist the resolved mission for a frame - the VLM reply, every
@@ -1137,6 +1241,7 @@ def yaw_to_face(agent_x, agent_z, target_x, target_z):
     dz = target_z - agent_z
     return float(np.arctan2(-dx, -dz))
 
+
 # Interactive capture loop
 class InteractiveCapture:
     """Main interactive capture and annotation class."""
@@ -1163,11 +1268,15 @@ class InteractiveCapture:
         os.makedirs(OUT_DIR, exist_ok=True)
 
         print(f"[info] Simulator ready.")
-        print(f"[info] Start pose: x={self.x:.2f}, z={self.z:.2f}, yaw={np.rad2deg(self.yaw):.1f}°")
+        print(
+            f"[info] Start pose: x={self.x:.2f}, z={self.z:.2f}, yaw={np.rad2deg(self.yaw):.1f}°"
+        )
         print(f"\n[info] Controls:")
         print(f"  SPACE - Capture frame and launch labelme")
         print(f"  Q     - Quit")
-        print(f"\n[info] Window will display RGB stream. Annotations saved to '{ANNOTATIONS_DIR}/'.\n")
+        print(
+            f"\n[info] Window will display RGB stream. Annotations saved to '{ANNOTATIONS_DIR}/'.\n"
+        )
 
     def set_agent_pose(self):
         """Update agent pose in simulator."""
@@ -1191,7 +1300,9 @@ class InteractiveCapture:
         save_pose(self.frame_idx, self.x, self.y, self.z, self.yaw)
 
         # Launch labelme
-        success, annotation_path, status_msg = launch_labelme_on_frame(rgb_path, self.frame_idx)
+        success, annotation_path, status_msg = launch_labelme_on_frame(
+            rgb_path, self.frame_idx
+        )
 
         print(f"\n[annotation status] {status_msg}")
 
@@ -1205,8 +1316,12 @@ class InteractiveCapture:
             )
             if vlm_success:
                 response, goal_mesh, obstacle_meshes = vlm_result
-                print(f"[info] VLM response saved: {OUT_DIR}/rgb_{self.frame_idx:04d}_vlm.txt\n")
-                self.navigate_mission(self.frame_idx, response, goal_mesh, obstacle_meshes)
+                print(
+                    f"[info] VLM response saved: {OUT_DIR}/rgb_{self.frame_idx:04d}_vlm.txt\n"
+                )
+                self.navigate_mission(
+                    self.frame_idx, response, goal_mesh, obstacle_meshes
+                )
             else:
                 print(f"[error] VLM query failed: {vlm_status}\n")
         else:
@@ -1224,8 +1339,10 @@ class InteractiveCapture:
 
         self.yaw = yaw_to_face(self.x, self.z, obj_x, obj_z)
         self.set_agent_pose()
-        print(f"[face] turned to face '{label}' at ({obj_x:.2f}, {obj_y:.2f}, {obj_z:.2f}), "
-              f"yaw={np.rad2deg(self.yaw):.1f}°")
+        print(
+            f"[face] turned to face '{label}' at ({obj_x:.2f}, {obj_y:.2f}, {obj_z:.2f}), "
+            f"yaw={np.rad2deg(self.yaw):.1f}°"
+        )
 
     def navigate_to_target(self, target_x, target_z, label="target"):
         """
@@ -1245,7 +1362,9 @@ class InteractiveCapture:
             linear_x, angular_y, distance, heading_error = controller.update(
                 self.x, self.y, self.z, self.yaw
             )
-            linear_x, angular_y = controller.obstacle_avoidance_hook(linear_x, angular_y, depth)
+            linear_x, angular_y = controller.obstacle_avoidance_hook(
+                linear_x, angular_y, depth
+            )
 
             self.x += linear_x * (-np.sin(self.yaw)) * NAV_DT
             self.z += linear_x * (-np.cos(self.yaw)) * NAV_DT
@@ -1260,15 +1379,21 @@ class InteractiveCapture:
                 self.root.update()
 
             if step % 10 == 0:
-                print(f"[nav] step={step:4d} pos=({self.x:.2f},{self.z:.2f}) "
-                      f"dist={distance:.2f}m heading_err={np.rad2deg(heading_error):.1f}°")
+                print(
+                    f"[nav] step={step:4d} pos=({self.x:.2f},{self.z:.2f}) "
+                    f"dist={distance:.2f}m heading_err={np.rad2deg(heading_error):.1f}°"
+                )
 
             if controller.at_target:
-                print(f"[nav] reached '{label}' in {step} steps, "
-                      f"pos=({self.x:.2f},{self.z:.2f})")
+                print(
+                    f"[nav] reached '{label}' in {step} steps, "
+                    f"pos=({self.x:.2f},{self.z:.2f})"
+                )
                 break
         else:
-            print(f"[nav] max steps ({NAV_MAX_STEPS}) reached before arriving at '{label}'")
+            print(
+                f"[nav] max steps ({NAV_MAX_STEPS}) reached before arriving at '{label}'"
+            )
 
     def register_mission_semantics(self, goal_mesh, obstacle_meshes):
         """
@@ -1285,7 +1410,9 @@ class InteractiveCapture:
             )
         for mesh_meta in obstacle_meshes:
             self.semantic_registry.register(
-                mesh_meta["mesh_path"], mesh_meta["role"], semantic_id_for_role(mesh_meta["role"])
+                mesh_meta["mesh_path"],
+                mesh_meta["role"],
+                semantic_id_for_role(mesh_meta["role"]),
             )
 
     def capture_mission_semantics(self, frame_idx, pose):
@@ -1334,7 +1461,9 @@ class InteractiveCapture:
         """
         for i, mesh_meta in enumerate(obstacle_meshes):
             obs_x, _, obs_z = mesh_meta["seed_world"]
-            self.navigate_to_target(obs_x, obs_z, label=f"obstacle[{i}]:{mesh_meta['label']}")
+            self.navigate_to_target(
+                obs_x, obs_z, label=f"obstacle[{i}]:{mesh_meta['label']}"
+            )
 
     def navigate_to_goal(self, goal_mesh):
         """Drive to the already-resolved goal mesh, then rotate in place to square up and face it."""
@@ -1344,12 +1473,16 @@ class InteractiveCapture:
 
         self.yaw = yaw_to_face(self.x, self.z, goal_x, goal_z)
         self.set_agent_pose()
-        print(f"[nav] facing goal '{label}' at ({goal_x:.2f}, {goal_y:.2f}, {goal_z:.2f}), "
-              f"yaw={np.rad2deg(self.yaw):.1f}°")
+        print(
+            f"[nav] facing goal '{label}' at ({goal_x:.2f}, {goal_y:.2f}, {goal_z:.2f}), "
+            f"yaw={np.rad2deg(self.yaw):.1f}°"
+        )
 
         return goal_x, goal_y, goal_z, label
 
-    def navigate_mission(self, frame_idx, response=None, goal_mesh=None, obstacle_meshes=None):
+    def navigate_mission(
+        self, frame_idx, response=None, goal_mesh=None, obstacle_meshes=None
+    ):
         """
         Full mission for a queried frame: resolve the VLM's goal + obstacles
         (including local terrain meshes), drive to each obstacle first, then
@@ -1391,7 +1524,12 @@ class InteractiveCapture:
             return
 
         save_mission_metadata(
-            frame_idx, response, goal_mesh, obstacle_meshes, (goal_x, goal_y, goal_z), semantic_paths
+            frame_idx,
+            response,
+            goal_mesh,
+            obstacle_meshes,
+            (goal_x, goal_y, goal_z),
+            semantic_paths,
         )
         print(f"[mission] complete")
 
@@ -1412,7 +1550,9 @@ class InteractiveCapture:
         canvas = tk.Canvas(root, width=RGBD_RESOLUTION[1], height=RGBD_RESOLUTION[0])
         canvas.pack()
 
-        info_label = tk.Label(root, text="SPACE: capture & annotate | Q: quit", bg="black", fg="white")
+        info_label = tk.Label(
+            root, text="SPACE: capture & annotate | Q: quit", bg="black", fg="white"
+        )
         info_label.pack(side=tk.BOTTOM, fill=tk.X)
 
         running = True
@@ -1448,6 +1588,7 @@ class InteractiveCapture:
             root.mainloop()
         finally:
             self.close()
+
 
 def regenerate_overlays():
     """Rebuild rgb_*_at.png for every existing annotation, without touching the sim."""
@@ -1495,7 +1636,9 @@ def run_vlm_on_frame(frame_idx, prompt=VLM_PROMPT):
     if not os.path.exists(overlay_path):
         draw_annotation_overlay(rgb_path, annotation_path, overlay_path)
 
-    success, result, status_msg = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx, prompt)
+    success, result, status_msg = resolve_vlm_selection(
+        rgb_path, overlay_path, annotation_path, frame_idx, prompt
+    )
     if not success:
         print(f"[error] {status_msg}")
         return
@@ -1510,7 +1653,12 @@ def run_vlm_on_frame(frame_idx, prompt=VLM_PROMPT):
         capture.close()
 
     save_mission_metadata(
-        frame_idx, response, goal_mesh, obstacle_meshes, goal_mesh["seed_world"], semantic_paths
+        frame_idx,
+        response,
+        goal_mesh,
+        obstacle_meshes,
+        goal_mesh["seed_world"],
+        semantic_paths,
     )
 
 
@@ -1577,11 +1725,13 @@ def validate_semantic_masks(frame_idx):
 
     ok = not overlap.any() and goal_matches and obstacle_matches and environment_matches
     status = "PASS" if ok else "FAIL"
-    print(f"[validate] frame {frame_idx}: {status} "
-          f"(goal_px={int(goal_mask.sum())}, obstacle_px={int(obstacle_mask.sum())}, "
-          f"overlap_px={int(overlap.sum())}, "
-          f"goal_matches_render={goal_matches}, obstacle_matches_render={obstacle_matches}, "
-          f"remainder_is_environment={environment_matches})")
+    print(
+        f"[validate] frame {frame_idx}: {status} "
+        f"(goal_px={int(goal_mask.sum())}, obstacle_px={int(obstacle_mask.sum())}, "
+        f"overlap_px={int(overlap.sum())}, "
+        f"goal_matches_render={goal_matches}, obstacle_matches_render={obstacle_matches}, "
+        f"remainder_is_environment={environment_matches})"
+    )
     return ok
 
 
@@ -1613,4 +1763,3 @@ if __name__ == "__main__":
         capture = InteractiveCapture()
         capture.run()
         print("[info] khel khatam.")
-

@@ -199,7 +199,7 @@ class MarsHabitatEnv:
 if __name__ == "__main__":
     HERE = Path(__file__).resolve().parent.parent.parent
     scene = HERE / "assets" / "marsyard2022.glb"
-    heightmap = HERE / "marsyard2022_terrain_hm.png"
+    heightmap = HERE / "marsyard2022_terrain_hm_1025.tif"
 
     with MarsHabitatEnv(str(scene), str(heightmap), services=[]) as env:
         obs = env.get_observation(0)
