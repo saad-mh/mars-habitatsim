@@ -65,8 +65,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -99,6 +101,15 @@ DEFAULT_FOCAL_WEIGHT = 20.0
 DEFAULT_DICE_WEIGHT = 1.0
 
 prev = time.time()
+
+
+def _amp_autocast(device: str):
+    """bf16 autocast on CUDA -- no GradScaler needed (bf16 has fp32's
+    exponent range, unlike fp16), and Blackwell's tensor cores run bf16
+    matmuls natively at full rate."""
+    if device.startswith("cuda"):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
 # ---------------------------------------------------------------------------
 # Datasets
@@ -544,6 +555,17 @@ def load_finetuned_model(checkpoint_dir: Path, device: str = "cuda") -> SimpleSA
 
 def train(args: argparse.Namespace) -> Path:
     device = args.device
+    if device.startswith("cuda"):
+        # TF32 for any matmul/conv that falls outside the bf16 autocast
+        # region (e.g. LoRA's fp32 master weights) -- free precision/perf
+        # tradeoff on Blackwell's tensor cores, same as A100/H100.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        # Fixed image_size + drop_last=True train batches means stable
+        # input shapes, so cudnn autotuning pays for itself.
+        torch.backends.cudnn.benchmark = True
+
     train_ds, val_ds, class_names = build_datasets(args)
     num_classes = len(class_names)
     print(f"[input] classes: {class_names} ({num_classes})")
@@ -574,15 +596,22 @@ def train(args: argparse.Namespace) -> Path:
         f"[config] encoder_mode={args.encoder_mode}, trainable params: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)"
     )
 
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=device.startswith("cuda"),
+        persistent_workers=args.num_workers > 0,
+    )
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 4
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
         drop_last=len(train_ds) > args.batch_size,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+        val_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs
     )
 
     optimizer = torch.optim.AdamW(
@@ -598,6 +627,12 @@ def train(args: argparse.Namespace) -> Path:
         optimizer.load_state_dict(state["optimizer"])
         start_epoch = state["epoch"] + 1
         print(f"[bro] resumed from {args.resume} at epoch {start_epoch}")
+        # load_state_dict copies these into model/optimizer already; without
+        # freeing this, the raw checkpoint (a full duplicate set of weights +
+        # AdamW momentum buffers on `device`) sits unused for the whole run.
+        del state
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -612,15 +647,16 @@ def train(args: argparse.Namespace) -> Path:
             images, masks = images.to(device, non_blocking=True), masks.to(
                 device, non_blocking=True
             )
-            logits = model(images)
-            loss, parts = seg_loss(
-                logits,
-                masks,
-                num_classes,
-                args.focal_weight,
-                args.dice_weight,
-                args.dice_exclude_background,
-            )
+            with _amp_autocast(device):
+                logits = model(images)
+                loss, parts = seg_loss(
+                    logits,
+                    masks,
+                    num_classes,
+                    args.focal_weight,
+                    args.dice_weight,
+                    args.dice_exclude_background,
+                )
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -637,15 +673,16 @@ def train(args: argparse.Namespace) -> Path:
                 images, masks = images.to(device, non_blocking=True), masks.to(
                     device, non_blocking=True
                 )
-                logits = model(images)
-                _, parts = seg_loss(
-                    logits,
-                    masks,
-                    num_classes,
-                    args.focal_weight,
-                    args.dice_weight,
-                    args.dice_exclude_background,
-                )
+                with _amp_autocast(device):
+                    logits = model(images)
+                    _, parts = seg_loss(
+                        logits,
+                        masks,
+                        num_classes,
+                        args.focal_weight,
+                        args.dice_weight,
+                        args.dice_exclude_background,
+                    )
                 val_losses.append(parts["total"])
                 pred = logits.argmax(dim=1)
                 _, per_class = compute_miou(pred, masks, num_classes)
@@ -719,7 +756,9 @@ def train(args: argparse.Namespace) -> Path:
     with torch.no_grad():
         for images, masks in val_loader:
             images = images.to(device, non_blocking=True)
-            pred = model(images).argmax(dim=1).cpu()
+            with _amp_autocast(device):
+                logits = model(images)
+            pred = logits.argmax(dim=1).cpu()
             cm += compute_confusion_matrix(pred, masks, num_classes)
     print(f"\n[eval] confusion matrix on validation set ({len(val_ds)} frames):")
     print_confusion_matrix(cm, class_names)
@@ -742,9 +781,9 @@ def train(args: argparse.Namespace) -> Path:
         with torch.no_grad():
             for i in sample_idx:
                 image, mask = full_ds[i]
-                pred = (
-                    model(image.unsqueeze(0).to(device)).argmax(dim=1).squeeze(0).cpu()
-                )
+                with _amp_autocast(device):
+                    logits = model(image.unsqueeze(0).to(device))
+                pred = logits.argmax(dim=1).squeeze(0).cpu()
                 acc = (pred == mask).float().mean().item()
                 accs.append(acc)
                 print(f"    idx={i:>6}  accuracy={acc:.4f}")
@@ -804,7 +843,14 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument(
+        "--num-workers",
+        type=int,
+        default=min(8, os.cpu_count() or 4),
+        help="cv2 decode/resize is CPU-bound; 4x active GPU count is a common floor, "
+        "but with few GPUs and many cores it's worth going higher to keep the GPU fed "
+        "(default: min(8, cpu_count))",
+    )
     ap.add_argument("--focal-weight", type=float, default=DEFAULT_FOCAL_WEIGHT)
     ap.add_argument("--dice-weight", type=float, default=DEFAULT_DICE_WEIGHT)
     ap.add_argument(
