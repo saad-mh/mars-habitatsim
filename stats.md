@@ -94,11 +94,39 @@ epoch 1/20 train_loss=1.0274 val_loss=0.7834 val_mIoU=0.6817
 ### end
 
 ```
-epoch 20/20 train_loss=0.6541 val_loss=0.6616 val_mIoU=0.7995
+epoch 20/20 train_loss=0.0372 val_loss=0.0379 val_mIoU=0.8681
 ```
 
 ### best
 
 ```
-epoch 19/20 train_loss=0.6552 val_loss=0.6607 val_mIoU=0.8027
+epoch 20/20 train_loss=0.0372 val_loss=0.0379 val_mIoU=0.8681
+```
+
+### conf matrix and stats
+
+```
+training took 51662.67 seconds
+
+[eval] confusion matrix on validation set (1359 frames):
+                  background  small_rock    big_rock     bedrock  hole_in_gr
+background      1,423,568,814           0     226,142           0           0
+small_rock                 0           0           0           0           0
+big_rock             147,115           0   1,072,713           0           0
+bedrock                    0           0           0           0           0
+hole_in_ground             0           0           0           0           0
+[eval] overall pixel accuracy (val set): 0.9997
+
+[eval] pixel accuracy on 10 random image(s) from the dataset:
+    idx=  2201  accuracy=0.9998
+    idx=  9325  accuracy=0.9999
+    idx= 13144  accuracy=0.9999
+    idx= 12513  accuracy=0.9999
+    idx=  1033  accuracy=0.9999
+    idx=  4179  accuracy=0.9999
+    idx=  1931  accuracy=0.9997
+    idx=  8117  accuracy=0.9997
+    idx= 12467  accuracy=0.9999
+    idx=  7364  accuracy=0.9998
+[eval] mean accuracy over 10 random image(s): 0.9998
 ```
