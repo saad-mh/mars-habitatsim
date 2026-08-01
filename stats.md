@@ -88,7 +88,7 @@ encoder_mode=lora, trainable params: 2,291,869 / 214,995,149 (1.07%)
 ### start
 
 ```
-epoch 1/20 train_loss=1.6588 val_loss=1.0078 val_mIoU=0.5354
+epoch 1/20 train_loss=1.0274 val_loss=0.7834 val_mIoU=0.6817
 ```
 
 ### end
