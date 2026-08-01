@@ -14,7 +14,14 @@ from sam_vla.core.lifecycle import ServiceRegistry
 from sam_vla.core.types import Observation, Pose
 from sam_vla.env.annotation_meshes import load_mesh_id_map, register_annotation_meshes
 from sam_vla.env.terrain import SIZE_X, SIZE_Y, SIZE_Z, HeightmapGrid, Terrain
-from sam_vla.env.sim_utils import make_sensor, register_semantic_mesh, rgb_depth, save_obj, set_agent_pose
+from sam_vla.env.sim_utils import (
+    make_sensor,
+    register_semantic_mesh,
+    rgb_depth,
+    save_obj,
+    set_agent_pose,
+    set_objects_hidden,
+)
 from sam_vla.env.rock_generation import RockSpec, load_rock_field, register_rocks
 
 RGB_HEIGHT = 480
@@ -63,6 +70,8 @@ class MarsHabitatEnv:
         self._annotation_categories = annotation_categories
         self.rocks: List[RockSpec] = []
         self.annotation_mesh_id_map: dict = {}
+        self._annotation_objects: dict = {}
+        self._annotation_onstage: dict = {}
 
     def __enter__(self) -> "MarsHabitatEnv":
         sim_cfg = habitat_sim.SimulatorConfiguration()
@@ -113,7 +122,12 @@ class MarsHabitatEnv:
 
         if self._annotations_dir is not None:
             self.annotation_mesh_id_map = load_mesh_id_map(self._annotations_dir)
-            register_annotation_meshes(self._sim, str(self._annotations_dir), self._annotation_categories)
+            self._annotation_objects = register_annotation_meshes(
+                self._sim, str(self._annotations_dir), self._annotation_categories
+            )
+            self._annotation_onstage = {
+                mesh_id: obj.translation for mesh_id, obj in self._annotation_objects.items()
+            }
 
         self._registry.start_all()
         return self
@@ -139,22 +153,73 @@ class MarsHabitatEnv:
         return Observation(rgb=rgb, depth=depth, pose=pose, frame_idx=frame_idx)
 
     def get_full_observation(self, frame_idx: int) -> Observation:
-        """One `sim.get_sensor_observations()` call returning rgb+depth+pose
-        (as get_observation does) AND the semantic id buffer (as
-        get_semantic_frame does), from a single render pass instead of two.
-        get_observation() and get_semantic_frame() each trigger their own
-        render call; a caller needing both -- e.g. the segmentation capture
-        pipeline -- must use this instead, or render cost silently doubles.
-        `.semantic` is None if with_semantic=False (mirrors
-        get_semantic_frame's precondition)."""
-        obs = self._sim.get_sensor_observations()
-        rgb, depth = rgb_depth(obs)
+        """Returns rgb+depth+pose (as get_observation does) AND the semantic
+        id buffer (as get_semantic_frame does). `.semantic` is None if
+        with_semantic=False (mirrors get_semantic_frame's precondition).
+
+        If annotation meshes are loaded, this does TWO render passes instead
+        of one: Pass A (rgb/depth) is captured with the annotation meshes
+        moved out of camera view via sim_utils.set_objects_hidden, so they
+        can never bake into the training RGB (see next.md -- the mesh sits
+        a few cm above terrain for the semantic pass and was, before this
+        split, also rendering into RGB as a visible object, producing a
+        deterministic occlusion artifact at every positive location that a
+        detector could trivially key on instead of real rock appearance).
+        Pass B (semantic only) is then captured with the meshes back
+        onstage. With no annotation meshes loaded, this is a single render
+        call exactly as before -- get_observation() and get_semantic_frame()
+        each trigger their own render call, so a caller needing both should
+        still prefer this over calling them separately."""
         state = self._agent.get_state()
         x, _y, z = (float(v) for v in state.position)
         yaw = float(quaternion.as_rotation_vector(state.rotation)[1])
         pose = Pose(x=x, y=float(state.position[1]), z=z, yaw=yaw)
-        semantic = np.asarray(obs["semantic"]) if self._with_semantic else None
+
+        if self._annotation_objects:
+            set_objects_hidden(self._annotation_objects, self._annotation_onstage, hidden=True)
+            obs = self._sim.get_sensor_observations()
+            rgb, depth = rgb_depth(obs)
+
+            set_objects_hidden(self._annotation_objects, self._annotation_onstage, hidden=False)
+            obs2 = self._sim.get_sensor_observations()
+            semantic = np.asarray(obs2["semantic"]) if self._with_semantic else None
+        else:
+            obs = self._sim.get_sensor_observations()
+            rgb, depth = rgb_depth(obs)
+            semantic = np.asarray(obs["semantic"]) if self._with_semantic else None
+
         return Observation(rgb=rgb, depth=depth, pose=pose, frame_idx=frame_idx, semantic=semantic)
+
+    def verify_annotation_isolation(self, frame_idx: int = -1) -> None:
+        """Standing regression check (next.md Step 5): assert
+        get_full_observation's actual Pass A RGB (the production path)
+        matches an explicit "annotation meshes absent" control render, at
+        the current agent pose. This is NOT the same as asserting
+        onstage-RGB == hidden-RGB -- those are *expected* to differ
+        whenever a mesh is in frame, since a real object was moved out of
+        view; that difference is the artifact next.md describes; it's fine.
+        What must never happen is get_full_observation itself forgetting to
+        hide the meshes before capturing Pass A, i.e. Pass A silently
+        matching the "meshes onstage" render instead of the "meshes absent"
+        one. Raises AssertionError if that ever happens. No-op if no
+        annotation meshes are loaded."""
+        if not self._annotation_objects:
+            return
+
+        obs = self.get_full_observation(frame_idx)  # production path
+
+        set_objects_hidden(self._annotation_objects, self._annotation_onstage, hidden=True)
+        obs_absent = self._sim.get_sensor_observations()
+        rgb_absent, _ = rgb_depth(obs_absent)
+        set_objects_hidden(self._annotation_objects, self._annotation_onstage, hidden=False)  # restore
+
+        if not np.array_equal(obs.rgb, rgb_absent):
+            diff_pixels = int(np.any(obs.rgb != rgb_absent, axis=-1).sum())
+            raise AssertionError(
+                f"annotation mesh isolation broken: get_full_observation's RGB differs by "
+                f"{diff_pixels} pixels from a render with annotation meshes explicitly absent -- "
+                "the annotation meshes are leaking into the training RGB again (see next.md)."
+            )
 
     def get_semantic_frame(self) -> np.ndarray:
         """Raw per-pixel semantic-id image (H, W) from the semantic sensor:
