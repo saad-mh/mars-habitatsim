@@ -1,14 +1,25 @@
 """Same WASD/space/x teleop UI as kb_teleop.py, but driven through
-sam_vla.env.habitat_env.MarsHabitatEnv instead of a standalone habitat_sim
-setup -- the exact sensor specs (480x640, HFOV 90) and camera-height formula
-(local terrain max + spawn clearance) that sam_vla/run_segmentation_sweep.py
-uses to build training data, so recorded frames match that distribution
-instead of kb_teleop.py's own lower/point-sampled camera height.
+sam_vla.env.habitat_env.MarsHabitatEnv with with_semantic=True and the
+annotation meshes registered -- i.e. the exact same simulation setup
+sam_vla/run_segmentation_sweep.py uses to build training data (sensor specs,
+camera-height formula, registered rock/bedrock/hole_in_ground hulls), not
+just matching sensors/pose. Saved frames get the same three assets a sweep
+run writes (rgb/, masks_instance/, masks_category/) plus
+segmentation_frames.jsonl + summary.json via the same EpisodeLogger +
+segmentation_capture helpers, so the output directory is a drop-in
+--run-dir for finetune_sam2_lora.py, and spot_check_segmentation /
+overlay_category_mask work on it unmodified.
+
+ANNOTATIONS_DIR is annotations/mesh_tight_bound2, not
+run_segmentation_sweep.py's own --annotations-dir default
+(annotations/mesh_segmentation) -- mesh_tight_bound2 is what the actual
+sweep runs behind sam_lora_runs/exp2 and exp3 used (see stats.md / bash
+history), so this matches the real training data source, not the script's
+default.
 """
 
-import os
-import time
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -19,13 +30,23 @@ import tkinter as tk
 from sam_vla.core.types import Pose
 from sam_vla.env.habitat_env import MarsHabitatEnv
 from sam_vla.env.terrain import SIZE_X, SIZE_Z
+from sam_vla.logging.episode_logger import EpisodeLogger, make_run_id
+from sam_vla.perception.segmentation_capture import (
+    build_category_lut,
+    capture_frame_record,
+    write_segmentation_assets,
+)
+from sam_vla.perception.spot_check_segmentation import build_palette, overlay_category_mask
 
 HERE = Path(__file__).resolve().parent
 
 SCENE = str(HERE / "assets" / "marsyard2022.glb")
 HEIGHTMAP = str(HERE / "marsyard2022_terrain_hm_1025.tif")
 
-OUT_DIR = f"mars_teleop_out{int(time.time())}"
+OUT_ROOT = "output"  # same root run_segmentation_sweep.py's --out-dir defaults to
+ANNOTATIONS_DIR = str(HERE / "annotations" / "mesh_tight_bound2")
+CATEGORIES = ["small_rock", "big_rock", "bedrock", "hole_in_ground"]
+BACKGROUND_CATEGORY = "background"
 
 # Start pose
 START_X = 0.0
@@ -45,9 +66,11 @@ START_RECORDING = False
 SAVE_ON_RECORDING_MOVEMENT_ONLY = True
 SAVE_FRAME_ON_RECORDING_START = True
 
-# Display
+# Display: RGB | depth | category-mask overlay, side by side
 SHOW_DEPTH_BESIDE_RGB = True
+SHOW_MASK_OVERLAY = True
 DEPTH_VIS_MAX_METERS = 10.0
+MASK_OVERLAY_ALPHA = 0.45
 
 # ============================================================
 
@@ -58,22 +81,6 @@ def depth_vis_from(depth: np.ndarray) -> np.ndarray:
     depth_clip = np.clip(depth, 0.0, DEPTH_VIS_MAX_METERS)
     depth_vis = (depth_clip / DEPTH_VIS_MAX_METERS * 255.0).astype(np.uint8)
     return np.stack([depth_vis, depth_vis, depth_vis], axis=-1)
-
-
-def save_obs(rgb, depth, idx, x, y, z, yaw, recording):
-    os.makedirs(OUT_DIR, exist_ok=True)
-
-    depth_vis = depth_vis_from(depth)[:, :, 0]
-    Image.fromarray(rgb).save(f"{OUT_DIR}/rgb_{idx:04d}.png")
-    Image.fromarray(depth_vis).save(f"{OUT_DIR}/depth_{idx:04d}.png")
-
-    with open(f"{OUT_DIR}/poses.txt", "a") as f:
-        f.write(
-            f"{idx:04d} "
-            f"x={x:.4f} y={y:.4f} z={z:.4f} "
-            f"yaw_rad={yaw:.4f} yaw_deg={np.rad2deg(yaw):.2f} "
-            f"recording={int(recording)}\n"
-        )
 
 
 def apply_boundary(x, z, old_x, old_z):
@@ -99,8 +106,28 @@ class MarsTeleopApp:
             start_x=START_X,
             start_z=START_Z,
             start_yaw=np.deg2rad(START_YAW_DEG),
+            with_semantic=True,
+            annotations_dir=ANNOTATIONS_DIR,
+            annotation_categories=CATEGORIES,
         )
         self.env.__enter__()
+
+        self.lut, self.class_names = build_category_lut(
+            self.env.annotation_mesh_id_map, CATEGORIES, BACKGROUND_CATEGORY
+        )
+        self.palette = build_palette(self.class_names)
+
+        config = {
+            "goal_mode": "kb-teleop",
+            "steering_mode": "manual",
+            "obstacle_count": "na",
+            "obstacle_seed": "na",
+            "categories": CATEGORIES,
+            "background_category": BACKGROUND_CATEGORY,
+            "annotations_dir": ANNOTATIONS_DIR,
+        }
+        run_id = make_run_id(config)
+        self.logger = EpisodeLogger(run_id, config, log_root=OUT_ROOT)
 
         self.x = START_X
         self.z = START_Z
@@ -111,13 +138,8 @@ class MarsTeleopApp:
         self.recorded = False
         self.closed = False
 
-        os.makedirs(OUT_DIR, exist_ok=True)
-        poses_path = f"{OUT_DIR}/poses.txt"
-        if os.path.exists(poses_path):
-            os.remove(poses_path)
-
         self.root = tk.Tk()
-        self.root.title("Kb Teleop (sweep-matched env)")
+        self.root.title("Kb Teleop (sweep-matched env + masks)")
 
         self.image_label = tk.Label(self.root)
         self.image_label.pack()
@@ -136,23 +158,33 @@ class MarsTeleopApp:
         self.render()
 
     def render(self):
-        obs = self.env.get_observation(self.frame_idx)
+        obs = self.env.get_full_observation(self.frame_idx)
         self.latest_obs = obs
         self.pose_y = obs.pose.y
 
-        depth_rgb = depth_vis_from(obs.depth)
+        self.category_mask, self.objects = capture_frame_record(
+            obs.rgb, obs.semantic, self.env.annotation_mesh_id_map, self.lut, self.class_names
+        )
 
+        panels = [obs.rgb]
         if SHOW_DEPTH_BESIDE_RGB:
-            img_arr = np.hstack([obs.rgb, depth_rgb])
-        else:
-            img_arr = obs.rgb
+            panels.append(depth_vis_from(obs.depth))
+        if SHOW_MASK_OVERLAY:
+            panels.append(
+                overlay_category_mask(
+                    obs.rgb, self.category_mask, self.class_names, self.palette, MASK_OVERLAY_ALPHA
+                )
+            )
+        img_arr = np.hstack(panels)
 
         img = Image.fromarray(img_arr)
         draw = ImageDraw.Draw(img)
 
+        n_objects = len(self.objects)
         status = (
             f"x={self.x:.2f} y={self.pose_y:.2f} z={self.z:.2f} "
             f"yaw={np.rad2deg(self.yaw):.1f} "
+            f"objects={n_objects} "
             f"REC={'ON' if self.recording else 'OFF'}"
         )
 
@@ -172,20 +204,34 @@ class MarsTeleopApp:
         self.image_label.configure(image=self.tk_img)
 
     def save_current_frame(self):
-        save_obs(
-            self.latest_obs.rgb,
-            self.latest_obs.depth,
-            self.frame_idx,
-            self.x,
-            self.pose_y,
-            self.z,
-            self.yaw,
-            self.recording,
+        obs = self.latest_obs
+        frame_id = f"teleop_{self.frame_idx:06d}"
+
+        paths = write_segmentation_assets(
+            self.logger.run_dir,
+            frame_id,
+            obs.rgb,
+            obs.semantic.astype(np.uint16),
+            self.category_mask,
+        )
+        self.logger.log_segmentation_frame(
+            frame_id=frame_id,
+            objects=[
+                {
+                    "mesh_id": o.mesh_id,
+                    "category": o.category,
+                    "pixel_count": o.pixel_count,
+                    "bbox": list(o.bbox),
+                }
+                for o in self.objects
+            ],
+            camera_pose={"x": obs.pose.x, "y": obs.pose.y, "z": obs.pose.z, "yaw": obs.pose.yaw},
+            **paths,
         )
 
         self.recorded = True
 
-        print(f"saved frame {self.frame_idx:04d}")
+        print(f"saved frame {frame_id} ({len(self.objects)} objects)")
         self.frame_idx += 1
 
     def on_key(self, event):
@@ -245,6 +291,15 @@ class MarsTeleopApp:
 
         self.closed = True
 
+        run_dir = self.logger.run_dir
+        self.logger.finalize(
+            {
+                "total_frames": self.frame_idx,
+                "class_names": self.class_names,
+                "source": "kb_teleop_env",
+            }
+        )
+
         try:
             self.env.__exit__(None, None, None)
         except Exception:
@@ -256,10 +311,10 @@ class MarsTeleopApp:
             pass
 
         if self.recorded:
-            print(f"Done. Output: {OUT_DIR}")
+            print(f"Done. Output: {run_dir}")
         else:
             print("Done. No frames recorded.")
-            shutil.rmtree(OUT_DIR, ignore_errors=True)
+            shutil.rmtree(run_dir, ignore_errors=True)
 
     def run(self):
         self.root.mainloop()
