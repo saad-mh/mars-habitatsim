@@ -20,16 +20,24 @@ adds the obstacle field, projection/overlay, and the VL call.
 
 Run inside the "habitat" conda env from the repo root (so vl_direction is
 importable and InternVLServerManager's subprocess cwd is correct):
-    conda activate habitat && python kb_teleop_vl.py
+    conda activate habitat && python kb_teleop_vl.py [--vl-every-n-frames N]
 InternVLServerManager spawns internvl_server.py in the "vl" conda env on
 first use and loads InternVL3-8B (weights are already cached locally, so
 this is mostly GPU-load time); the window opens once that health check
-passes. Every WASD/QE keypress blocks on a real model call, so movement
-will feel throttled by inference latency -- that's the point of this
-harness, not a bug.
+passes.
+
+VL queries are dispatched on a background thread and gated to run every
+--vl-every-n-frames frames or every VL_QUERY_EVERY_N_SECONDS seconds,
+whichever comes first (see _should_query_vl). Movement/rendering never
+blocks on the VL call -- the rover keeps stepping and the frame keeps
+rendering on whatever the last-known VL directive was (or with none at all,
+before the first result lands), the same way a real rover has to keep
+running even when its perception stack hasn't produced an output yet.
 """
 
+import argparse
 import math
+import threading
 import time
 from pathlib import Path
 
@@ -131,6 +139,8 @@ class VLTeleopApp:
         self.vl_query_every_n_seconds = VL_QUERY_EVERY_N_SECONDS
         self.last_vl_frame_idx = None
         self.last_vl_time = None
+        self.vl_query_in_flight = False
+        self.vl_lock = threading.Lock()
 
         self.sim = kb.make_sim()
         self.agent = self.sim.initialize_agent(0)
@@ -246,8 +256,13 @@ class VLTeleopApp:
     def _should_query_vl(self):
         """Gate on whichever cadence trigger fires first: every N frames
         (manually configured, default 3) or every VL_QUERY_EVERY_N_SECONDS
-        wall-clock seconds since the last actual call. Always true on the
-        first frame."""
+        wall-clock seconds since the last dispatched call. Always true on
+        the first frame. Skips while a previous call is still in flight so
+        slow inference can't pile up overlapping requests -- the render
+        loop itself is never gated on this, only whether a *new* dispatch
+        happens."""
+        if self.vl_query_in_flight:
+            return False
         if self.last_vl_frame_idx is None:
             return True
         if self.frame_idx - self.last_vl_frame_idx >= self.vl_query_every_n_frames:
@@ -256,7 +271,11 @@ class VLTeleopApp:
             return True
         return False
 
-    def _query_vl(self, annotated_rgb, nearest_any, nearest_visible):
+    def _dispatch_vl_query(self, annotated_rgb, nearest_any, nearest_visible):
+        """Builds the VL request and hands the actual model call to a
+        background thread so render()/movement never blocks on inference
+        latency -- the sim keeps stepping on whatever self.last_vl_line
+        already holds (possibly still "", if no result has landed yet)."""
         mode = (
             "cbf"
             if nearest_any is not None
@@ -282,27 +301,54 @@ class VLTeleopApp:
             )
             context = ExplorationContext(task_str=EXPLORATION_TASK_STR, vague_hint=hint)
 
+        frame_idx_snapshot = self.frame_idx
         self.last_vl_frame_idx = self.frame_idx
         self.last_vl_time = time.time()
+        self.vl_query_in_flight = True
 
+        thread = threading.Thread(
+            target=self._vl_worker,
+            args=(mode, annotated_rgb, context, fallback_note, frame_idx_snapshot),
+            daemon=True,
+        )
+        thread.start()
+
+    def _vl_worker(self, mode, annotated_rgb, context, fallback_note, frame_idx_snapshot):
+        """Runs on a background thread -- the actual (slow) model call.
+        Never touches Tkinter directly; schedules the UI update back onto
+        the main loop via root.after so this stays thread-safe."""
         try:
             result = vl_query(
                 mode, [annotated_rgb], context, EPISODE_ID, client=self.client
             )
         except Exception as e:
-            line = f"[{self.frame_idx:05d}] {mode} -> ERROR -> n/a -> {e}"
-            print(line)
-            return line
+            line = f"[{frame_idx_snapshot:05d}] {mode} -> ERROR -> n/a -> {e}"
+        else:
+            direction_str = (
+                result.direction.value if result.direction is not None else "NONE"
+            )
+            line = (
+                f"[{frame_idx_snapshot:05d}] {mode} -> {direction_str} -> "
+                f"{result.latency_ms:.1f}ms -> {result.raw_response!r}{fallback_note}"
+            )
 
-        direction_str = (
-            result.direction.value if result.direction is not None else "NONE"
-        )
-        line = (
-            f"[{self.frame_idx:05d}] {mode} -> {direction_str} -> "
-            f"{result.latency_ms:.1f}ms -> {result.raw_response!r}{fallback_note}"
-        )
         print(line)
-        return line
+
+        with self.vl_lock:
+            self.vl_query_in_flight = False
+
+        if not self.closed:
+            try:
+                self.root.after(0, self._apply_vl_line, line)
+            except Exception:
+                pass  # window may have been torn down between the check and this call
+
+    def _apply_vl_line(self, line):
+        """Runs on the main/Tkinter thread via root.after. Only updates the
+        cached line; does not force a redraw so a slow VL result never
+        stalls movement -- it just appears baked into the next
+        keypress-triggered render()."""
+        self.last_vl_line = line
 
     def render(self):
         obs = self.sim.get_sensor_observations()
@@ -314,9 +360,7 @@ class VLTeleopApp:
         annotated_rgb = overlay_obstacles(rgb, circles)
 
         if self._should_query_vl():
-            self.last_vl_line = self._query_vl(
-                annotated_rgb, nearest_any, nearest_visible
-            )
+            self._dispatch_vl_query(annotated_rgb, nearest_any, nearest_visible)
         self.frame_idx += 1
 
         if kb.SHOW_DEPTH_BESIDE_RGB:
@@ -391,23 +435,22 @@ class VLTeleopApp:
         self.root.mainloop()
 
 
-def _prompt_vl_query_every_n_frames():
-    raw = input(
-        f"VL query interval in frames [default {DEFAULT_VL_QUERY_EVERY_N_FRAMES}]: "
-    ).strip()
-    if not raw:
-        return DEFAULT_VL_QUERY_EVERY_N_FRAMES
-    try:
-        n = int(raw)
-        if n < 1:
-            raise ValueError
-        return n
-    except ValueError:
-        print(f"Invalid input {raw!r}, using default {DEFAULT_VL_QUERY_EVERY_N_FRAMES}")
-        return DEFAULT_VL_QUERY_EVERY_N_FRAMES
+def _parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--vl-every-n-frames",
+        type=int,
+        default=DEFAULT_VL_QUERY_EVERY_N_FRAMES,
+        help=f"query VL every N frames (default {DEFAULT_VL_QUERY_EVERY_N_FRAMES}); "
+        f"also fires every {VL_QUERY_EVERY_N_SECONDS:.1f}s regardless, whichever comes first",
+    )
+    args = parser.parse_args()
+    if args.vl_every_n_frames < 1:
+        parser.error("--vl-every-n-frames must be >= 1")
+    return args
 
 
 if __name__ == "__main__":
-    vl_query_every_n_frames = _prompt_vl_query_every_n_frames()
-    app = VLTeleopApp(vl_query_every_n_frames=vl_query_every_n_frames)
+    args = _parse_args()
+    app = VLTeleopApp(vl_query_every_n_frames=args.vl_every_n_frames)
     app.run()
