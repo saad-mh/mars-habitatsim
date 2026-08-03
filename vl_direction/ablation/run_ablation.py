@@ -143,23 +143,24 @@ def _run_one_model(spec, scenarios, measured_reps, raw_rows):
     baseline_mib = _gpu_memory_used_mib()
     manager = _make_manager(spec)
 
-    t0 = time.monotonic()
+    result_meta = None
     try:
-        manager.start()
-    except Exception as e:
-        print(f"[run_ablation] {spec.name}: FAILED to start -- {e}")
-        raw_rows.append(
-            {"model": spec.name, "scenario": "", "mode": "", "rep": -1, "latency_ms": "", "parse_ok": "", "direction": "", "raw_response": f"START FAILED: {e}"}
-        )
-        return None
-    load_time_s = time.monotonic() - t0
-    post_load_mib = _gpu_memory_used_mib()
-    vram_delta_mib = post_load_mib - baseline_mib
-    print(f"[run_ablation] {spec.name}: loaded in {load_time_s:.1f}s, +{vram_delta_mib}MiB GPU")
+        t0 = time.monotonic()
+        try:
+            manager.start()
+        except Exception as e:
+            print(f"[run_ablation] {spec.name}: FAILED to start -- {e}")
+            raw_rows.append(
+                {"model": spec.name, "scenario": "", "mode": "", "rep": -1, "latency_ms": "", "parse_ok": "", "direction": "", "raw_response": f"START FAILED: {e}"}
+            )
+            return None
+        load_time_s = time.monotonic() - t0
+        post_load_mib = _gpu_memory_used_mib()
+        vram_delta_mib = post_load_mib - baseline_mib
+        print(f"[run_ablation] {spec.name}: loaded in {load_time_s:.1f}s, +{vram_delta_mib}MiB GPU")
 
-    client = InternVLSocketClient(host="127.0.0.1", port=manager.port)
+        client = InternVLSocketClient(host="127.0.0.1", port=manager.port)
 
-    try:
         for entry, frame in scenarios:
             mode, context, fallback_note = _build_query_args(entry)
             for rep in range(WARMUP_REPS + measured_reps):
@@ -193,11 +194,18 @@ def _run_one_model(spec, scenarios, measured_reps, raw_rows):
                     f"  [{entry['label']}{'(warmup)' if is_warmup else ''}] {mode} -> "
                     f"{row['direction'] or 'NONE'} -> {row['latency_ms']} -> {row['raw_response']!r}"
                 )
+
+        result_meta = {"name": spec.name, "load_time_s": load_time_s, "vram_delta_mib": vram_delta_mib}
     finally:
+        # Always torn down, even if manager.start() itself raised (e.g. a
+        # timed-out download/load) -- start() sets _owns_process=True right
+        # after spawning, before the health-check loop, so the subprocess is
+        # still reachable here and would otherwise leak as an orphaned,
+        # GPU-memory-holding process with no driver left to stop it.
         manager.stop()
         _wait_for_gpu_teardown(baseline_mib)
 
-    return {"name": spec.name, "load_time_s": load_time_s, "vram_delta_mib": vram_delta_mib}
+    return result_meta
 
 
 def _summarize(raw_rows, model_meta):
@@ -246,48 +254,57 @@ def main():
             raise ValueError(f"unknown model name(s): {missing}; available: {[s.name for s in MODEL_SPECS]}")
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = int(time.time())
+    raw_path = RESULTS_DIR / f"ablation_raw_{timestamp}.csv"
+    summary_path = RESULTS_DIR / f"ablation_summary_{timestamp}.csv"
+    raw_fieldnames = ["model", "scenario", "mode", "rep", "latency_ms", "parse_ok", "direction", "raw_response"]
+    summary_fieldnames = [
+        "model", "n_calls", "n_ok", "parse_success_rate",
+        "latency_mean_ms", "latency_p50_ms", "latency_p95_ms",
+        "load_time_s", "vram_delta_mib",
+    ]
+    print(f"[run_ablation] writing incrementally to {raw_path} and {summary_path} as each model finishes")
+
     raw_rows = []
     model_meta = {}
 
     for spec in specs:
+        rows_before = len(raw_rows)
         meta = _run_one_model(spec, scenarios, args.reps, raw_rows)
         if meta is not None:
             model_meta[spec.name] = meta
 
-    timestamp = int(time.time())
-    raw_path = RESULTS_DIR / f"ablation_raw_{timestamp}.csv"
-    with open(raw_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["model", "scenario", "mode", "rep", "latency_ms", "parse_ok", "direction", "raw_response"])
-        writer.writeheader()
-        writer.writerows(raw_rows)
+        # Append just this model's new rows -- and rewrite the (small)
+        # summary from everything accumulated so far -- right after each
+        # model finishes, so a still-running sweep is visible on disk
+        # instead of only appearing once every model has completed.
+        write_header = not raw_path.exists()
+        with open(raw_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=raw_fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(raw_rows[rows_before:])
 
-    summary = _summarize(raw_rows, model_meta)
-    summary_path = RESULTS_DIR / f"ablation_summary_{timestamp}.csv"
-    with open(summary_path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "model", "n_calls", "n_ok", "parse_success_rate",
-                "latency_mean_ms", "latency_p50_ms", "latency_p95_ms",
-                "load_time_s", "vram_delta_mib",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(summary)
+        summary = _summarize(raw_rows, model_meta)
+        with open(summary_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=summary_fieldnames)
+            writer.writeheader()
+            writer.writerows(summary)
 
-    print(f"\n[run_ablation] wrote {raw_path}")
-    print(f"[run_ablation] wrote {summary_path}\n")
-    print(f"{'model':<24} {'parse%':>7} {'mean_ms':>9} {'p50_ms':>8} {'p95_ms':>8} {'load_s':>7} {'vram_MiB':>9}")
-    for row in summary:
-        print(
-            f"{row['model']:<24} "
-            f"{row['parse_success_rate'] * 100:>6.1f}% "
-            f"{row['latency_mean_ms'] or 0:>9.1f} "
-            f"{row['latency_p50_ms'] or 0:>8.1f} "
-            f"{row['latency_p95_ms'] or 0:>8.1f} "
-            f"{row['load_time_s'] or 0:>7.1f} "
-            f"{row['vram_delta_mib'] or 0:>9}"
-        )
+        print(f"[run_ablation] {spec.name} done -- updated {summary_path.name}")
+        print(f"{'model':<24} {'parse%':>7} {'mean_ms':>9} {'p50_ms':>8} {'p95_ms':>8} {'load_s':>7} {'vram_MiB':>9}")
+        for row in summary:
+            print(
+                f"{row['model']:<24} "
+                f"{row['parse_success_rate'] * 100:>6.1f}% "
+                f"{row['latency_mean_ms'] or 0:>9.1f} "
+                f"{row['latency_p50_ms'] or 0:>8.1f} "
+                f"{row['latency_p95_ms'] or 0:>8.1f} "
+                f"{row['load_time_s'] or 0:>7.1f} "
+                f"{row['vram_delta_mib'] or 0:>9}"
+            )
+
+    print(f"\n[run_ablation] sweep complete. Final results: {raw_path}, {summary_path}")
 
 
 if __name__ == "__main__":
