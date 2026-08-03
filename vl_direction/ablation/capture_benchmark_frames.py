@@ -138,13 +138,19 @@ def _build_scenarios(obstacles):
             f"(best candidates: {far_candidates[:needed_far]}); widen _FAR_CANDIDATE_COORDS"
         )
 
+    # Face the terrain center from these far-out placements -- a fixed
+    # arbitrary yaw risks pointing past the finite terrain mesh's edge into
+    # the unrendered black void beyond it (caught by inspecting a captured
+    # frame: uncertainty_1 came back solid black before this fix).
     for i in range(_NUM_EXPLORATION_FAR):
         _edge, x, z = chosen_far[i]
-        scenarios.append({"label": f"exploration_far_{i}", "x": x, "z": z, "yaw_deg": float(45 * i)})
+        yaw_deg = math.degrees(math.atan2(x, z))
+        scenarios.append({"label": f"exploration_far_{i}", "x": x, "z": z, "yaw_deg": yaw_deg})
 
     for i in range(_NUM_UNCERTAINTY):
         _edge, x, z = chosen_far[_NUM_EXPLORATION_FAR + i]
-        scenarios.append({"label": f"uncertainty_{i}", "x": x, "z": z, "yaw_deg": float(90 * i)})
+        yaw_deg = math.degrees(math.atan2(x, z))
+        scenarios.append({"label": f"uncertainty_{i}", "x": x, "z": z, "yaw_deg": yaw_deg})
 
     return scenarios
 
