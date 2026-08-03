@@ -20,11 +20,11 @@ _HEALTH_CHECK_RETRY_INTERVAL = 1.0
 _START_TIMEOUT = 30.0
 _STOP_TIMEOUT = 5.0
 
-# internvl_server needs transformers + InternVL's own stack, which will live
-# in a dedicated conda env once a checkpoint is chosen -- not the env this
-# manager runs in. Resolve that env's interpreter directly rather than
-# relying on "python" from PATH.
-_INTERNVL_VLM_CONDA_ENV = "internvl_vlm"
+# internvl_server needs transformers + InternVL's own stack, which live in
+# the "vl" conda env (torch 2.11+cu128, transformers 5.x, InternVL3-8B) --
+# not the env this manager runs in. Resolve that env's interpreter directly
+# rather than relying on "python" from PATH.
+_INTERNVL_VLM_CONDA_ENV = "vl"
 
 
 def _resolve_internvl_vlm_python() -> str:

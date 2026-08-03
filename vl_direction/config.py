@@ -10,17 +10,27 @@ mirrors sam_vla/vlm/qwen_config.py's role exactly.
 # "mock" returns canned text with no I/O (default -- keeps this module
 # importable/testable without a live model or network). "hf"/"vllm"/"api"
 # all route through InternVLSocketClient; the backend value only labels
-# which serving stack the (not-yet-implemented) internvl_server actually
-# runs once one exists.
-INTERNVL_BACKEND = "mock"
-INTERNVL_MODEL_PATH = "OpenGVLab/InternVL2-8B"  # placeholder, unused while backend == "mock"
+# which serving stack internvl_server actually runs.
+#
+# The real checkpoint lives in the "vl" conda env (torch 2.11+cu128,
+# transformers 5.x) -- see internvl_model_runner.py / internvl_server.py.
+# INTERNVL_MODEL_PATH is InternVL3-8B: picked as the balanced choice for
+# this task's short LEFT/RIGHT/FRONT/BACK + sweep-description calls -- good
+# spatial/grounding accuracy for its size, and its ~16GB bf16 footprint
+# leaves this GPU's 98GB with plenty of headroom for multi-frame bursts.
+INTERNVL_BACKEND = "hf"
+INTERNVL_MODEL_PATH = "OpenGVLab/InternVL3-8B"
 
 INTERNVL_SERVER_HOST = "127.0.0.1"
 INTERNVL_SERVER_PORT = 8766  # distinct from qwen_server's 8765
 
 # --- per-mode generation knobs ---
 MAX_NEW_TOKENS = {"cbf": 16, "exploration": 16, "uncertainty": 32}
-FRAME_BURST_SIZE = {"cbf": 1, "exploration": 3, "uncertainty": 1}  # exploration configurable 1-5
+FRAME_BURST_SIZE = {
+    "cbf": 1,
+    "exploration": 3,
+    "uncertainty": 1,
+}  # exploration configurable 1-5
 
 # --- uncertainty sub-flow ---
 # This module never compares covariance against this threshold itself -- the
