@@ -11,14 +11,21 @@ later is a one-file change plus running this server in its own conda env.
 import base64
 import io
 import json
+import os
 import socket
 import struct
 
 import numpy as np
 from PIL import Image
 
-from vl_direction.config import INTERNVL_SERVER_HOST, INTERNVL_SERVER_PORT
+from vl_direction.config import INTERNVL_MODEL_PATH, INTERNVL_SERVER_HOST, INTERNVL_SERVER_PORT
 from vl_direction.internvl_model_runner import load_internvl_model, run_internvl_inference
+
+# Ablation harness sets these to point the same server code at a different
+# checkpoint/port without editing config.py -- unset, these fall back to the
+# InternVL3-8B / default-port behavior.
+_MODEL_PATH = os.environ.get("INTERNVL_MODEL_PATH", INTERNVL_MODEL_PATH)
+_SERVER_PORT = int(os.environ.get("INTERNVL_SERVER_PORT", INTERNVL_SERVER_PORT))
 
 _HEADER_SIZE = 4
 
@@ -94,7 +101,7 @@ def serve_forever(model, tokenizer, host: str = INTERNVL_SERVER_HOST, port: int 
 
 
 if __name__ == "__main__":
-    print("[!] Loading InternVL model")
-    _model, _tokenizer = load_internvl_model()
+    print(f"[!] Loading InternVL model: {_MODEL_PATH}")
+    _model, _tokenizer = load_internvl_model(_MODEL_PATH)
     print("Model loaded, starting server.")
-    serve_forever(_model, _tokenizer)
+    serve_forever(_model, _tokenizer, port=_SERVER_PORT)

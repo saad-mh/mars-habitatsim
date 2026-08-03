@@ -48,8 +48,10 @@ def _resolve_internvl_vlm_python() -> str:
 
 
 class InternVLServerManager:
-    def __init__(self, port: int = None):
+    def __init__(self, port: int = None, model_path: str = None, startup_timeout: float = None):
         self.port = port if port is not None else INTERNVL_SERVER_PORT
+        self.model_path = model_path
+        self.startup_timeout = startup_timeout if startup_timeout is not None else _START_TIMEOUT
         self._process = None
         self._owns_process = False
 
@@ -77,21 +79,32 @@ class InternVLServerManager:
             return
 
         print(f"[InternVLServerManager] no server on port {self.port}, spawning subprocess")
+        env = os.environ.copy()
+        env["INTERNVL_SERVER_PORT"] = str(self.port)
+        if self.model_path is not None:
+            env["INTERNVL_MODEL_PATH"] = self.model_path
         self._process = subprocess.Popen(
             [_resolve_internvl_vlm_python(), "-m", "vl_direction.internvl_server"],
             cwd=os.getcwd(),
+            env=env,
         )
         self._owns_process = True
 
-        deadline = time.time() + _START_TIMEOUT
+        deadline = time.time() + self.startup_timeout
         while time.time() < deadline:
             if self._health_check():
                 print("[InternVLServerManager] server is up")
                 return
+            if self._process.poll() is not None:
+                raise RuntimeError(
+                    f"internvl_server subprocess exited early with code {self._process.returncode} "
+                    f"(model_path={self.model_path!r}) -- check its stderr above"
+                )
             time.sleep(_HEALTH_CHECK_RETRY_INTERVAL)
 
         raise RuntimeError(
-            f"internvl_server did not respond to ping within {_START_TIMEOUT}s of spawning"
+            f"internvl_server did not respond to ping within {self.startup_timeout}s of spawning "
+            f"(model_path={self.model_path!r})"
         )
 
     def stop(self) -> None:

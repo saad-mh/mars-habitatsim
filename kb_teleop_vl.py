@@ -14,6 +14,15 @@ current view; "exploration" (four-way prior) otherwise, including the
 fallback case where the nearest obstacle is behind the rover and has no
 pixel bbox to hand to CBFContext.
 
+Also drives vl_direction's third mode, "uncertainty", via UncertaintySession --
+this script has no real belief tracker, so a synthetic covariance proxy drifts
+up while no synthetic obstacle is close enough to act as a visual anchor and
+resets when one is. Crossing the threshold halts keyboard movement and normal
+cbf/exploration dispatch, asks InternVL for a sweep description, and waits for
+a human-supplied heading (numpad keys 1/2/3/4/6/7/8/9, or R to retry) before
+resuming -- press U at any time to force-trigger the halt for testing instead
+of waiting on/tuning the organic drift.
+
 Reuses kb_teleop.py's habitat_sim setup (make_sim, terrain height lookup,
 boundary clamping) via import rather than duplicating it -- this script only
 adds the obstacle field, projection/overlay, and the VL call.
@@ -49,34 +58,47 @@ import tkinter as tk
 import quaternion
 
 import kb_teleop as kb
+from vl_direction import config as vl_dir_config
 from vl_direction.client import get_client
 from vl_direction.directive_engine import query as vl_query
 from vl_direction.internvl_server_manager import InternVLServerManager
 from vl_direction.schemas import CBFContext, ExplorationContext
+from vl_direction.uncertainty_session import UncertaintySession
 
-# --- synthetic obstacle field (stand-in for a real obstacle detector) ---
 NUM_OBSTACLES = 6
 OBSTACLE_RADIUS_M = 0.5
 OBSTACLE_SEED = 7
 OBSTACLE_SPAWN_HALF_EXTENT = 18.0  # sampled uniformly in [-extent, extent]^2, comfortably inside kb.BOUNDARY_LIMIT
 
-# --- mode selection ---
-CBF_DISTANCE_THRESHOLD_M = 3.5  # rover-to-nearest-obstacle-edge distance below which we ask for a go-around side
+CBF_DISTANCE_THRESHOLD_M = 3.5
 EXPLORATION_TASK_STR = "explore the terrain ahead"
 
-# --- camera projection (must match kb_teleop.make_sensor's hfov, which
-# habitat_sim defaults to 90deg -- unchanged here, see make_sensor) ---
+# --- uncertainty halt: synthetic covariance proxy (this script has no real belief
+# tracker) -- confidence drifts up while no synthetic obstacle is close enough to act
+# as a visual anchor, resets when one is. U forces an immediate halt for testing. ---
+UNCERTAINTY_GROUNDING_RANGE_M = CBF_DISTANCE_THRESHOLD_M
+DEFAULT_UNCERTAINTY_COVARIANCE_THRESHOLD = vl_dir_config.DEFAULT_COVARIANCE_THRESHOLD
+DEFAULT_UNCERTAINTY_GROWTH_PER_STEP = 0.1
+UNCERTAINTY_HEADING_KEYS = {
+    "8": 0.0,
+    "9": 45.0,
+    "6": 90.0,
+    "3": 135.0,
+    "2": 180.0,
+    "1": -135.0,
+    "4": -90.0,
+    "7": -45.0,
+}
+
 CAMERA_HFOV_DEG = 90.0
 _FRAME_H, _FRAME_W = kb.RGBD_RESOLUTION
 _FOCAL_PX = (_FRAME_W / 2.0) / math.tan(math.radians(CAMERA_HFOV_DEG / 2.0))
 
-# --- overlay ---
 OVERLAY_ALPHA = 0.5
 OVERLAY_MIN_PIXEL_RADIUS = 3
 OVERLAY_MAX_PIXEL_RADIUS = 260
 
-# --- backend ---
-USE_MOCK_CLIENT = False  # flip to True to smoke-test this script with no GPU/model
+USE_MOCK_CLIENT = False
 
 EPISODE_ID = f"kb-teleop-vl-{int(time.time())}"
 
@@ -84,7 +106,7 @@ EPISODE_ID = f"kb-teleop-vl-{int(time.time())}"
 # manually configurable at startup; the seconds trigger is a fixed backstop
 # so a stalled frame counter still keeps directives fresh) ---
 DEFAULT_VL_QUERY_EVERY_N_FRAMES = 3
-VL_QUERY_EVERY_N_SECONDS = 3.0
+VL_QUERY_EVERY_N_SECONDS = 5.0
 
 
 def make_obstacles(rng, count, half_extent):
@@ -134,13 +156,26 @@ def overlay_obstacles(rgb, projected_circles):
 
 
 class VLTeleopApp:
-    def __init__(self, vl_query_every_n_frames=DEFAULT_VL_QUERY_EVERY_N_FRAMES):
+    def __init__(
+        self,
+        vl_query_every_n_frames=DEFAULT_VL_QUERY_EVERY_N_FRAMES,
+        uncertainty_covariance_threshold=DEFAULT_UNCERTAINTY_COVARIANCE_THRESHOLD,
+        uncertainty_growth_per_step=DEFAULT_UNCERTAINTY_GROWTH_PER_STEP,
+    ):
         self.vl_query_every_n_frames = vl_query_every_n_frames
         self.vl_query_every_n_seconds = VL_QUERY_EVERY_N_SECONDS
         self.last_vl_frame_idx = None
         self.last_vl_time = None
         self.vl_query_in_flight = False
         self.vl_lock = threading.Lock()
+
+        self.uncertainty_covariance_threshold = uncertainty_covariance_threshold
+        self.uncertainty_growth_per_step = uncertainty_growth_per_step
+        self.uncertainty_covariance = 0.0
+        self.halted_for_uncertainty = False
+        self.uncertainty_request_in_flight = False
+        self.last_uncertainty_line = ""
+        self.last_annotated_rgb = None
 
         self.sim = kb.make_sim()
         self.agent = self.sim.initialize_agent(0)
@@ -177,6 +212,17 @@ class VLTeleopApp:
             f"or every {self.vl_query_every_n_seconds:.1f}s, whichever comes first"
         )
 
+        self.uncertainty_session = UncertaintySession(
+            episode_id=EPISODE_ID,
+            covariance_threshold=self.uncertainty_covariance_threshold,
+            covariance_value=self.uncertainty_covariance,
+            client=self.client,
+        )
+        print(
+            f"[VLTeleopApp] uncertainty halt: growth={self.uncertainty_growth_per_step}/step, "
+            f"threshold={self.uncertainty_covariance_threshold} (press U to force-trigger)"
+        )
+
         self.frame_idx = 0
         self.closed = False
         self.last_vl_line = ""
@@ -189,7 +235,10 @@ class VLTeleopApp:
 
         self.info_label = tk.Label(
             self.root,
-            text="W/S move | A/D turn | Q/E height | X quit",
+            text=(
+                "W/S move | A/D turn | Q/E height | U force-uncertainty-halt | X quit  "
+                "(while halted: 1/2/3/4/6/7/8/9 = submit heading, R = retry)"
+            ),
             font=("Arial", 12),
         )
         self.info_label.pack()
@@ -313,7 +362,9 @@ class VLTeleopApp:
         )
         thread.start()
 
-    def _vl_worker(self, mode, annotated_rgb, context, fallback_note, frame_idx_snapshot):
+    def _vl_worker(
+        self, mode, annotated_rgb, context, fallback_note, frame_idx_snapshot
+    ):
         """Runs on a background thread -- the actual (slow) model call.
         Never touches Tkinter directly; schedules the UI update back onto
         the main loop via root.after so this stays thread-safe."""
@@ -350,6 +401,102 @@ class VLTeleopApp:
         keypress-triggered render()."""
         self.last_vl_line = line
 
+    def _update_uncertainty_covariance(self, nearest_any):
+        """Synthetic proxy for a real covariance signal -- this script has no
+        belief tracker to source one from. Drifts up while no obstacle is
+        close enough to act as a visual anchor, resets when one is. Frozen
+        while already halted so it can't re-trigger mid-halt."""
+        if self.halted_for_uncertainty:
+            return
+        grounded = (
+            nearest_any is not None
+            and nearest_any["edge_distance"] <= UNCERTAINTY_GROUNDING_RANGE_M
+        )
+        if grounded:
+            self.uncertainty_covariance = 0.0
+        else:
+            self.uncertainty_covariance += self.uncertainty_growth_per_step
+
+    def _dispatch_uncertainty_request(self, retry):
+        """Enters (or re-enters, on retry) the uncertainty halt: dispatches
+        the sweep-description call to a background thread, same pattern as
+        _dispatch_vl_query, so it doesn't block rendering/input handling."""
+        self.halted_for_uncertainty = True
+        self.uncertainty_request_in_flight = True
+        frame = self.last_annotated_rgb
+        target = (
+            self.uncertainty_session.retry
+            if retry
+            else self.uncertainty_session.request_human_heading
+        )
+
+        thread = threading.Thread(
+            target=self._uncertainty_worker, args=(target, frame), daemon=True
+        )
+        thread.start()
+
+    def _uncertainty_worker(self, session_method, frame):
+        """Runs on a background thread -- calls UncertaintySession's request
+        or retry method (a real InternVL sweep-description call). Never
+        touches Tkinter directly; schedules the UI update via root.after."""
+        try:
+            result = session_method(frame)
+        except Exception as e:
+            line = f"[uncertainty] ERROR -> {e}"
+        else:
+            payload = result.uncertainty_payload
+            line = (
+                f"[uncertainty] attempt={payload.attempt} -> {payload.status.value} -> "
+                f"sweep: {result.raw_response!r} -- "
+                f"press 1/2/3/4/6/7/8/9 for heading, R to retry"
+            )
+
+        print(line)
+
+        with self.vl_lock:
+            self.uncertainty_request_in_flight = False
+
+        if not self.closed:
+            try:
+                self.root.after(0, self._apply_uncertainty_line, line)
+            except Exception:
+                pass  # window may have been torn down between the check and this call
+
+    def _apply_uncertainty_line(self, line):
+        """Runs on the main/Tkinter thread via root.after. Re-renders (unlike
+        _apply_vl_line) so the halted-state prompt on screen picks up the
+        freshly landed sweep description right away."""
+        self.last_uncertainty_line = line
+        self.render()
+
+    def _handle_halted_key(self, key):
+        """Only reachable while self.halted_for_uncertainty is True -- this
+        is the actual movement halt, called from on_key instead of the usual
+        WASD handling. Ignores everything but retry/heading-submit while a
+        sweep-description call is in flight, to avoid double-dispatching."""
+        if self.uncertainty_request_in_flight:
+            return
+
+        if key == "r":
+            self._dispatch_uncertainty_request(retry=True)
+            return
+
+        angle = UNCERTAINTY_HEADING_KEYS.get(key)
+        if angle is None:
+            return
+
+        result = self.uncertainty_session.submit_heading(angle_deg=angle)
+        payload = result.uncertainty_payload
+        line = (
+            f"[uncertainty] submit_heading({angle:.0f}deg) -> {payload.status.value} -> "
+            f"max_units={payload.max_units:.1f}"
+        )
+        print(line)
+        self.last_uncertainty_line = line
+        self.uncertainty_covariance = 0.0
+        self.halted_for_uncertainty = False
+        self.render()
+
     def render(self):
         obs = self.sim.get_sensor_observations()
         self.latest_obs = obs
@@ -358,8 +505,17 @@ class VLTeleopApp:
 
         circles, nearest_any, nearest_visible = self._project_obstacles()
         annotated_rgb = overlay_obstacles(rgb, circles)
+        self.last_annotated_rgb = annotated_rgb
 
-        if self._should_query_vl():
+        self._update_uncertainty_covariance(nearest_any)
+        if (
+            not self.halted_for_uncertainty
+            and not self.uncertainty_request_in_flight
+            and self.uncertainty_covariance >= self.uncertainty_covariance_threshold
+        ):
+            self._dispatch_uncertainty_request(retry=False)
+
+        if not self.halted_for_uncertainty and self._should_query_vl():
             self._dispatch_vl_query(annotated_rgb, nearest_any, nearest_visible)
         self.frame_idx += 1
 
@@ -371,11 +527,14 @@ class VLTeleopApp:
         img = Image.fromarray(img_arr)
         draw = ImageDraw.Draw(img)
 
-        status = f"x={self.x:.2f} y={self.y:.2f} z={self.z:.2f} yaw={np.rad2deg(self.yaw):.1f} clearance={self.clearance:.2f}"
+        status = f"x={self.x:.2f} y={self.y:.2f} z={self.z:.2f} yaw={np.rad2deg(self.yaw):.1f} clearance={self.clearance:.2f} cov={self.uncertainty_covariance:.2f}"
+        if self.halted_for_uncertainty:
+            status += "  [HALTED: awaiting heading]"
 
-        draw.rectangle([0, 0, img.width, 55], fill=(0, 0, 0))
+        draw.rectangle([0, 0, img.width, 75], fill=(0, 0, 0))
         draw.text((10, 8), status, fill=(255, 255, 255))
         draw.text((10, 30), self.last_vl_line, fill=(255, 255, 0))
+        draw.text((10, 52), self.last_uncertainty_line, fill=(0, 255, 255))
 
         self.tk_img = ImageTk.PhotoImage(img)
         self.image_label.configure(image=self.tk_img)
@@ -383,13 +542,23 @@ class VLTeleopApp:
     def on_key(self, event):
         key = event.keysym.lower()
 
-        old_x = self.x
-        old_z = self.z
-
         if key == "x" or key == "escape":
             self.close()
             return
-        elif key == "w":
+
+        if self.halted_for_uncertainty:
+            self._handle_halted_key(key)
+            return
+
+        if key == "u":
+            self.uncertainty_covariance = self.uncertainty_covariance_threshold
+            self.render()
+            return
+
+        old_x = self.x
+        old_z = self.z
+
+        if key == "w":
             self.x += -np.sin(self.yaw) * kb.MOVE_STEP
             self.z += -np.cos(self.yaw) * kb.MOVE_STEP
         elif key == "s":
@@ -438,19 +607,38 @@ class VLTeleopApp:
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--vl-every-n-frames",
+        "--qwery-n",
         type=int,
         default=DEFAULT_VL_QUERY_EVERY_N_FRAMES,
         help=f"query VL every N frames (default {DEFAULT_VL_QUERY_EVERY_N_FRAMES}); "
         f"also fires every {VL_QUERY_EVERY_N_SECONDS:.1f}s regardless, whichever comes first",
     )
+    parser.add_argument(
+        "--cov-thresh",
+        type=float,
+        default=DEFAULT_UNCERTAINTY_COVARIANCE_THRESHOLD,
+        help="synthetic covariance value at which the uncertainty halt fires "
+        f"(default {DEFAULT_UNCERTAINTY_COVARIANCE_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--cov-growth",
+        type=float,
+        default=DEFAULT_UNCERTAINTY_GROWTH_PER_STEP,
+        help="per-frame covariance growth while no synthetic obstacle is nearby "
+        f"(default {DEFAULT_UNCERTAINTY_GROWTH_PER_STEP}); press U in-app to "
+        "force-trigger the halt instead of waiting on this",
+    )
     args = parser.parse_args()
-    if args.vl_every_n_frames < 1:
-        parser.error("--vl-every-n-frames must be >= 1")
+    if args.qwery_n < 1:
+        parser.error("--qwery-n must be >= 1")
     return args
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    app = VLTeleopApp(vl_query_every_n_frames=args.vl_every_n_frames)
+    app = VLTeleopApp(
+        vl_query_every_n_frames=args.qwery_n,
+        uncertainty_covariance_threshold=args.cov_thresh,
+        uncertainty_growth_per_step=args.cov_growth,
+    )
     app.run()

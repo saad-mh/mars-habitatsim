@@ -29,7 +29,7 @@ import torchvision.transforms as T
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
 
-INTERNVL_MODEL_ID = "OpenGVLab/InternVL3-8B"
+from vl_direction.config import INTERNVL_MODEL_PATH as INTERNVL_MODEL_ID
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
