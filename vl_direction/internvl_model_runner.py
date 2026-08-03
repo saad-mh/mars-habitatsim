@@ -122,6 +122,21 @@ def load_internvl_model(model_path: str = INTERNVL_MODEL_ID, device: str = "cuda
         .to(device)
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+    if not hasattr(tokenizer, "convert_tokens_to_ids"):
+        # transformers' own _from_pretrained silently returns False here on
+        # certain sentencepiece RuntimeErrors (tokenization_utils_base.py's
+        # "loading from TikToken will be attempted instead" branch, which
+        # doesn't actually happen for every repo) instead of raising -- seen
+        # with InternVL2.5-8B's InternLM2 tokenizer.model under sentencepiece
+        # >=0.1.99 ("piece must not include null character"). Left uncaught,
+        # this surfaces three calls later as a baffling
+        # "'bool' object has no attribute 'convert_tokens_to_ids'" inside
+        # model.chat(). If this fires, try downgrading sentencepiece
+        # (0.1.99 is confirmed to work for InternVL2.5-8B in the "vl" env).
+        raise RuntimeError(
+            f"AutoTokenizer.from_pretrained({model_path!r}) returned {tokenizer!r} instead of a "
+            "tokenizer -- likely a sentencepiece incompatibility with this checkpoint's tokenizer.model"
+        )
     return model, tokenizer
 
 
