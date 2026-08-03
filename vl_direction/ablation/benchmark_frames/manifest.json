@@ -106,13 +106,13 @@
       "x": -20,
       "y": 0.5147051787376407,
       "z": 20,
-      "yaw_deg": 0.0
+      "yaw_deg": -45.0
     },
     "nearest_any_edge_distance_m": 22.94497594060117,
     "nearest_visible_bbox_xyxy": [
-      465,
+      199,
       237,
-      481,
+      215,
       253
     ],
     "frame_wh": [
@@ -127,10 +127,15 @@
       "x": -15,
       "y": 0.4948094677925111,
       "z": 20,
-      "yaw_deg": 45.0
+      "yaw_deg": -36.86989764584402
     },
     "nearest_any_edge_distance_m": 21.26217609658452,
-    "nearest_visible_bbox_xyxy": null,
+    "nearest_visible_bbox_xyxy": [
+      174,
+      237,
+      191,
+      254
+    ],
     "frame_wh": [
       640,
       480
@@ -143,10 +148,15 @@
       "x": -10,
       "y": 0.526812093257904,
       "z": 20,
-      "yaw_deg": 90.0
+      "yaw_deg": -26.56505117707799
     },
     "nearest_any_edge_distance_m": 20.654614628069726,
-    "nearest_visible_bbox_xyxy": null,
+    "nearest_visible_bbox_xyxy": [
+      153,
+      237,
+      171,
+      255
+    ],
     "frame_wh": [
       640,
       480
@@ -159,14 +169,14 @@
       "x": -20,
       "y": 0.5580438470840455,
       "z": 15,
-      "yaw_deg": 0.0
+      "yaw_deg": -53.13010235415598
     },
     "nearest_any_edge_distance_m": 18.555799114157015,
     "nearest_visible_bbox_xyxy": [
-      510,
+      187,
       237,
-      531,
-      258
+      206,
+      256
     ],
     "frame_wh": [
       640,
@@ -180,10 +190,15 @@
       "x": -20,
       "y": 1.0872405242919925,
       "z": -20,
-      "yaw_deg": 90.0
+      "yaw_deg": -135.0
     },
     "nearest_any_edge_distance_m": 17.683505879775343,
-    "nearest_visible_bbox_xyxy": null,
+    "nearest_visible_bbox_xyxy": [
+      312,
+      245,
+      331,
+      263
+    ],
     "frame_wh": [
       640,
       480
