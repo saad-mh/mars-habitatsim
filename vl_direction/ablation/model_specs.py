@@ -17,7 +17,6 @@ class ModelSpec:
     startup_timeout_s: float
 
 
-
 # Timeouts sized off a measured ~15MB/s real download throughput on this
 # machine (an earlier curl test that suggested ~2KB/s was just measuring an
 # unfollowed HF redirect response, not real bandwidth) -- e.g. InternVL3-14B's

@@ -32,7 +32,9 @@ class UncertaintySession:
         self.client = client
         self.attempt = 0
 
-    def request_human_heading(self, frame: Optional[np.ndarray] = None) -> VLDirectiveResult:
+    def request_human_heading(
+        self, frame: Optional[np.ndarray] = None
+    ) -> VLDirectiveResult:
         frames = [frame] if frame is not None else []
         context = UncertaintyContext(
             covariance_value=self.covariance_value,
@@ -40,7 +42,9 @@ class UncertaintySession:
             rover_front_reference_deg=self.rover_front_reference_deg,
             attempt=self.attempt,
         )
-        return query("uncertainty", frames, context, self.episode_id, client=self.client)
+        return query(
+            "uncertainty", frames, context, self.episode_id, client=self.client
+        )
 
     def submit_heading(
         self,
@@ -48,7 +52,9 @@ class UncertaintySession:
         angle_range_deg: Optional[tuple] = None,
         max_units: Optional[float] = None,
     ) -> VLDirectiveResult:
-        heading_response = HeadingResponse(angle_deg=angle_deg, angle_range_deg=angle_range_deg)
+        heading_response = HeadingResponse(
+            angle_deg=angle_deg, angle_range_deg=angle_range_deg
+        )
         context = UncertaintyContext(
             covariance_value=self.covariance_value,
             threshold_used=self.covariance_threshold,

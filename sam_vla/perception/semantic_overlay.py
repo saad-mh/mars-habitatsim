@@ -33,8 +33,12 @@ def overlay_semantic_masks(
     goal_mask = semantic == goal_id
     obstacle_mask = semantic == obstacle_id
 
-    overlaid[goal_mask] = (1.0 - alpha) * overlaid[goal_mask] + alpha * GOAL_OVERLAY_COLOR
-    overlaid[obstacle_mask] = (1.0 - alpha) * overlaid[obstacle_mask] + alpha * OBSTACLE_OVERLAY_COLOR
+    overlaid[goal_mask] = (1.0 - alpha) * overlaid[
+        goal_mask
+    ] + alpha * GOAL_OVERLAY_COLOR
+    overlaid[obstacle_mask] = (1.0 - alpha) * overlaid[
+        obstacle_mask
+    ] + alpha * OBSTACLE_OVERLAY_COLOR
 
     overlaid = np.clip(overlaid, 0, 255).astype(np.uint8)
 

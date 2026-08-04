@@ -45,7 +45,10 @@ def rgb_depth(obs: Dict[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def save_obj(
-    path: str, verts: np.ndarray, faces: np.ndarray, diffuse_rgb: Optional[Tuple[float, float, float]] = None
+    path: str,
+    verts: np.ndarray,
+    faces: np.ndarray,
+    diffuse_rgb: Optional[Tuple[float, float, float]] = None,
 ) -> None:
     """Write an .obj mesh. If `diffuse_rgb` is given, also write a companion .mtl
     with that diffuse color and zero specular (matte, non-shiny) -- the same
@@ -81,10 +84,14 @@ def distance_to_goal(pose: Pose, goal_position: Tuple[float, float, float]) -> f
     mirrors rollout_navdp_policy's `goal_dist_now` (terrain height makes the y
     component noisy/uninformative for a ground rover)."""
     gx, _gy, gz = goal_position
-    return float(np.linalg.norm(np.asarray([pose.x - gx, pose.z - gz], dtype=np.float32)))
+    return float(
+        np.linalg.norm(np.asarray([pose.x - gx, pose.z - gz], dtype=np.float32))
+    )
 
 
-def register_semantic_mesh(sim, mesh_path: str, semantic_id: int, y_offset: float = 0.0):
+def register_semantic_mesh(
+    sim, mesh_path: str, semantic_id: int, y_offset: float = 0.0
+):
     """Add a render-only (kinematic, non-collidable) mesh carrying a semantic
     id, so the semantic sensor renders it as a distinct mask.
 
@@ -105,7 +112,9 @@ def register_semantic_mesh(sim, mesh_path: str, semantic_id: int, y_offset: floa
     template.render_asset_handle = mesh_path
     template.collision_asset_handle = mesh_path
     template.is_collidable = False
-    template_id = otm.register_template(template, f"sem_{semantic_id}_{Path(mesh_path).name}")
+    template_id = otm.register_template(
+        template, f"sem_{semantic_id}_{Path(mesh_path).name}"
+    )
     obj = rom.add_object_by_template_handle(otm.get_template_handle_by_id(template_id))
     obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC
     obj.collidable = False
@@ -121,7 +130,9 @@ def register_semantic_mesh(sim, mesh_path: str, semantic_id: int, y_offset: floa
 ANNOTATION_HIDE_DROP_M = 10_000.0
 
 
-def set_objects_hidden(objects: Dict[int, Any], onstage: Dict[int, mn.Vector3], hidden: bool) -> None:
+def set_objects_hidden(
+    objects: Dict[int, Any], onstage: Dict[int, mn.Vector3], hidden: bool
+) -> None:
     """Toggle a set of registered objects between their real ("onstage")
     world position and a position dropped ANNOTATION_HIDE_DROP_M straight
     down, so a render pass can exclude them without the per-frame cost of
@@ -131,4 +142,6 @@ def set_objects_hidden(objects: Dict[int, Any], onstage: Dict[int, mn.Vector3], 
     run can't drift. `objects`/`onstage` are keyed the same (e.g. mesh_id)."""
     for key, obj in objects.items():
         base = onstage[key]
-        obj.translation = base - mn.Vector3(0.0, ANNOTATION_HIDE_DROP_M, 0.0) if hidden else base
+        obj.translation = (
+            base - mn.Vector3(0.0, ANNOTATION_HIDE_DROP_M, 0.0) if hidden else base
+        )

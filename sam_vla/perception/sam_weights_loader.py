@@ -4,12 +4,20 @@ import os
 
 import torch
 
-from sam_vla.perception.sam2_custom_head import NUM_CLASSES, SimpleSAM2Seg, build_sam2_backbone
+from sam_vla.perception.sam2_custom_head import (
+    NUM_CLASSES,
+    SimpleSAM2Seg,
+    build_sam2_backbone,
+)
 
-SAM_CHECKPOINT_PATH = "sam/sam/sam_v2_dataset/training_output/checkpoints/best_model.pth"
+SAM_CHECKPOINT_PATH = (
+    "sam/sam/sam_v2_dataset/training_output/checkpoints/best_model.pth"
+)
 
 
-def load_sam_model(checkpoint_path: str = SAM_CHECKPOINT_PATH, device: str = "cuda") -> object:
+def load_sam_model(
+    checkpoint_path: str = SAM_CHECKPOINT_PATH, device: str = "cuda"
+) -> object:
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(
             f"Custom SimpleSAM2Seg weights required, none found at '{checkpoint_path}'. "

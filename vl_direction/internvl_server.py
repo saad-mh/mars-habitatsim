@@ -18,8 +18,15 @@ import struct
 import numpy as np
 from PIL import Image
 
-from vl_direction.config import INTERNVL_MODEL_PATH, INTERNVL_SERVER_HOST, INTERNVL_SERVER_PORT
-from vl_direction.internvl_model_runner import load_internvl_model, run_internvl_inference
+from vl_direction.config import (
+    INTERNVL_MODEL_PATH,
+    INTERNVL_SERVER_HOST,
+    INTERNVL_SERVER_PORT,
+)
+from vl_direction.internvl_model_runner import (
+    load_internvl_model,
+    run_internvl_inference,
+)
 
 # Ablation harness sets these to point the same server code at a different
 # checkpoint/port without editing config.py -- unset, these fall back to the
@@ -36,7 +43,9 @@ def _recv_exact(conn: socket.socket, num_bytes: int) -> bytes:
     while remaining > 0:
         chunk = conn.recv(remaining)
         if not chunk:
-            raise ConnectionError("connection closed before expected bytes were received")
+            raise ConnectionError(
+                "connection closed before expected bytes were received"
+            )
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -80,7 +89,9 @@ def _dispatch(model, tokenizer, message: dict) -> dict:
     raise ValueError(f"unknown mode: {mode!r}")
 
 
-def serve_forever(model, tokenizer, host: str = INTERNVL_SERVER_HOST, port: int = INTERNVL_SERVER_PORT) -> None:
+def serve_forever(
+    model, tokenizer, host: str = INTERNVL_SERVER_HOST, port: int = INTERNVL_SERVER_PORT
+) -> None:
     # Single-threaded blocking accept loop, same rationale as qwen_server.py:
     # inference isn't safe to run concurrently across connections anyway.
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

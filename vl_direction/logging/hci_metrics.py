@@ -28,21 +28,29 @@ def intervention_counts(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
 def uncertainty_trigger_stats(records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     records = list(records)
     triggers = [
-        r for r in records
-        if r.get("uncertainty_payload") and r["uncertainty_payload"].get("status") == "NEEDS_HUMAN_INPUT"
+        r
+        for r in records
+        if r.get("uncertainty_payload")
+        and r["uncertainty_payload"].get("status") == "NEEDS_HUMAN_INPUT"
     ]
     resolutions = [
-        r for r in records
-        if r.get("uncertainty_payload") and r["uncertainty_payload"].get("status") == "HEADING_DIRECTIVE"
+        r
+        for r in records
+        if r.get("uncertainty_payload")
+        and r["uncertainty_payload"].get("status") == "HEADING_DIRECTIVE"
     ]
     avg_retries = (
-        sum(r["uncertainty_payload"].get("attempt", 0) for r in resolutions) / len(resolutions)
-        if resolutions else None
+        sum(r["uncertainty_payload"].get("attempt", 0) for r in resolutions)
+        / len(resolutions)
+        if resolutions
+        else None
     )
     return {"trigger_count": len(triggers), "avg_retries_to_resolution": avg_retries}
 
 
-def success_rate_by_mode(episode_summaries: Iterable[Dict[str, Any]]) -> Dict[str, float]:
+def success_rate_by_mode(
+    episode_summaries: Iterable[Dict[str, Any]],
+) -> Dict[str, float]:
     """episode_summaries: caller-supplied dicts with at least
     {"session_mode": "autonomous"|"human_intervened", "success": bool}."""
     by_mode: Dict[str, List[bool]] = {}
@@ -51,7 +59,9 @@ def success_rate_by_mode(episode_summaries: Iterable[Dict[str, Any]]) -> Dict[st
     return {mode: sum(v) / len(v) for mode, v in by_mode.items() if v}
 
 
-def steps_to_goal_by_mode(episode_summaries: Iterable[Dict[str, Any]]) -> Dict[str, float]:
+def steps_to_goal_by_mode(
+    episode_summaries: Iterable[Dict[str, Any]],
+) -> Dict[str, float]:
     """episode_summaries: caller-supplied dicts with at least
     {"session_mode": ..., "steps_to_goal": float}, successful episodes only."""
     by_mode: Dict[str, List[float]] = {}
@@ -68,10 +78,18 @@ def confidence_vs_override_correlation(
     a human override happened at roughly the same time. teleop_events is a
     caller-supplied list of {"timestamp": iso8601} for human interventions."""
     override_timestamps = {e["timestamp"] for e in teleop_events}
-    overridden = [r["confidence"] for r in records if r.get("timestamp") in override_timestamps]
-    not_overridden = [r["confidence"] for r in records if r.get("timestamp") not in override_timestamps]
+    overridden = [
+        r["confidence"] for r in records if r.get("timestamp") in override_timestamps
+    ]
+    not_overridden = [
+        r["confidence"]
+        for r in records
+        if r.get("timestamp") not in override_timestamps
+    ]
     return {
-        "avg_confidence_when_overridden": sum(overridden) / len(overridden) if overridden else None,
+        "avg_confidence_when_overridden": (
+            sum(overridden) / len(overridden) if overridden else None
+        ),
         "avg_confidence_when_not_overridden": (
             sum(not_overridden) / len(not_overridden) if not_overridden else None
         ),
@@ -80,14 +98,34 @@ def confidence_vs_override_correlation(
 
 if __name__ == "__main__":
     demo_records = [
-        {"identity_token": "cbf", "session_mode": "human_intervened", "uncertainty_payload": None,
-         "confidence": 0.9, "timestamp": "t1"},
-        {"identity_token": "exploration", "session_mode": "autonomous", "uncertainty_payload": None,
-         "confidence": 0.4, "timestamp": "t2"},
-        {"identity_token": "uncertainty", "session_mode": "autonomous",
-         "uncertainty_payload": {"status": "NEEDS_HUMAN_INPUT", "attempt": 0}, "confidence": 1.0, "timestamp": "t3"},
-        {"identity_token": "uncertainty", "session_mode": "autonomous",
-         "uncertainty_payload": {"status": "HEADING_DIRECTIVE", "attempt": 1}, "confidence": 1.0, "timestamp": "t4"},
+        {
+            "identity_token": "cbf",
+            "session_mode": "human_intervened",
+            "uncertainty_payload": None,
+            "confidence": 0.9,
+            "timestamp": "t1",
+        },
+        {
+            "identity_token": "exploration",
+            "session_mode": "autonomous",
+            "uncertainty_payload": None,
+            "confidence": 0.4,
+            "timestamp": "t2",
+        },
+        {
+            "identity_token": "uncertainty",
+            "session_mode": "autonomous",
+            "uncertainty_payload": {"status": "NEEDS_HUMAN_INPUT", "attempt": 0},
+            "confidence": 1.0,
+            "timestamp": "t3",
+        },
+        {
+            "identity_token": "uncertainty",
+            "session_mode": "autonomous",
+            "uncertainty_payload": {"status": "HEADING_DIRECTIVE", "attempt": 1},
+            "confidence": 1.0,
+            "timestamp": "t4",
+        },
     ]
     print("intervention_counts ->", intervention_counts(demo_records))
     print("uncertainty_trigger_stats ->", uncertainty_trigger_stats(demo_records))

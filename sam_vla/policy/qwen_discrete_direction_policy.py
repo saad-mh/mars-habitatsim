@@ -49,7 +49,9 @@ class QwenDiscreteDirectionPolicy:
         frame (MarsHabitatEnv.get_semantic_frame()) for the same step. Returns
         the mapped Action and the raw VLA result dict for logging."""
         overlaid_rgb = overlay_semantic_masks(rgb, semantic)
-        direction, vla_result = qwen_client.drive_direction_verbose(overlaid_rgb, goal_spec, frame_idx)
+        direction, vla_result = qwen_client.drive_direction_verbose(
+            overlaid_rgb, goal_spec, frame_idx
+        )
         action = direction_to_action(direction)
         return action, vla_result
 

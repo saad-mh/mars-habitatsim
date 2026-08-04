@@ -28,7 +28,8 @@ def mask_to_body(
     """Body-frame goal point [forward, left] from a rendered mask: bearing from the
     mask's centroid column, range from the MEDIAN depth over all mask pixels -- robust
     to a single mask pixel landing on a depth discontinuity at the object's silhouette
-    edge, which would otherwise seed a badly wrong range that dead-reckons uncorrected."""
+    edge, which would otherwise seed a badly wrong range that dead-reckons uncorrected.
+    """
     ys, xs = np.where(np.asarray(mask) > 0)
     if xs.size < min_px:
         return None
@@ -90,7 +91,9 @@ class BeliefGoalTracker:
         height, width = np.asarray(depth).shape[:2]
         if int((np.asarray(goal_mask) > 0).sum()) < self.min_px:
             return False
-        seed = mask_to_body(goal_mask, depth, height, width, self.hfov_deg, self.goal_range, self.min_px)
+        seed = mask_to_body(
+            goal_mask, depth, height, width, self.hfov_deg, self.goal_range, self.min_px
+        )
         if seed is not None:
             self.belief_g = seed
         return seed is not None
@@ -98,12 +101,18 @@ class BeliefGoalTracker:
     def propagate(self, action: Action, dt: float) -> None:
         """Dead-reckon the belief by the just-executed action. Action.v_lat is
         RIGHTWARD-positive (sam_vla's pose_integrator convention, see its docstring)
-        while propagate_body_point wants the LEFTWARD component -- hence the sign flip."""
+        while propagate_body_point wants the LEFTWARD component -- hence the sign flip.
+        """
         if self.belief_g is None:
             return
         self.belief_g = propagate_body_point(
-            self.belief_g, v_fwd=action.v_fwd, v_left=-action.v_lat, yaw_rate=action.yaw_rate,
-            dt=dt, odom_noise=self.odom_noise, rng=self._rng,
+            self.belief_g,
+            v_fwd=action.v_fwd,
+            v_left=-action.v_lat,
+            yaw_rate=action.yaw_rate,
+            dt=dt,
+            odom_noise=self.odom_noise,
+            rng=self._rng,
         )
 
     def bearing(self) -> Optional[float]:
@@ -132,7 +141,9 @@ def lost_goal_heading_assist(
     tell "just off-screen" from "behind me" without this. Off to the side (still
     ahead): keep the policy's forward speed and only steer harder. Fully behind
     (goal_lost): pivot with the forward floor."""
-    goal_offcentre = bearing_deg_thresh > 0.0 and abs(bearing) > math.radians(bearing_deg_thresh)
+    goal_offcentre = bearing_deg_thresh > 0.0 and abs(bearing) > math.radians(
+        bearing_deg_thresh
+    )
     if not (goal_lost or goal_offcentre):
         return action
     yaw_cmd = float(np.clip(turn_kp * bearing, -max_yaw_rate, max_yaw_rate))

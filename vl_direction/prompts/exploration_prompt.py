@@ -8,9 +8,9 @@ from vl_direction.schemas import ExplorationContext
 _SYSTEM_FRAMING = "You are a directional assistant for a Mars rover. You never explain, you only answer."
 
 _FEW_SHOT = (
-    "Example: task is \"find the sample collection site\", scene shows open "
+    'Example: task is "find the sample collection site", scene shows open '
     "terrain ahead and a ridge to the right -> FRONT\n"
-    "Example: hint is \"this area's explored\", scene shows a previously "
+    'Example: hint is "this area\'s explored", scene shows a previously '
     "visited crater dead ahead -> RIGHT"
 )
 
@@ -38,5 +38,7 @@ def build_exploration_reprompt(context: ExplorationContext, frame_count: int) ->
 
 
 if __name__ == "__main__":
-    demo = ExplorationContext(task_str="find the sample collection site", vague_hint="this area's explored")
+    demo = ExplorationContext(
+        task_str="find the sample collection site", vague_hint="this area's explored"
+    )
     print(build_exploration_prompt(demo, frame_count=3))

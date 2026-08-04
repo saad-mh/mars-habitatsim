@@ -53,7 +53,9 @@ class VLDirectionEpisodeLogger:
         self._config = dict(config_dict)
         self._config.setdefault("run_id", run_id)
         self._config.setdefault("timestamp_start", _now_iso())
-        (self.run_dir / "config.json").write_text(json.dumps(self._config, indent=2, default=_json_default))
+        (self.run_dir / "config.json").write_text(
+            json.dumps(self._config, indent=2, default=_json_default)
+        )
 
         self._directive_count = 0
         self._file = open(self.run_dir / "directives.jsonl", "a", encoding="utf-8")
@@ -77,7 +79,10 @@ class VLDirectionEpisodeLogger:
                 self._file.flush()
                 break
             if item is not None:
-                self._file.write(json.dumps(item, separators=(",", ":"), default=_json_default) + "\n")
+                self._file.write(
+                    json.dumps(item, separators=(",", ":"), default=_json_default)
+                    + "\n"
+                )
 
             now = time.monotonic()
             if now - last_flush >= self._flush_interval_s:
@@ -97,7 +102,9 @@ class VLDirectionEpisodeLogger:
             "num_directives": self._directive_count,
         }
         computed.update(summary or {})
-        (self.run_dir / "summary.json").write_text(json.dumps(computed, indent=2, default=_json_default))
+        (self.run_dir / "summary.json").write_text(
+            json.dumps(computed, indent=2, default=_json_default)
+        )
         self.close()
         return computed
 
@@ -113,7 +120,9 @@ class VLDirectionEpisodeLogger:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if not self._closed:
-            self.finalize({"termination_reason": "exception" if exc_type else "unfinalized"})
+            self.finalize(
+                {"termination_reason": "exception" if exc_type else "unfinalized"}
+            )
         return False
 
 
@@ -129,7 +138,9 @@ if __name__ == "__main__":
 
     tmp_root = tempfile.mkdtemp(prefix="vl_direction_logger_demo_")
     try:
-        logger = VLDirectionEpisodeLogger("demo-run", {"study_arm": "vl_only"}, log_root=tmp_root)
+        logger = VLDirectionEpisodeLogger(
+            "demo-run", {"study_arm": "vl_only"}, log_root=tmp_root
+        )
         frame = np.zeros((4, 4, 3), dtype=np.uint8)
         for _ in range(3):
             result = query(

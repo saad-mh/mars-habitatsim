@@ -22,7 +22,9 @@ if __name__ == "__main__":
     from sam_vla.core.types import Pose
 
     rgb = np.array(Image.open("marsyard2022_terrain_texture.png").convert("RGB"))
-    obs = Observation(rgb=rgb, depth=None, pose=Pose(x=0.0, y=0.0, z=0.0, yaw=0.0), frame_idx=0)
+    obs = Observation(
+        rgb=rgb, depth=None, pose=Pose(x=0.0, y=0.0, z=0.0, yaw=0.0), frame_idx=0
+    )
     goal_spec = GoalSpec(
         goal_bbox_norm=(0.4, 0.4, 0.6, 0.6),
         obstacle_bboxes_norm=[(0.1, 0.1, 0.3, 0.3)],

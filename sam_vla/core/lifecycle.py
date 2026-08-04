@@ -29,6 +29,7 @@ class ServiceRegistry:
 
 
 if __name__ == "__main__":
+
     class ServiceA:
         def start(self) -> None:
             print("A started")

@@ -19,11 +19,11 @@ SweepPose = Tuple[float, float, float]  # (x, z, yaw)
 
 @dataclass
 class PoseSweepConfig:
-    mode: str = "grid"          # "grid" | "random"
+    mode: str = "grid"  # "grid" | "random"
     grid_spacing_m: float = 2.0
     num_yaws_per_cell: int = 4  # grid mode: viewpoint diversity per (x, z) cell
     num_random_poses: int = 500
-    boundary_margin: float = 2.0   # keep every pose this far from the scene bound
+    boundary_margin: float = 2.0  # keep every pose this far from the scene bound
     seed: int = 0
 
 
@@ -55,17 +55,26 @@ def sample_sweep_poses(config: PoseSweepConfig) -> List[SweepPose]:
     if config.mode == "grid":
         xs = _axis_positions(half_x, config.grid_spacing_m)
         zs = _axis_positions(half_z, config.grid_spacing_m)
-        yaws = [2.0 * math.pi * i / config.num_yaws_per_cell for i in range(config.num_yaws_per_cell)]
+        yaws = [
+            2.0 * math.pi * i / config.num_yaws_per_cell
+            for i in range(config.num_yaws_per_cell)
+        ]
         return [(x, z, yaw) for x in xs for z in zs for yaw in yaws]
 
     if config.mode == "random":
         rng = random.Random(config.seed)
         return [
-            (rng.uniform(-half_x, half_x), rng.uniform(-half_z, half_z), rng.uniform(0.0, 2.0 * math.pi))
+            (
+                rng.uniform(-half_x, half_x),
+                rng.uniform(-half_z, half_z),
+                rng.uniform(0.0, 2.0 * math.pi),
+            )
             for _ in range(config.num_random_poses)
         ]
 
-    raise ValueError(f"unknown pose sweep mode {config.mode!r} (expected 'grid' or 'random')")
+    raise ValueError(
+        f"unknown pose sweep mode {config.mode!r} (expected 'grid' or 'random')"
+    )
 
 
 def _axis_positions(half_extent: float, spacing: float) -> List[float]:

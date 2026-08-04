@@ -97,18 +97,30 @@ def boxes_from_mask(
     return detections
 
 
-def draw_detections(rgb: np.ndarray, detections: List[dict], palette: dict) -> np.ndarray:
+def draw_detections(
+    rgb: np.ndarray, detections: List[dict], palette: dict
+) -> np.ndarray:
     overlay = rgb.copy()
     for det in detections:
         color = palette.get(det["class"], (255, 255, 255))
         cv2.rectangle(
-            overlay, (det["x_min"], det["y_min"]), (det["x_max"], det["y_max"]), color, 2
+            overlay,
+            (det["x_min"], det["y_min"]),
+            (det["x_max"], det["y_max"]),
+            color,
+            2,
         )
         label = f"{det['class']} {det['confidence']:.2f}"
         text_y = det["y_min"] - 6 if det["y_min"] - 6 >= 10 else det["y_min"] + 14
         cv2.putText(
-            overlay, label, (det["x_min"], text_y),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA,
+            overlay,
+            label,
+            (det["x_min"], text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
         )
     return overlay
 
@@ -137,7 +149,10 @@ def run_one(model, image_path: Path, out_dir: Path, class_names, args) -> List[d
     (out_dir / "annotations").mkdir(parents=True, exist_ok=True)
 
     stem = image_path.stem
-    cv2.imwrite(str(out_dir / "overlays" / f"{stem}.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(
+        str(out_dir / "overlays" / f"{stem}.png"),
+        cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR),
+    )
     write_annotations(out_dir / "annotations" / f"{stem}.txt", detections)
 
     return detections
@@ -145,14 +160,16 @@ def run_one(model, image_path: Path, out_dir: Path, class_names, args) -> List[d
 
 def main(args: argparse.Namespace) -> None:
     model = load_finetuned_model(Path(args.checkpoint_dir), device=args.device)
-    class_names = json.loads(
-        (Path(args.checkpoint_dir) / "metadata.json").read_text()
-    )["class_names"]
+    class_names = json.loads((Path(args.checkpoint_dir) / "metadata.json").read_text())[
+        "class_names"
+    ]
 
     if args.classes:
         unknown = set(args.classes) - set(class_names)
         if unknown:
-            raise SystemExit(f"unknown class(es) {unknown}, checkpoint has {class_names}")
+            raise SystemExit(
+                f"unknown class(es) {unknown}, checkpoint has {class_names}"
+            )
 
     if args.image:
         images = [Path(args.image)]
@@ -179,20 +196,28 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--checkpoint-dir", required=True, help="e.g. sam_lora_runs/exp1/best")
+    ap.add_argument(
+        "--checkpoint-dir", required=True, help="e.g. sam_lora_runs/exp1/best"
+    )
 
     source = ap.add_mutually_exclusive_group(required=True)
     source.add_argument("--image", default=None, help="single image to run on")
     source.add_argument("--images-dir", default=None, help="folder of images to run on")
 
-    ap.add_argument("--out-dir", required=True, help="where to write overlays/ and annotations/")
+    ap.add_argument(
+        "--out-dir", required=True, help="where to write overlays/ and annotations/"
+    )
     ap.add_argument("--image-size", type=int, default=1024)
     ap.add_argument(
-        "--classes", nargs="+", default=None,
+        "--classes",
+        nargs="+",
+        default=None,
         help="class names to detect (default: all non-background classes in the checkpoint)",
     )
     ap.add_argument(
-        "--min-area", type=int, default=64,
+        "--min-area",
+        type=int,
+        default=64,
         help="drop connected blobs smaller than this many pixels (noise)",
     )
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

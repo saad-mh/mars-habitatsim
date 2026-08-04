@@ -28,6 +28,7 @@ def integrate_mars(pose: Pose, action: Action, dt: float) -> Pose:
 
 
 if __name__ == "__main__":
+
     def _show(label: str, pose: Pose, action: Action, dt: float) -> None:
         result = integrate_mars(pose, action, dt)
         print(f"{label}:")

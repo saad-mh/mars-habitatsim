@@ -87,7 +87,9 @@ def capture_frame_record(
     semantic_id_buffer = np.asarray(semantic_id_buffer)
     ids, counts = np.unique(semantic_id_buffer, return_counts=True)
     max_id = int(ids.max()) if ids.size else 0
-    slices = ndimage.find_objects(semantic_id_buffer, max_label=max_id) if max_id > 0 else []
+    slices = (
+        ndimage.find_objects(semantic_id_buffer, max_label=max_id) if max_id > 0 else []
+    )
 
     objects: List[ObjectRecord] = []
     for mesh_id, count in zip(ids.tolist(), counts.tolist()):
@@ -100,7 +102,12 @@ def capture_frame_record(
                 mesh_id=mesh_id,
                 category=entry["category"],
                 pixel_count=count,
-                bbox=(x_slice.start, y_slice.start, x_slice.stop - x_slice.start, y_slice.stop - y_slice.start),
+                bbox=(
+                    x_slice.start,
+                    y_slice.start,
+                    x_slice.stop - x_slice.start,
+                    y_slice.stop - y_slice.start,
+                ),
             )
         )
     return category_mask, objects
@@ -151,7 +158,7 @@ if __name__ == "__main__":
     semantic = np.zeros((h, w), dtype=np.int32)
     semantic[0:3, 0:3] = 1024  # small_rock
     semantic[5:8, 5:8] = 1025  # big_rock
-    semantic[3:5, 3:5] = 3     # ROCK_SEMANTIC_ID, not in registry -> background
+    semantic[3:5, 3:5] = 3  # ROCK_SEMANTIC_ID, not in registry -> background
 
     mesh_id_map = {
         "1024": {"category": "small_rock", "name": "rock_a"},
@@ -159,9 +166,17 @@ if __name__ == "__main__":
     }
     categories = ["small_rock", "big_rock", "bedrock", "hole_in_ground"]
     lut, class_names = build_category_lut(mesh_id_map, categories)
-    assert class_names == ["background", "small_rock", "big_rock", "bedrock", "hole_in_ground"]
+    assert class_names == [
+        "background",
+        "small_rock",
+        "big_rock",
+        "bedrock",
+        "hole_in_ground",
+    ]
 
-    category_mask, objects = capture_frame_record(rgb, semantic, mesh_id_map, lut, class_names)
+    category_mask, objects = capture_frame_record(
+        rgb, semantic, mesh_id_map, lut, class_names
+    )
 
     small_rock_idx = class_names.index("small_rock")
     big_rock_idx = class_names.index("big_rock")
@@ -179,7 +194,9 @@ if __name__ == "__main__":
 
     # category filter: excluding big_rock folds it into background too
     filtered_lut, filtered_names = build_category_lut(mesh_id_map, ["small_rock"])
-    filtered_mask, filtered_objects = capture_frame_record(rgb, semantic, mesh_id_map, filtered_lut, filtered_names)
+    filtered_mask, filtered_objects = capture_frame_record(
+        rgb, semantic, mesh_id_map, filtered_lut, filtered_names
+    )
     assert filtered_names == ["background", "small_rock"]
     assert [o.category for o in filtered_objects] == ["small_rock"]
     assert (filtered_mask[5:8, 5:8] == 0).all()  # big_rock now background

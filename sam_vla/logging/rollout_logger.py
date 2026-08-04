@@ -23,7 +23,11 @@ class RolloutLogger:
         self._frame_indices = []
         self._timestamps = []
         self._distances_to_goal = []
-        self._manifest = {"start_time": _now_iso(), "steps": [], "goal_resolution": None}
+        self._manifest = {
+            "start_time": _now_iso(),
+            "steps": [],
+            "goal_resolution": None,
+        }
         self._goal_position: Optional[GoalPosition] = None
 
     def log_goal_resolution(
@@ -80,7 +84,11 @@ class RolloutLogger:
                 "pose": list(pose_tuple),
                 "action": list(action_tuple),
                 "vla_result": vla_result,
-                "goal_position": list(self._goal_position) if self._goal_position is not None else None,
+                "goal_position": (
+                    list(self._goal_position)
+                    if self._goal_position is not None
+                    else None
+                ),
                 "distance_to_goal": dist,
                 "timestamp": timestamp,
             }
@@ -138,8 +146,14 @@ class RolloutLogger:
             cv2.rectangle(annotated, pt0, pt1, (255, 0, 0), 2)
             label = f"{det.class_name} {det.confidence:.2f}"
             cv2.putText(
-                annotated, label, (pt0[0], max(pt0[1] - 5, 0)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA,
+                annotated,
+                label,
+                (pt0[0], max(pt0[1] - 5, 0)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 0, 0),
+                1,
+                cv2.LINE_AA,
             )
 
         gx0, gy0, gx1, gy1 = goal_spec.goal_bbox_norm
@@ -147,8 +161,14 @@ class RolloutLogger:
         gpt1 = (int(gx1 * width), int(gy1 * height))
         cv2.rectangle(annotated, gpt0, gpt1, (0, 255, 0), 3)
         cv2.putText(
-            annotated, "GOAL", (gpt0[0], max(gpt0[1] - 5, 0)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA,
+            annotated,
+            "GOAL",
+            (gpt0[0], max(gpt0[1] - 5, 0)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
         )
 
         annotated_path = out_path / "first_frame_annotated.png"
@@ -191,7 +211,9 @@ class RolloutLogger:
         frames = self._output_frames()
         iio.imwrite(video_path, np.stack(frames), fps=fps, codec="libx264")
 
-        print(f"RolloutLogger: saved video ({len(frames)} frames @ {fps}fps) -> {video_path}")
+        print(
+            f"RolloutLogger: saved video ({len(frames)} frames @ {fps}fps) -> {video_path}"
+        )
 
 
 if __name__ == "__main__":

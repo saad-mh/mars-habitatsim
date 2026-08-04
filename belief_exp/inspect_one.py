@@ -40,12 +40,18 @@ def print_multi_trace(log) -> None:
 
     print(f"\nroute_order: {log.route_order}")
     if log.finished:
-        print(f"route finished; final_route_index={log.final_route_index}/{len(log.route_order)}")
+        print(
+            f"route finished; final_route_index={log.final_route_index}/{len(log.route_order)}"
+        )
     else:
-        print(f"route NOT finished within max_steps; final_route_index={log.final_route_index}/{len(log.route_order)}")
+        print(
+            f"route NOT finished within max_steps; final_route_index={log.final_route_index}/{len(log.route_order)}"
+        )
     for gid in log.route_order:
         step = log.advance_steps.get(gid)
-        print(f"  {gid}: {'advanced at step ' + str(step) if step is not None else 'never reached'}")
+        print(
+            f"  {gid}: {'advanced at step ' + str(step) if step is not None else 'never reached'}"
+        )
 
 
 def print_trace(log) -> None:
@@ -110,7 +116,12 @@ def main() -> None:
         help="run multi_goal_scenario.run_multi_episode (N goals, fixed visiting order) "
         "instead of the single-goal scenario.run_episode",
     )
-    ap.add_argument("--n-goals", type=int, default=3, help="--multi-goal only: number of goals in the route")
+    ap.add_argument(
+        "--n-goals",
+        type=int,
+        default=3,
+        help="--multi-goal only: number of goals in the route",
+    )
     args = ap.parse_args()
 
     bank_cfg = BankConfig(
@@ -136,8 +147,13 @@ def main() -> None:
     if args.multi_goal:
         logs = [
             run_multi_episode(
-                bank_cfg, route_cfg, env_cfg, gate_cfg,
-                np.random.default_rng(args.seed + i), n_goals=args.n_goals, max_steps=args.max_steps,
+                bank_cfg,
+                route_cfg,
+                env_cfg,
+                gate_cfg,
+                np.random.default_rng(args.seed + i),
+                n_goals=args.n_goals,
+                max_steps=args.max_steps,
             )
             for i in range(args.episodes)
         ]

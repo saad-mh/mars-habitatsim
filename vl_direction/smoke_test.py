@@ -11,7 +11,13 @@ import numpy as np
 from vl_direction.client import MockInternVLClient
 from vl_direction.directive_engine import query
 from vl_direction.intervention.mode_flag import SessionMode, reset, set_mode
-from vl_direction.schemas import CBFContext, Direction, ExplorationContext, IdentityToken, UncertaintyStatus
+from vl_direction.schemas import (
+    CBFContext,
+    Direction,
+    ExplorationContext,
+    IdentityToken,
+    UncertaintyStatus,
+)
 from vl_direction.uncertainty_session import UncertaintySession
 
 _FRAME = np.zeros((8, 8, 3), dtype=np.uint8)
@@ -37,7 +43,9 @@ def _check_exploration():
     result = query(
         "exploration",
         [_FRAME],
-        ExplorationContext(task_str="find the sample site", vague_hint="try somewhere else"),
+        ExplorationContext(
+            task_str="find the sample site", vague_hint="try somewhere else"
+        ),
         _EPISODE_ID,
         client=MockInternVLClient(canned_response="FRONT"),
     )
@@ -65,7 +73,9 @@ def _check_uncertainty():
         episode_id=_EPISODE_ID,
         covariance_threshold=1.0,
         covariance_value=3.0,
-        client=MockInternVLClient(canned_response="rocky terrain to the left, open ground ahead"),
+        client=MockInternVLClient(
+            canned_response="rocky terrain to the left, open ground ahead"
+        ),
     )
     r1 = session.request_human_heading(_FRAME)
     assert r1.identity_token == IdentityToken.UNCERTAINTY

@@ -37,8 +37,12 @@ def _resolve_qwen_ablation_python() -> str:
     conda_info = subprocess.run(
         ["conda", "info", "--base"], capture_output=True, text=True, check=True
     ).stdout
-    conda_base = next(line.strip() for line in conda_info.splitlines() if line.startswith("/"))
-    candidate = os.path.join(conda_base, "envs", _QWEN_ABLATION_CONDA_ENV, "bin", "python")
+    conda_base = next(
+        line.strip() for line in conda_info.splitlines() if line.startswith("/")
+    )
+    candidate = os.path.join(
+        conda_base, "envs", _QWEN_ABLATION_CONDA_ENV, "bin", "python"
+    )
     if not os.path.exists(candidate):
         raise RuntimeError(
             f"could not find python for conda env '{_QWEN_ABLATION_CONDA_ENV}' at {candidate}; "
@@ -48,7 +52,9 @@ def _resolve_qwen_ablation_python() -> str:
 
 
 class QwenAblationServerManager:
-    def __init__(self, port: int = None, model_path: str = None, startup_timeout: float = 60.0):
+    def __init__(
+        self, port: int = None, model_path: str = None, startup_timeout: float = 60.0
+    ):
         from vl_direction.ablation.qwen_ablation_server import _DEFAULT_PORT
 
         self.port = port if port is not None else _DEFAULT_PORT
@@ -59,7 +65,9 @@ class QwenAblationServerManager:
 
     def _health_check(self, timeout: float = 1.0) -> bool:
         try:
-            with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as conn:
+            with socket.create_connection(
+                ("127.0.0.1", self.port), timeout=timeout
+            ) as conn:
                 conn.settimeout(timeout)
                 payload = json.dumps({"mode": "ping"}).encode("utf-8")
                 conn.sendall(struct.pack(">I", len(payload)) + payload)
@@ -76,17 +84,25 @@ class QwenAblationServerManager:
 
     def start(self) -> None:
         if self._health_check():
-            print(f"[QwenAblationServerManager] server already running on port {self.port}, not spawning")
+            print(
+                f"[QwenAblationServerManager] server already running on port {self.port}, not spawning"
+            )
             self._owns_process = False
             return
 
-        print(f"[QwenAblationServerManager] no server on port {self.port}, spawning subprocess")
+        print(
+            f"[QwenAblationServerManager] no server on port {self.port}, spawning subprocess"
+        )
         env = os.environ.copy()
         env["QWEN_ABLATION_SERVER_PORT"] = str(self.port)
         if self.model_path is not None:
             env["QWEN_ABLATION_MODEL_PATH"] = self.model_path
         self._process = subprocess.Popen(
-            [_resolve_qwen_ablation_python(), "-m", "vl_direction.ablation.qwen_ablation_server"],
+            [
+                _resolve_qwen_ablation_python(),
+                "-m",
+                "vl_direction.ablation.qwen_ablation_server",
+            ],
             cwd=os.getcwd(),
             env=env,
         )

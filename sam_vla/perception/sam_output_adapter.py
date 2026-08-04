@@ -45,10 +45,31 @@ def to_detections(
 
 if __name__ == "__main__":
     raw_examples = [
-        {"class_name": "bedrock", "x": 100.0, "y": 50.0, "width": 200.0, "height": 150.0, "score": 0.92},
-        {"class_name": "bigrock", "x": 400.0, "y": 300.0, "width": 80.0, "height": 80.0, "score": 0.77},
+        {
+            "class_name": "bedrock",
+            "x": 100.0,
+            "y": 50.0,
+            "width": 200.0,
+            "height": 150.0,
+            "score": 0.92,
+        },
+        {
+            "class_name": "bigrock",
+            "x": 400.0,
+            "y": 300.0,
+            "width": 80.0,
+            "height": 80.0,
+            "score": 0.77,
+        },
         # Invalid: zero width -> x0 == x1, fails validate()
-        {"class_name": "bedrock", "x": 600.0, "y": 200.0, "width": 0.0, "height": 40.0, "score": 0.5},
+        {
+            "class_name": "bedrock",
+            "x": 600.0,
+            "y": 200.0,
+            "width": 0.0,
+            "height": 40.0,
+            "score": 0.5,
+        },
     ]
 
     result = to_detections(raw_examples, image_width=1280, image_height=720)

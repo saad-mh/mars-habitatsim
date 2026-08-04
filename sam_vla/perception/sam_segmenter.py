@@ -67,21 +67,25 @@ def segment_frame(rgb: np.ndarray, model=None) -> list[dict]:
         if not mask.any():
             continue
 
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8
+        )
         for label_id in range(1, num_labels):  # label 0 is background
             x, y, w, h, area = stats[label_id]
             if area < _MIN_INSTANCE_AREA:
                 continue
 
             score = float(probs_np[class_idx][labels == label_id].mean())
-            detections.append({
-                "class_name": class_name,
-                "x": float(x * scale_x),
-                "y": float(y * scale_y),
-                "width": float(w * scale_x),
-                "height": float(h * scale_y),
-                "score": score,
-            })
+            detections.append(
+                {
+                    "class_name": class_name,
+                    "x": float(x * scale_x),
+                    "y": float(y * scale_y),
+                    "width": float(w * scale_x),
+                    "height": float(h * scale_y),
+                    "score": score,
+                }
+            )
 
     return detections
 

@@ -33,7 +33,9 @@ def _resolve_qwen_vlm_python() -> str:
     ).stdout
     # Some conda installs print unrelated warnings (e.g. a broken
     # anaconda-anon-usage plugin) to stdout before the actual base path.
-    conda_base = next(line.strip() for line in conda_info.splitlines() if line.startswith("/"))
+    conda_base = next(
+        line.strip() for line in conda_info.splitlines() if line.startswith("/")
+    )
     candidate = os.path.join(conda_base, "envs", _QWEN_VLM_CONDA_ENV, "bin", "python")
     if not os.path.exists(candidate):
         raise RuntimeError(
@@ -51,7 +53,9 @@ class QwenServerManager:
 
     def _health_check(self, timeout: float = 1.0) -> bool:
         try:
-            with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as conn:
+            with socket.create_connection(
+                ("127.0.0.1", self.port), timeout=timeout
+            ) as conn:
                 conn.settimeout(timeout)
                 payload = json.dumps({"mode": "ping"}).encode("utf-8")
                 conn.sendall(struct.pack(">I", len(payload)) + payload)
@@ -68,7 +72,9 @@ class QwenServerManager:
 
     def start(self) -> None:
         if self._health_check():
-            print(f"[QwenServerManager] server already running on port {self.port}, not spawning")
+            print(
+                f"[QwenServerManager] server already running on port {self.port}, not spawning"
+            )
             self._owns_process = False
             return
 
@@ -114,7 +120,9 @@ if __name__ == "__main__":
 
     owned_before = manager._owns_process
     manager.start()
-    print("owns_process changed on second start():", owned_before != manager._owns_process)
+    print(
+        "owns_process changed on second start():", owned_before != manager._owns_process
+    )
 
     manager.stop()
     print("health check after stop():", manager._health_check())

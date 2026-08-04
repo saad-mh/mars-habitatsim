@@ -76,6 +76,8 @@ def register_annotation_meshes(
             raise FileNotFoundError(
                 f"mesh_id_map references missing hull mesh {mesh_path} for mesh_id {mesh_id}"
             )
-        objects[mesh_id] = register_semantic_mesh(sim, str(mesh_path), mesh_id, y_offset=y_lift)
+        objects[mesh_id] = register_semantic_mesh(
+            sim, str(mesh_path), mesh_id, y_offset=y_lift
+        )
 
     return objects

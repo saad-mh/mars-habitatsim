@@ -37,8 +37,12 @@ def _resolve_internvl_vlm_python() -> str:
     ).stdout
     # Some conda installs print unrelated warnings to stdout before the
     # actual base path (see qwen_server_manager.py's identical handling).
-    conda_base = next(line.strip() for line in conda_info.splitlines() if line.startswith("/"))
-    candidate = os.path.join(conda_base, "envs", _INTERNVL_VLM_CONDA_ENV, "bin", "python")
+    conda_base = next(
+        line.strip() for line in conda_info.splitlines() if line.startswith("/")
+    )
+    candidate = os.path.join(
+        conda_base, "envs", _INTERNVL_VLM_CONDA_ENV, "bin", "python"
+    )
     if not os.path.exists(candidate):
         raise RuntimeError(
             f"could not find python for conda env '{_INTERNVL_VLM_CONDA_ENV}' at {candidate}; "
@@ -48,16 +52,22 @@ def _resolve_internvl_vlm_python() -> str:
 
 
 class InternVLServerManager:
-    def __init__(self, port: int = None, model_path: str = None, startup_timeout: float = None):
+    def __init__(
+        self, port: int = None, model_path: str = None, startup_timeout: float = None
+    ):
         self.port = port if port is not None else INTERNVL_SERVER_PORT
         self.model_path = model_path
-        self.startup_timeout = startup_timeout if startup_timeout is not None else _START_TIMEOUT
+        self.startup_timeout = (
+            startup_timeout if startup_timeout is not None else _START_TIMEOUT
+        )
         self._process = None
         self._owns_process = False
 
     def _health_check(self, timeout: float = 1.0) -> bool:
         try:
-            with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as conn:
+            with socket.create_connection(
+                ("127.0.0.1", self.port), timeout=timeout
+            ) as conn:
                 conn.settimeout(timeout)
                 payload = json.dumps({"mode": "ping"}).encode("utf-8")
                 conn.sendall(struct.pack(">I", len(payload)) + payload)
@@ -74,11 +84,15 @@ class InternVLServerManager:
 
     def start(self) -> None:
         if self._health_check():
-            print(f"[InternVLServerManager] server already running on port {self.port}, not spawning")
+            print(
+                f"[InternVLServerManager] server already running on port {self.port}, not spawning"
+            )
             self._owns_process = False
             return
 
-        print(f"[InternVLServerManager] no server on port {self.port}, spawning subprocess")
+        print(
+            f"[InternVLServerManager] no server on port {self.port}, spawning subprocess"
+        )
         env = os.environ.copy()
         env["INTERNVL_SERVER_PORT"] = str(self.port)
         if self.model_path is not None:

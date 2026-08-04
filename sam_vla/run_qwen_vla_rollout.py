@@ -21,21 +21,30 @@ from sam_vla.logging.rollout_logger import RolloutLogger
 from sam_vla.perception.semantic_overlay import overlay_semantic_masks
 
 
-def register_goal_obstacle_masks(env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir):
+def register_goal_obstacle_masks(
+    env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir
+):
     """Give the chosen goal object a goal-mask mesh and every other detected
     object an obstacle-mask mesh, each a disc of `obj_mask_radius` around its
     bbox's backprojected world coords. The rest of the scene is untouched."""
     if goal_position is not None:
-        env.register_object_mask(goal_position, MESH_GOAL_ID, obj_mask_radius, out_dir, "goal")
+        env.register_object_mask(
+            goal_position, MESH_GOAL_ID, obj_mask_radius, out_dir, "goal"
+        )
     else:
         print("[WARN] goal bbox had no valid depth; skipping goal mask", flush=True)
 
     for i, obstacle_bbox in enumerate(goal_spec.obstacle_bboxes_norm):
         obstacle_position = bbox_to_world(obs0, obstacle_bbox, hfov_deg=HFOV_DEG)
         if obstacle_position is None:
-            print(f"[WARN] obstacle[{i}] bbox had no valid depth; skipping obstacle mask", flush=True)
+            print(
+                f"[WARN] obstacle[{i}] bbox had no valid depth; skipping obstacle mask",
+                flush=True,
+            )
             continue
-        env.register_object_mask(obstacle_position, MESH_OBST_ID, obj_mask_radius, out_dir, f"obstacle_{i}")
+        env.register_object_mask(
+            obstacle_position, MESH_OBST_ID, obj_mask_radius, out_dir, f"obstacle_{i}"
+        )
 
 
 def run(
@@ -69,24 +78,34 @@ def run(
         with_semantic=True,
     ) as env:
         obs0 = env.get_observation(frame_idx=0)
-        goal_spec, goal_vlm_result, sam_detections = first_frame_resolver.resolve_verbose(obs0.rgb)
+        goal_spec, goal_vlm_result, sam_detections = (
+            first_frame_resolver.resolve_verbose(obs0.rgb)
+        )
         goal_position = backproject_goal_position(obs0, goal_spec, hfov_deg=HFOV_DEG)
         logger.log_goal_resolution(goal_spec, goal_vlm_result, goal_position)
         logger.save_sam_first_frame(obs0.rgb, sam_detections, goal_spec, out_dir)
-        print(f"resolved goal_spec: {goal_spec.instruction_text} | goal_position={goal_position}")
-        register_goal_obstacle_masks(env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir)
+        print(
+            f"resolved goal_spec: {goal_spec.instruction_text} | goal_position={goal_position}"
+        )
+        register_goal_obstacle_masks(
+            env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir
+        )
 
         policy = QwenDiscreteDirectionPolicy()
 
         for step in range(max_steps):
             obs = env.get_observation(frame_idx=step)
             semantic = env.get_semantic_frame()
-            raw_action, vla_result = policy.act_verbose(obs.rgb, semantic, goal_spec, step)
+            raw_action, vla_result = policy.act_verbose(
+                obs.rgb, semantic, goal_spec, step
+            )
             action = safety_filter_fn(raw_action, obs)
             new_pose = integrate_mars(obs.pose, action, dt)
             env.step(new_pose)
             vis_rgb = overlay_semantic_masks(obs.rgb, semantic)
-            logger.log_step(obs, action, new_pose, vla_result=vla_result, vis_rgb=vis_rgb)
+            logger.log_step(
+                obs, action, new_pose, vla_result=vla_result, vis_rgb=vis_rgb
+            )
 
             if step % 10 == 0:
                 dist = (
@@ -114,15 +133,32 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--scene-path", required=True)
     parser.add_argument("--heightmap-path", required=True)
-    parser.add_argument("--out-dir", default=f"vla_rollout{datetime.datetime.now().strftime('%d%m%y%H%M')}")
+    parser.add_argument(
+        "--out-dir",
+        default=f"vla_rollout{datetime.datetime.now().strftime('%d%m%y%H%M')}",
+    )
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--dt", type=float, default=0.1)
-    parser.add_argument("--save-video", action="store_true", help="Save rollout.mp4 from logged RGB frames")
-    parser.add_argument("--save-frames", action="store_true", help="Save individual PNG frames under out_dir/frames/")
+    parser.add_argument(
+        "--save-video",
+        action="store_true",
+        help="Save rollout.mp4 from logged RGB frames",
+    )
+    parser.add_argument(
+        "--save-frames",
+        action="store_true",
+        help="Save individual PNG frames under out_dir/frames/",
+    )
     parser.add_argument("--video-fps", type=int, default=10)
-    parser.add_argument("--start-x", type=float, default=0.0, help="Rover spawn x coordinate")
-    parser.add_argument("--start-z", type=float, default=8.0, help="Rover spawn z coordinate")
-    parser.add_argument("--start-yaw", type=float, default=0.0, help="Rover spawn yaw in degrees")
+    parser.add_argument(
+        "--start-x", type=float, default=0.0, help="Rover spawn x coordinate"
+    )
+    parser.add_argument(
+        "--start-z", type=float, default=8.0, help="Rover spawn z coordinate"
+    )
+    parser.add_argument(
+        "--start-yaw", type=float, default=0.0, help="Rover spawn yaw in degrees"
+    )
     parser.add_argument(
         "--randomise-spawn",
         action="store_true",

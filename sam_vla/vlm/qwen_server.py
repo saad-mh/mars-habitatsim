@@ -35,7 +35,9 @@ def _recv_exact(conn: socket.socket, num_bytes: int) -> bytes:
     while remaining > 0:
         chunk = conn.recv(remaining)
         if not chunk:
-            raise ConnectionError("connection closed before expected bytes were received")
+            raise ConnectionError(
+                "connection closed before expected bytes were received"
+            )
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -123,7 +125,9 @@ def _dispatch(model, processor, message: dict) -> dict:
     raise ValueError(f"unknown mode: {mode!r}")
 
 
-def serve_forever(model, processor, host: str = QWEN_SERVER_HOST, port: int = QWEN_SERVER_PORT) -> None:
+def serve_forever(
+    model, processor, host: str = QWEN_SERVER_HOST, port: int = QWEN_SERVER_PORT
+) -> None:
     # Single-threaded blocking accept loop: Qwen inference is not safe to run
     # concurrently across connections anyway, so requests are naturally
     # serialized rather than fanned out via ThreadingTCPServer.

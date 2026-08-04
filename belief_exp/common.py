@@ -7,6 +7,7 @@ SE(2) ego-motion integrator for the ground-truth goal) -- matching the existing
 navdp/scripts/*.py convention of keeping this tiny controller as a local copy
 in every file that needs it, rather than inventing a shared import path for it.
 """
+
 from __future__ import annotations
 
 import math

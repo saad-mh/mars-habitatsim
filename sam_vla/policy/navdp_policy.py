@@ -42,7 +42,9 @@ def _resolve_navdp_root(raw: Optional[str]) -> Path:
     candidates.append(HERE.parent.parent / "navdp")
     for c in candidates:
         c = c.expanduser().resolve()
-        if (c / "model_s2_dit.py").exists() and (c / "scripts" / "rollout_habitat_policy.py").exists():
+        if (c / "model_s2_dit.py").exists() and (
+            c / "scripts" / "rollout_habitat_policy.py"
+        ).exists():
             return c
     raise FileNotFoundError(
         "Could not find the navdp repo (expected model_s2_dit.py + "
@@ -94,9 +96,17 @@ class NavdpPolicy:  # implements NavigationPolicy (via act_verbose, like QwenDis
         navdp_root_path = _resolve_navdp_root(navdp_root)
         _add_navdp_to_path(navdp_root_path)
 
-        from navdp.data.habitat_route_dataset import _empty_belief_tensor, _proprio_from_pose
+        from navdp.data.habitat_route_dataset import (
+            _empty_belief_tensor,
+            _proprio_from_pose,
+        )
         from navdp.extensions import DepthObstacleMap
-        from rollout_habitat_policy import ActionSmoother, action_to_control, frame_to_spatial, load_model
+        from rollout_habitat_policy import (
+            ActionSmoother,
+            action_to_control,
+            frame_to_spatial,
+            load_model,
+        )
 
         self._empty_belief_tensor = _empty_belief_tensor
         self._proprio_from_pose = _proprio_from_pose
@@ -112,15 +122,23 @@ class NavdpPolicy:  # implements NavigationPolicy (via act_verbose, like QwenDis
         self.replan_every = max(int(replan_every), 1)
         self.use_obstacle_depth_map = bool(use_obstacle_depth_map)
 
-        self.model, train_args = load_model(Path(ckpt_path).expanduser().resolve(), device, weights)
+        self.model, train_args = load_model(
+            Path(ckpt_path).expanduser().resolve(), device, weights
+        )
 
         self.modes = {
-            "proprio_mode": str(proprio_mode or train_args.get("habitat_proprio_mode", "planar3")),
-            "action_mode": str(action_mode or train_args.get("habitat_action_mode", "action3d")),
+            "proprio_mode": str(
+                proprio_mode or train_args.get("habitat_proprio_mode", "planar3")
+            ),
+            "action_mode": str(
+                action_mode or train_args.get("habitat_action_mode", "action3d")
+            ),
             "yaw_axis": str(yaw_axis or train_args.get("habitat_yaw_axis", "y")),
         }
         if self.modes["action_mode"] == "waypoint":
-            raise ValueError("NavdpPolicy executes velocity actions; use an action3d or action2d checkpoint/mode.")
+            raise ValueError(
+                "NavdpPolicy executes velocity actions; use an action3d or action2d checkpoint/mode."
+            )
 
         if use_obstacle_channel is not None:
             self.use_obstacle_channel = bool(use_obstacle_channel)
@@ -150,24 +168,38 @@ class NavdpPolicy:  # implements NavigationPolicy (via act_verbose, like QwenDis
         obstacle_mask = np.where(sem == MESH_OBST_ID, 255, 0).astype(np.uint8)
 
         spatial = self._frame_to_spatial(
-            depth, goal_mask, self.image_size, obstacle_mask,
+            depth,
+            goal_mask,
+            self.image_size,
+            obstacle_mask,
             include_obstacle_channel=self.use_obstacle_channel,
         ).to(self.device)
 
         if self.use_obstacle_depth_map:
             height, width = depth.shape[:2]
-            self._obstacle_builder.camera_intrinsics = _intrinsics_from_hfov(height, width, self.hfov_deg)
+            self._obstacle_builder.camera_intrinsics = _intrinsics_from_hfov(
+                height, width, self.hfov_deg
+            )
             obstacle_map = self._obstacle_builder.build(depth)
         else:
             obstacle_map = np.zeros((96, 96), dtype=np.float32)
         obstacle_t = torch.from_numpy(obstacle_map[None]).float().to(self.device)
 
         qx, qy, qz, qw = _yaw_quat_xyzw(obs.pose.yaw)
-        pose7 = np.asarray([obs.pose.x, obs.pose.y, obs.pose.z, qx, qy, qz, qw], dtype=np.float32)
-        proprio = self._proprio_from_pose(pose7, self.modes["proprio_mode"], planar_axes=(0, 2), yaw_axis=self.modes["yaw_axis"])
+        pose7 = np.asarray(
+            [obs.pose.x, obs.pose.y, obs.pose.z, qx, qy, qz, qw], dtype=np.float32
+        )
+        proprio = self._proprio_from_pose(
+            pose7,
+            self.modes["proprio_mode"],
+            planar_axes=(0, 2),
+            yaw_axis=self.modes["yaw_axis"],
+        )
         proprio_t = torch.from_numpy(proprio[None]).float().to(self.device)
 
-        belief_t = torch.from_numpy(self._empty_belief_tensor()[None]).float().to(self.device)
+        belief_t = (
+            torch.from_numpy(self._empty_belief_tensor()[None]).float().to(self.device)
+        )
         route_index = torch.zeros(1, dtype=torch.long, device=self.device)
         active_goal_index = torch.zeros(1, dtype=torch.long, device=self.device)
 
@@ -183,21 +215,25 @@ class NavdpPolicy:  # implements NavigationPolicy (via act_verbose, like QwenDis
                 active_goal_index=active_goal_index,
             )
             pred_chunk = pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
-            chunk_ctrl = np.stack([
-                self._action_to_control(
-                    a,
-                    action_mode=self.modes["action_mode"],
-                    max_forward_speed=self.max_forward_speed,
-                    max_lateral_speed=self.max_lateral_speed,
-                    max_yaw_rate=self.max_yaw_rate,
-                )
-                for a in pred_chunk
-            ]).astype(np.float32)
+            chunk_ctrl = np.stack(
+                [
+                    self._action_to_control(
+                        a,
+                        action_mode=self.modes["action_mode"],
+                        max_forward_speed=self.max_forward_speed,
+                        max_lateral_speed=self.max_lateral_speed,
+                        max_yaw_rate=self.max_yaw_rate,
+                    )
+                    for a in pred_chunk
+                ]
+            ).astype(np.float32)
             self._smoother.add(step, chunk_ctrl)
             self._last_pred_chunk = pred_chunk
 
         v_fwd, v_lat, yaw_rate = self._smoother.get(step)
-        action = Action(v_fwd=float(v_fwd), v_lat=float(v_lat), yaw_rate=float(yaw_rate))
+        action = Action(
+            v_fwd=float(v_fwd), v_lat=float(v_lat), yaw_rate=float(yaw_rate)
+        )
         vla_result = {
             "goal_visible_pixels": int((goal_mask > 0).sum()),
             "obstacle_visible_pixels": int((obstacle_mask > 0).sum()),
@@ -209,12 +245,18 @@ class NavdpPolicy:  # implements NavigationPolicy (via act_verbose, like QwenDis
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="Smoke-load a NavDP checkpoint outside a rollout.")
+    ap = argparse.ArgumentParser(
+        description="Smoke-load a NavDP checkpoint outside a rollout."
+    )
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--navdp-root", default=None)
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
-    policy = NavdpPolicy(ckpt_path=args.ckpt, navdp_root=args.navdp_root, device=args.device)
-    print(f"loaded NavdpPolicy: modes={policy.modes} image_size={policy.image_size} "
-          f"use_obstacle_channel={policy.use_obstacle_channel}")
+    policy = NavdpPolicy(
+        ckpt_path=args.ckpt, navdp_root=args.navdp_root, device=args.device
+    )
+    print(
+        f"loaded NavdpPolicy: modes={policy.modes} image_size={policy.image_size} "
+        f"use_obstacle_channel={policy.use_obstacle_channel}"
+    )

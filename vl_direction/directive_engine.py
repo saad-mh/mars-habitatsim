@@ -20,7 +20,10 @@ from vl_direction.client import InternVLClient, get_client
 from vl_direction.intervention.mode_flag import get_current_mode
 from vl_direction.parser import parse_direction
 from vl_direction.prompts.cbf_prompt import build_cbf_prompt, build_cbf_reprompt
-from vl_direction.prompts.exploration_prompt import build_exploration_prompt, build_exploration_reprompt
+from vl_direction.prompts.exploration_prompt import (
+    build_exploration_prompt,
+    build_exploration_reprompt,
+)
 from vl_direction.prompts.uncertainty_prompt import build_sweep_description_prompt
 from vl_direction.schemas import (
     CBFContext,
@@ -57,7 +60,12 @@ def _query_cbf(client, frames, context: CBFContext):
     prompt = build_cbf_prompt(context)
     reprompt = build_cbf_reprompt(context)
     raw, direction, parse_ok = _generate_with_retry(
-        client, frames, prompt, reprompt, _ALLOWED_DIRECTIONS["cbf"], config.MAX_NEW_TOKENS["cbf"]
+        client,
+        frames,
+        prompt,
+        reprompt,
+        _ALLOWED_DIRECTIONS["cbf"],
+        config.MAX_NEW_TOKENS["cbf"],
     )
     confidence = 1.0 if parse_ok else 0.0
     return IdentityToken.CBF, direction, confidence, raw, parse_ok, None
@@ -68,7 +76,12 @@ def _query_exploration(client, frames, context: ExplorationContext):
     prompt = build_exploration_prompt(context, frame_count)
     reprompt = build_exploration_reprompt(context, frame_count)
     raw, direction, parse_ok = _generate_with_retry(
-        client, frames, prompt, reprompt, _ALLOWED_DIRECTIONS["exploration"], config.MAX_NEW_TOKENS["exploration"]
+        client,
+        frames,
+        prompt,
+        reprompt,
+        _ALLOWED_DIRECTIONS["exploration"],
+        config.MAX_NEW_TOKENS["exploration"],
     )
     confidence = 1.0 if parse_ok else 0.0
     return IdentityToken.EXPLORATION, direction, confidence, raw, parse_ok, None
@@ -95,8 +108,14 @@ def _query_uncertainty(client, frames, context: UncertaintyContext):
     # Submit phase: pure packaging, no VLM call -- the human already supplied
     # the heading, there's nothing left to ask the model.
     hr = context.human_heading_response
-    max_units = context.max_units if context.max_units is not None else config.DEFAULT_MAX_UNITS
-    heading_desc = f"heading {hr.angle_deg}" if hr.angle_deg is not None else f"heading range {hr.angle_range_deg}"
+    max_units = (
+        context.max_units if context.max_units is not None else config.DEFAULT_MAX_UNITS
+    )
+    heading_desc = (
+        f"heading {hr.angle_deg}"
+        if hr.angle_deg is not None
+        else f"heading range {hr.angle_range_deg}"
+    )
     raw = f"traverse {heading_desc} for up to {max_units} units, or until goal is visually confirmed"
     payload = UncertaintyPayload(
         status=UncertaintyStatus.HEADING_DIRECTIVE,
@@ -109,7 +128,11 @@ def _query_uncertainty(client, frames, context: UncertaintyContext):
     return IdentityToken.UNCERTAINTY, None, 1.0, raw, True, payload
 
 
-_HANDLERS = {"cbf": _query_cbf, "exploration": _query_exploration, "uncertainty": _query_uncertainty}
+_HANDLERS = {
+    "cbf": _query_cbf,
+    "exploration": _query_exploration,
+    "uncertainty": _query_uncertainty,
+}
 
 
 def query(
@@ -127,8 +150,8 @@ def query(
     call_id = str(uuid.uuid4())
     t0 = time.monotonic()
 
-    identity_token, direction, confidence, raw, parse_ok, uncertainty_payload = _HANDLERS[mode](
-        resolved_client, frames, context
+    identity_token, direction, confidence, raw, parse_ok, uncertainty_payload = (
+        _HANDLERS[mode](resolved_client, frames, context)
     )
 
     result = VLDirectiveResult(

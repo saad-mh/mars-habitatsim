@@ -62,7 +62,9 @@ def _find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image
     return best_ratio
 
 
-def _dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=True):
+def _dynamic_preprocess(
+    image, min_num=1, max_num=12, image_size=448, use_thumbnail=True
+):
     orig_width, orig_height = image.size
     aspect_ratio = orig_width / orig_height
 
@@ -77,7 +79,9 @@ def _dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbn
         key=lambda x: x[0] * x[1],
     )
 
-    target_aspect_ratio = _find_closest_aspect_ratio(aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+    target_aspect_ratio = _find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size
+    )
 
     target_width = image_size * target_aspect_ratio[0]
     target_height = image_size * target_aspect_ratio[1]
@@ -100,14 +104,20 @@ def _dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbn
     return processed_images
 
 
-def _load_image_array(rgb: np.ndarray, input_size: int = 448, max_num: int = 12) -> torch.Tensor:
+def _load_image_array(
+    rgb: np.ndarray, input_size: int = 448, max_num: int = 12
+) -> torch.Tensor:
     image = Image.fromarray(rgb).convert("RGB")
     transform = _build_transform(input_size)
-    tiles = _dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+    tiles = _dynamic_preprocess(
+        image, image_size=input_size, use_thumbnail=True, max_num=max_num
+    )
     return torch.stack([transform(tile) for tile in tiles])
 
 
-def load_internvl_model(model_path: str = INTERNVL_MODEL_ID, device: str = "cuda") -> tuple:
+def load_internvl_model(
+    model_path: str = INTERNVL_MODEL_ID, device: str = "cuda"
+) -> tuple:
     from transformers import AutoModel, AutoTokenizer
 
     model = (
@@ -121,7 +131,9 @@ def load_internvl_model(model_path: str = INTERNVL_MODEL_ID, device: str = "cuda
         .eval()
         .to(device)
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=True, use_fast=False
+    )
     if not hasattr(tokenizer, "convert_tokens_to_ids"):
         # transformers' own _from_pretrained silently returns False here on
         # certain sentencepiece RuntimeErrors (tokenization_utils_base.py's
@@ -152,7 +164,9 @@ def run_internvl_inference(
 
     pixel_values_per_image = [_load_image_array(img) for img in images]
     num_patches_list = [pv.size(0) for pv in pixel_values_per_image]
-    pixel_values = torch.cat(pixel_values_per_image, dim=0).to(torch.bfloat16).to(model.device)
+    pixel_values = (
+        torch.cat(pixel_values_per_image, dim=0).to(torch.bfloat16).to(model.device)
+    )
 
     generation_config = {"max_new_tokens": max_new_tokens, "do_sample": False}
 
@@ -163,13 +177,19 @@ def run_internvl_inference(
     image_tags = "".join(f"Image-{i + 1}: <image>\n" for i in range(len(images)))
     question = f"{image_tags}{prompt}"
     return model.chat(
-        tokenizer, pixel_values, question, generation_config, num_patches_list=num_patches_list
+        tokenizer,
+        pixel_values,
+        question,
+        generation_config,
+        num_patches_list=num_patches_list,
     )
 
 
 if __name__ == "__main__":
     image_path = sys.argv[1]
-    prompt = sys.argv[2] if len(sys.argv) > 2 else "Describe this image in one sentence."
+    prompt = (
+        sys.argv[2] if len(sys.argv) > 2 else "Describe this image in one sentence."
+    )
 
     test_image = np.array(Image.open(image_path).convert("RGB"))
 

@@ -38,8 +38,8 @@ def build_goal_vocabulary_prompt() -> str:
         "not just one.\n\n"
         "List a small set of short, visually distinct object terms (2-4 "
         "terms) describing the categories of rocks or other objects in this "
-        "scene that would make good navigation targets, e.g. \"small rock\" "
-        "vs \"big rock\" if there is a clear size distinction, or terms "
+        'scene that would make good navigation targets, e.g. "small rock" '
+        'vs "big rock" if there is a clear size distinction, or terms '
         "based on shape/color if that better separates the objects you see. "
         "Also give one instruction sentence describing the rover's overall "
         "task across all of them.\n\n"
@@ -96,9 +96,21 @@ def build_direction_prompt(instruction_text: str, frame_idx: int) -> str:
 
 if __name__ == "__main__":
     dummy_detections = [
-        {"class_name": "rock", "bbox_norm": [0.12, 0.30, 0.28, 0.55], "confidence": 0.91},
-        {"class_name": "rock", "bbox_norm": [0.60, 0.40, 0.80, 0.70], "confidence": 0.77},
-        {"class_name": "obstacle", "bbox_norm": [0.40, 0.10, 0.55, 0.35], "confidence": 0.65},
+        {
+            "class_name": "rock",
+            "bbox_norm": [0.12, 0.30, 0.28, 0.55],
+            "confidence": 0.91,
+        },
+        {
+            "class_name": "rock",
+            "bbox_norm": [0.60, 0.40, 0.80, 0.70],
+            "confidence": 0.77,
+        },
+        {
+            "class_name": "obstacle",
+            "bbox_norm": [0.40, 0.10, 0.55, 0.35],
+            "confidence": 0.65,
+        },
     ]
 
     print("=== build_select_goal_prompt ===")

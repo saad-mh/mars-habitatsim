@@ -32,7 +32,10 @@ def build_cbf_prompt(context: CBFContext) -> str:
 
 
 def build_cbf_reprompt(context: CBFContext) -> str:
-    return build_cbf_prompt(context) + "\n\nYou must answer with exactly one of: LEFT, RIGHT."
+    return (
+        build_cbf_prompt(context)
+        + "\n\nYou must answer with exactly one of: LEFT, RIGHT."
+    )
 
 
 if __name__ == "__main__":

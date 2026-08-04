@@ -20,20 +20,29 @@ from vl_direction.intervention.mode_flag import SessionMode, get_current_mode, s
 class TeleopEvent:
     key: str
     timestamp: float
-    shadow_vl_direction: Optional[str] = None  # optional sec 6.4 shadow-mode comparison value
+    shadow_vl_direction: Optional[str] = (
+        None  # optional sec 6.4 shadow-mode comparison value
+    )
 
 
 class TeleopBridge:
-    def __init__(self, resume_timeout_s: float = config.TELEOP_RESUME_AUTONOMY_TIMEOUT_S):
+    def __init__(
+        self, resume_timeout_s: float = config.TELEOP_RESUME_AUTONOMY_TIMEOUT_S
+    ):
         self.resume_timeout_s = resume_timeout_s
         self.events: List[TeleopEvent] = []
         self._last_event_time: Optional[float] = None
 
     def notify_teleop_event(
-        self, key: str, timestamp: Optional[float] = None, shadow_vl_direction: Optional[str] = None
+        self,
+        key: str,
+        timestamp: Optional[float] = None,
+        shadow_vl_direction: Optional[str] = None,
     ) -> TeleopEvent:
         timestamp = timestamp if timestamp is not None else time.monotonic()
-        event = TeleopEvent(key=key, timestamp=timestamp, shadow_vl_direction=shadow_vl_direction)
+        event = TeleopEvent(
+            key=key, timestamp=timestamp, shadow_vl_direction=shadow_vl_direction
+        )
         self.events.append(event)
         self._last_event_time = timestamp
         set_mode(SessionMode.HUMAN_INTERVENED)
@@ -46,7 +55,10 @@ class TeleopBridge:
     def tick(self, now: Optional[float] = None) -> None:
         """Call periodically from the orchestrator loop: auto-resumes
         AUTONOMOUS after resume_timeout_s of no teleop input."""
-        if get_current_mode() != SessionMode.HUMAN_INTERVENED or self._last_event_time is None:
+        if (
+            get_current_mode() != SessionMode.HUMAN_INTERVENED
+            or self._last_event_time is None
+        ):
             return
         now = now if now is not None else time.monotonic()
         if now - self._last_event_time >= self.resume_timeout_s:
@@ -62,8 +74,12 @@ if __name__ == "__main__":
     bridge.notify_teleop_event(key="a", timestamp=0.0)
     assert get_current_mode() == SessionMode.HUMAN_INTERVENED
     bridge.tick(now=0.05)
-    assert get_current_mode() == SessionMode.HUMAN_INTERVENED, "should not resume before timeout"
+    assert (
+        get_current_mode() == SessionMode.HUMAN_INTERVENED
+    ), "should not resume before timeout"
     bridge.tick(now=0.2)
-    assert get_current_mode() == SessionMode.AUTONOMOUS, "should auto-resume after timeout"
+    assert (
+        get_current_mode() == SessionMode.AUTONOMOUS
+    ), "should auto-resume after timeout"
     print("OK: teleop_bridge mode transitions behave as expected.")
     reset()

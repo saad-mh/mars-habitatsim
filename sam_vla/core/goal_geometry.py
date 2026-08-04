@@ -61,10 +61,14 @@ def bbox_to_world(
     x0, y0, x1, y1 = bbox_norm
     fx0, fx1 = x0 * width, x1 * width
     fy0, fy1 = y0 * height, y1 * height
-    ix0, ix1 = sorted((min(max(int(fx0), 0), width - 1), min(max(int(fx1), 0), width - 1)))
-    iy0, iy1 = sorted((min(max(int(fy0), 0), height - 1), min(max(int(fy1), 0), height - 1)))
+    ix0, ix1 = sorted(
+        (min(max(int(fx0), 0), width - 1), min(max(int(fx1), 0), width - 1))
+    )
+    iy0, iy1 = sorted(
+        (min(max(int(fy0), 0), height - 1), min(max(int(fy1), 0), height - 1))
+    )
 
-    patch = np.asarray(obs.depth)[iy0:iy1 + 1, ix0:ix1 + 1]
+    patch = np.asarray(obs.depth)[iy0 : iy1 + 1, ix0 : ix1 + 1]
     valid = patch[np.isfinite(patch) & (patch > 0.0)]
     if valid.size == 0:
         return None
@@ -165,8 +169,14 @@ def terrain_patch_mesh(
             faces.append((v00, v01, v11))
             faces.append((v00, v11, v10))
 
-    verts_arr = np.asarray(verts, dtype=np.float64) if verts else np.empty((0, 3), dtype=np.float64)
-    faces_arr = np.asarray(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
+    verts_arr = (
+        np.asarray(verts, dtype=np.float64)
+        if verts
+        else np.empty((0, 3), dtype=np.float64)
+    )
+    faces_arr = (
+        np.asarray(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
+    )
     return verts_arr, faces_arr
 
 

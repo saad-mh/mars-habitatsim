@@ -154,10 +154,16 @@ def spot_check_run(
         category_mask = iio.imread(run_dir / rec["category_mask_path"])
         overlaid = overlay_category_mask(rgb, category_mask, class_names, palette)
         instance_mask = (
-            iio.imread(run_dir / rec["instance_mask_path"]) if draw_mode == "mask" else None
+            iio.imread(run_dir / rec["instance_mask_path"])
+            if draw_mode == "mask"
+            else None
         )
         annotated = draw_object_labels(
-            overlaid, rec["objects"], palette, draw_mode=draw_mode, instance_mask=instance_mask
+            overlaid,
+            rec["objects"],
+            palette,
+            draw_mode=draw_mode,
+            instance_mask=instance_mask,
         )
 
         out_path = out_dir / f"{rec['frame_id']}.png"

@@ -43,7 +43,14 @@ def run_sweep_subprocess(out_dir: Path, python_bin: str, sweep_args: List[str]) 
     out_dir.mkdir(parents=True, exist_ok=True)
     before = {p.name for p in out_dir.iterdir() if p.is_dir()}
 
-    cmd = [python_bin, "-m", "sam_vla.run_segmentation_sweep", "--out-dir", str(out_dir), *sweep_args]
+    cmd = [
+        python_bin,
+        "-m",
+        "sam_vla.run_segmentation_sweep",
+        "--out-dir",
+        str(out_dir),
+        *sweep_args,
+    ]
     print(f"[pipeline] running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
 
@@ -77,11 +84,15 @@ def run_pipeline(
         return run_dir
 
     if num_kept == 0:
-        raise RuntimeError(f"all frames in {run_dir} were empty -- nothing left to export")
+        raise RuntimeError(
+            f"all frames in {run_dir} were empty -- nothing left to export"
+        )
 
     if spot_check_n > 0:
         written = spot_check_run(run_dir, n=spot_check_n)
-        print(f"[pipeline] wrote {len(written)} spot-check overlays -> {run_dir / 'spot_check'}")
+        print(
+            f"[pipeline] wrote {len(written)} spot-check overlays -> {run_dir / 'spot_check'}"
+        )
 
     export_out = export_dir or (run_dir / "annotations_export")
     written = export_annotations(run_dir, export_out, formats)
@@ -92,25 +103,42 @@ def run_pipeline(
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out-dir", required=True, help="passed through as run_segmentation_sweep's --out-dir")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument(
-        "--python", default=sys.executable,
+        "--out-dir",
+        required=True,
+        help="passed through as run_segmentation_sweep's --out-dir",
+    )
+    ap.add_argument(
+        "--python",
+        default=sys.executable,
         help="interpreter to run run_segmentation_sweep with (needs habitat_sim installed)",
     )
-    ap.add_argument("--formats", default="coco,yolo", help=f"comma-separated subset of {ALL_FORMATS}")
-    ap.add_argument("--export-dir", default=None, help="default: <run_dir>/annotations_export/")
     ap.add_argument(
-        "--spot-check-n", type=int, default=20,
+        "--formats",
+        default="coco,yolo",
+        help=f"comma-separated subset of {ALL_FORMATS}",
+    )
+    ap.add_argument(
+        "--export-dir", default=None, help="default: <run_dir>/annotations_export/"
+    )
+    ap.add_argument(
+        "--spot-check-n",
+        type=int,
+        default=20,
         help="spot-check overlays to render after filtering, 0 to skip",
     )
     ap.add_argument(
-        "--dry-run-filter", action="store_true",
+        "--dry-run-filter",
+        action="store_true",
         help="report empty-frame drop counts without deleting anything; stops before spot-check/export "
-             "since the kept-frame set isn't final",
+        "since the kept-frame set isn't final",
     )
     ap.add_argument(
-        "sweep_args", nargs=argparse.REMAINDER,
+        "sweep_args",
+        nargs=argparse.REMAINDER,
         help="everything after -- is forwarded to run_segmentation_sweep",
     )
     args = ap.parse_args()
@@ -122,7 +150,9 @@ if __name__ == "__main__":
     formats = [f.strip() for f in args.formats.split(",") if f.strip()]
     unknown = set(formats) - set(ALL_FORMATS)
     if unknown:
-        raise SystemExit(f"unknown format(s) {sorted(unknown)}, choose from {ALL_FORMATS}")
+        raise SystemExit(
+            f"unknown format(s) {sorted(unknown)}, choose from {ALL_FORMATS}"
+        )
 
     run_pipeline(
         Path(args.out_dir),

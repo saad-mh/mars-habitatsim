@@ -63,7 +63,10 @@ class Sam3GoalTracker:
         self.ring_buffer: deque[np.ndarray] = deque(maxlen=window_frames)
 
         build_kwargs = dict(
-            version=version, compile=compile_, async_loading_frames=False, use_fa3=use_fa3
+            version=version,
+            compile=compile_,
+            async_loading_frames=False,
+            use_fa3=use_fa3,
         )
         if checkpoint_path:
             build_kwargs["checkpoint_path"] = checkpoint_path
@@ -93,7 +96,9 @@ class Sam3GoalTracker:
             return {}
 
         auto_dir = out_dir is None
-        window_dir = out_dir if out_dir else os.path.join(self.scratch_dir, f"step_{step:08d}")
+        window_dir = (
+            out_dir if out_dir else os.path.join(self.scratch_dir, f"step_{step:08d}")
+        )
         self._write_window(window_dir)
 
         try:
@@ -128,7 +133,9 @@ class Sam3GoalTracker:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
-            self.predictor.handle_request({"type": "close_session", "session_id": session_id})
+            self.predictor.handle_request(
+                {"type": "close_session", "session_id": session_id}
+            )
         finally:
             if auto_dir:
                 shutil.rmtree(window_dir, ignore_errors=True)

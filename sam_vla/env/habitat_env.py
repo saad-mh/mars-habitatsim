@@ -78,21 +78,33 @@ class MarsHabitatEnv:
         sim_cfg.scene_id = str(self._scene_path.expanduser().resolve())
         sim_cfg.enable_physics = False
 
-        rgb_spec = make_sensor("rgb", habitat_sim.SensorType.COLOR, RGB_HEIGHT, RGB_WIDTH, HFOV_DEG)
-        depth_spec = make_sensor("depth", habitat_sim.SensorType.DEPTH, RGB_HEIGHT, RGB_WIDTH, HFOV_DEG)
+        rgb_spec = make_sensor(
+            "rgb", habitat_sim.SensorType.COLOR, RGB_HEIGHT, RGB_WIDTH, HFOV_DEG
+        )
+        depth_spec = make_sensor(
+            "depth", habitat_sim.SensorType.DEPTH, RGB_HEIGHT, RGB_WIDTH, HFOV_DEG
+        )
         # make_sensor doesn't set a far clip; cap depth range here to a sane sensor spec.
         depth_spec.far = DEPTH_MAX_RANGE_M
 
         sensor_specs = [rgb_spec, depth_spec]
         if self._with_semantic:
             sensor_specs.append(
-                make_sensor("semantic", habitat_sim.SensorType.SEMANTIC, RGB_HEIGHT, RGB_WIDTH, HFOV_DEG)
+                make_sensor(
+                    "semantic",
+                    habitat_sim.SensorType.SEMANTIC,
+                    RGB_HEIGHT,
+                    RGB_WIDTH,
+                    HFOV_DEG,
+                )
             )
 
         agent_cfg = AgentConfiguration()
         agent_cfg.sensor_specifications = sensor_specs
 
-        self._sim = habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
+        self._sim = habitat_sim.Simulator(
+            habitat_sim.Configuration(sim_cfg, [agent_cfg])
+        )
         self._agent = self._sim.initialize_agent(0)
 
         heightmap_grid = HeightmapGrid(
@@ -104,7 +116,9 @@ class MarsHabitatEnv:
             flip_z=True,
             swap_xz=False,
         )
-        self._terrain = Terrain(heightmap_grid, flip_x=False, flip_z=False, swap_xz=False)
+        self._terrain = Terrain(
+            heightmap_grid, flip_x=False, flip_z=False, swap_xz=False
+        )
 
         if self._randomise_spawn:
             x = random.uniform(-SIZE_X / 2.0, SIZE_X / 2.0)
@@ -126,7 +140,8 @@ class MarsHabitatEnv:
                 self._sim, str(self._annotations_dir), self._annotation_categories
             )
             self._annotation_onstage = {
-                mesh_id: obj.translation for mesh_id, obj in self._annotation_objects.items()
+                mesh_id: obj.translation
+                for mesh_id, obj in self._annotation_objects.items()
             }
 
         self._registry.start_all()
@@ -134,7 +149,10 @@ class MarsHabitatEnv:
 
     def get_height_at_xz(self, x: float, z: float) -> float:
         """Terrain height at (x, z), plus rover clearance, sampled from the heightmap."""
-        return self._terrain.local_height_max(x, z, self._spawn_terrain_radius) + self._spawn_clearance
+        return (
+            self._terrain.local_height_max(x, z, self._spawn_terrain_radius)
+            + self._spawn_clearance
+        )
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._registry.stop_all()
@@ -176,11 +194,15 @@ class MarsHabitatEnv:
         pose = Pose(x=x, y=float(state.position[1]), z=z, yaw=yaw)
 
         if self._annotation_objects:
-            set_objects_hidden(self._annotation_objects, self._annotation_onstage, hidden=True)
+            set_objects_hidden(
+                self._annotation_objects, self._annotation_onstage, hidden=True
+            )
             obs = self._sim.get_sensor_observations()
             rgb, depth = rgb_depth(obs)
 
-            set_objects_hidden(self._annotation_objects, self._annotation_onstage, hidden=False)
+            set_objects_hidden(
+                self._annotation_objects, self._annotation_onstage, hidden=False
+            )
             obs2 = self._sim.get_sensor_observations()
             semantic = np.asarray(obs2["semantic"]) if self._with_semantic else None
         else:
@@ -188,7 +210,9 @@ class MarsHabitatEnv:
             rgb, depth = rgb_depth(obs)
             semantic = np.asarray(obs["semantic"]) if self._with_semantic else None
 
-        return Observation(rgb=rgb, depth=depth, pose=pose, frame_idx=frame_idx, semantic=semantic)
+        return Observation(
+            rgb=rgb, depth=depth, pose=pose, frame_idx=frame_idx, semantic=semantic
+        )
 
     def verify_annotation_isolation(self, frame_idx: int = -1) -> None:
         """Standing regression check (next.md Step 5): assert
@@ -208,10 +232,14 @@ class MarsHabitatEnv:
 
         obs = self.get_full_observation(frame_idx)  # production path
 
-        set_objects_hidden(self._annotation_objects, self._annotation_onstage, hidden=True)
+        set_objects_hidden(
+            self._annotation_objects, self._annotation_onstage, hidden=True
+        )
         obs_absent = self._sim.get_sensor_observations()
         rgb_absent, _ = rgb_depth(obs_absent)
-        set_objects_hidden(self._annotation_objects, self._annotation_onstage, hidden=False)  # restore
+        set_objects_hidden(
+            self._annotation_objects, self._annotation_onstage, hidden=False
+        )  # restore
 
         if not np.array_equal(obs.rgb, rgb_absent):
             diff_pixels = int(np.any(obs.rgb != rgb_absent, axis=-1).sum())

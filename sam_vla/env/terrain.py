@@ -127,7 +127,14 @@ class Terrain:
     """Wraps a `HeightmapGrid` with a second, scene-level axis mapping
     (its own flip/swap) between the rover's world (x, z) and the grid's."""
 
-    def __init__(self, grid: HeightmapGrid, *, flip_x: bool = False, flip_z: bool = False, swap_xz: bool = False):
+    def __init__(
+        self,
+        grid: HeightmapGrid,
+        *,
+        flip_x: bool = False,
+        flip_z: bool = False,
+        swap_xz: bool = False,
+    ):
         self._grid = grid
         self.flip_x = bool(flip_x)
         self.flip_z = bool(flip_z)
@@ -147,7 +154,9 @@ class Terrain:
         xx, zz = self._map(x, z)
         return float(self._grid(xx, zz))
 
-    def local_height_max(self, x: float, z: float, radius: float, samples: int = 5) -> float:
+    def local_height_max(
+        self, x: float, z: float, radius: float, samples: int = 5
+    ) -> float:
         """Max terrain height within `radius` of (x, z); used to keep a spawn
         point (or object marker) clear of nearby bumps rather than sinking
         into them when sampled at a single point."""

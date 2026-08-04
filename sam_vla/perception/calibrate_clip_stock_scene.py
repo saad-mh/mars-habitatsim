@@ -58,7 +58,9 @@ def _color_for_goal_id(goal_id: str) -> tuple[int, int, int]:
     return (int(r * 255), int(g * 255), int(b * 255))
 
 
-def _annotate_frame(frame: np.ndarray, mask_infos: list[dict], alpha: float = 0.4) -> np.ndarray:
+def _annotate_frame(
+    frame: np.ndarray, mask_infos: list[dict], alpha: float = 0.4
+) -> np.ndarray:
     """Alpha-blends each tracked goal's mask in its own color and draws a
     category/score/goal_id label near its bbox. mask_infos items:
     {"mask": bool ndarray, "goal_id": str, "category": str, "score": float}."""
@@ -88,12 +90,17 @@ def _annotate_frame(frame: np.ndarray, mask_infos: list[dict], alpha: float = 0.
 def save_gif(frames: list[np.ndarray], out_path: str, fps: float = 2.0) -> None:
     images = [Image.fromarray(f) for f in frames]
     images[0].save(
-        out_path, save_all=True, append_images=images[1:],
-        duration=int(1000 / fps), loop=0,
+        out_path,
+        save_all=True,
+        append_images=images[1:],
+        duration=int(1000 / fps),
+        loop=0,
     )
 
 
-def build_stock_sim(scene_glb: str, width: int = 640, height: int = 480, hfov_deg: float = 90.0):
+def build_stock_sim(
+    scene_glb: str, width: int = 640, height: int = 480, hfov_deg: float = 90.0
+):
     """Minimal habitat_sim.Simulator against a stock example scene: one RGB
     sensor, no depth/semantic (not needed for CLIP calibration)."""
     import habitat_sim
@@ -139,7 +146,9 @@ def load_frames(frames_dir: str) -> list[np.ndarray]:
     paths = sorted(p for p in os.listdir(frames_dir) if p.endswith(".jpg"))
     if not paths:
         raise FileNotFoundError(f"no .jpg frames found in {frames_dir}")
-    return [np.array(Image.open(os.path.join(frames_dir, p)).convert("RGB")) for p in paths]
+    return [
+        np.array(Image.open(os.path.join(frames_dir, p)).convert("RGB")) for p in paths
+    ]
 
 
 def calibrate(
@@ -165,7 +174,11 @@ def calibrate(
     from sam_vla.perception.clip_goal_classifier import ClipGoalClassifier
     from sam_vla.perception.sam3_goal_tracker import Sam3GoalTracker
 
-    tracker = Sam3GoalTracker(vocab_terms=vocab_terms, window_frames=window_frames, checkpoint_path=checkpoint_path)
+    tracker = Sam3GoalTracker(
+        vocab_terms=vocab_terms,
+        window_frames=window_frames,
+        checkpoint_path=checkpoint_path,
+    )
     classifier = ClipGoalClassifier(goal_vocabulary=vocab_terms)
     tracked_goals: dict[str, TrackedGoal] = {}
     last_known: dict[str, dict] = {}
@@ -185,7 +198,9 @@ def calibrate(
                         continue
                     crop = frame[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
                     category, score, embedding = classifier.classify(crop)
-                    goal_id = classifier.match_or_mint(embedding, tracked_goals, clip_reid_thresh)
+                    goal_id = classifier.match_or_mint(
+                        embedding, tracked_goals, clip_reid_thresh
+                    )
                     is_new = goal_id not in tracked_goals
                     if is_new:
                         tracked_goals[goal_id] = TrackedGoal(
@@ -201,7 +216,12 @@ def calibrate(
                                 float(ys.max() + 1) / height,
                             ),
                         )
-                    last_known[goal_id] = {"mask": mask, "category": category, "score": score, "goal_id": goal_id}
+                    last_known[goal_id] = {
+                        "mask": mask,
+                        "category": category,
+                        "score": score,
+                        "goal_id": goal_id,
+                    }
                     print(
                         f"[step {step}] sam3_obj_id={obj_id} area={int(mask.sum())} "
                         f"-> category={category!r} score={score:.3f} goal_id={goal_id} "
@@ -214,22 +234,61 @@ def calibrate(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scene-glb", default=None, help="path to a habitat_test_scenes .glb (required unless --load-frames-dir is given)")
-    parser.add_argument("--vocab-terms", default="chair,door,picture frame,window,table", help="comma-separated stock-scene object terms")
-    parser.add_argument("--script-length", type=int, default=12, help="number of scripted turn+forward steps to walk")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--scene-glb",
+        default=None,
+        help="path to a habitat_test_scenes .glb (required unless --load-frames-dir is given)",
+    )
+    parser.add_argument(
+        "--vocab-terms",
+        default="chair,door,picture frame,window,table",
+        help="comma-separated stock-scene object terms",
+    )
+    parser.add_argument(
+        "--script-length",
+        type=int,
+        default=12,
+        help="number of scripted turn+forward steps to walk",
+    )
     parser.add_argument("--window-frames", type=int, default=5)
     parser.add_argument("--seg-interval", type=int, default=3)
     parser.add_argument("--clip-reid-thresh", type=float, default=0.9)
-    parser.add_argument("--checkpoint", default=None, help="path to a local SAM3.1 checkpoint (default: download from HF)")
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="path to a local SAM3.1 checkpoint (default: download from HF)",
+    )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--dump-frames-dir", default=None, help="write captured frames here for a later --load-frames-dir run in another env")
-    parser.add_argument("--load-frames-dir", default=None, help="skip habitat_sim capture; load already-dumped frames from here instead")
-    parser.add_argument("--capture-only", action="store_true", help="only capture+dump frames (no SAM3/CLIP); use in an env that has habitat_sim but not torch")
-    parser.add_argument("--gif-path", default=None, help="stitch the per-goal mask+label annotated frames into an animated GIF at this path")
+    parser.add_argument(
+        "--dump-frames-dir",
+        default=None,
+        help="write captured frames here for a later --load-frames-dir run in another env",
+    )
+    parser.add_argument(
+        "--load-frames-dir",
+        default=None,
+        help="skip habitat_sim capture; load already-dumped frames from here instead",
+    )
+    parser.add_argument(
+        "--capture-only",
+        action="store_true",
+        help="only capture+dump frames (no SAM3/CLIP); use in an env that has habitat_sim but not torch",
+    )
+    parser.add_argument(
+        "--gif-path",
+        default=None,
+        help="stitch the per-goal mask+label annotated frames into an animated GIF at this path",
+    )
     parser.add_argument("--gif-fps", type=float, default=2.0)
-    parser.add_argument("--annotate-dir", default=None, help="also dump each annotated frame as a PNG here")
+    parser.add_argument(
+        "--annotate-dir",
+        default=None,
+        help="also dump each annotated frame as a PNG here",
+    )
     args = parser.parse_args()
 
     vocab_terms = [t.strip() for t in args.vocab_terms.split(",") if t.strip()]
@@ -241,16 +300,26 @@ def main() -> None:
         if not args.scene_glb:
             parser.error("--scene-glb is required unless --load-frames-dir is given")
         sim = build_stock_sim(args.scene_glb, width=args.width, height=args.height)
-        script = (["turn_left", "move_forward"] * args.script_length)[: args.script_length]
+        script = (["turn_left", "move_forward"] * args.script_length)[
+            : args.script_length
+        ]
         frames = capture_frames(sim, script, out_dir=args.dump_frames_dir)
         sim.close()
-        print(f"captured {len(frames)} frames" + (f", dumped to {args.dump_frames_dir}" if args.dump_frames_dir else ""))
+        print(
+            f"captured {len(frames)} frames"
+            + (f", dumped to {args.dump_frames_dir}" if args.dump_frames_dir else "")
+        )
 
     if args.capture_only:
         return
 
     annotated_frames = calibrate(
-        frames, vocab_terms, args.window_frames, args.seg_interval, args.clip_reid_thresh, checkpoint_path=args.checkpoint
+        frames,
+        vocab_terms,
+        args.window_frames,
+        args.seg_interval,
+        args.clip_reid_thresh,
+        checkpoint_path=args.checkpoint,
     )
 
     if args.annotate_dir:

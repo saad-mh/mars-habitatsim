@@ -26,7 +26,9 @@ def _encode_image(rgb: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _send_request(mode: str, payload: dict, port: int = None, timeout: float = 30.0) -> dict:
+def _send_request(
+    mode: str, payload: dict, port: int = None, timeout: float = 30.0
+) -> dict:
     if port is None:
         port = QWEN_SERVER_PORT
     message = json.dumps({"mode": mode, "payload": payload}).encode("utf-8")
@@ -50,7 +52,9 @@ def _recv_exact(conn: socket.socket, num_bytes: int) -> bytes:
     while remaining > 0:
         chunk = conn.recv(remaining)
         if not chunk:
-            raise ConnectionError("connection closed before expected bytes were received")
+            raise ConnectionError(
+                "connection closed before expected bytes were received"
+            )
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -80,7 +84,9 @@ def _goal_spec_from_result(result: dict, detections: list[Detection]) -> GoalSpe
 
     goal_detection = detections[goal_index]
     obstacle_bboxes = [d.bbox_norm for i, d in enumerate(detections) if i != goal_index]
-    instruction_text = f"Navigate to the {goal_detection.class_name} target while avoiding obstacles."
+    instruction_text = (
+        f"Navigate to the {goal_detection.class_name} target while avoiding obstacles."
+    )
     if reasoning:
         instruction_text += f" ({reasoning})"
 
@@ -96,7 +102,9 @@ def select_goal(rgb: np.ndarray, detections: list[Detection]) -> GoalSpec:
     return _goal_spec_from_result(result, detections)
 
 
-def select_goal_verbose(rgb: np.ndarray, detections: list[Detection]) -> tuple[GoalSpec, dict]:
+def select_goal_verbose(
+    rgb: np.ndarray, detections: list[Detection]
+) -> tuple[GoalSpec, dict]:
     """Same as select_goal, but also returns the raw VLM result dict (goal_index, reasoning) for logging."""
     result = _select_goal_result(rgb, detections)
     return _goal_spec_from_result(result, detections), result
@@ -107,7 +115,9 @@ def describe_goal_vocabulary(rgb: np.ndarray) -> tuple[list[str], str]:
     detection as the goal, asks Qwen for a small open-vocabulary set of
     goal-worthy terms (seeds SAM3's per-term prompts and CLIP's text bank)
     plus one instruction sentence covering all of them."""
-    response = _send_request("describe_goal_vocabulary", {"image_b64": _encode_image(rgb)})
+    response = _send_request(
+        "describe_goal_vocabulary", {"image_b64": _encode_image(rgb)}
+    )
     if "error" in response:
         raise ValueError(f"describe_goal_vocabulary failed: {response['error']}")
     result = response["result"]
@@ -137,7 +147,9 @@ def drive_action(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> Action
     )
 
 
-def drive_action_verbose(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> tuple[Action, dict]:
+def drive_action_verbose(
+    rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int
+) -> tuple[Action, dict]:
     """Same as drive_action, but also returns the raw VLM result dict for logging."""
     result = _drive_action_result(rgb, goal_spec, frame_idx)
     action = Action(
@@ -148,7 +160,9 @@ def drive_action_verbose(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -
     return action, result
 
 
-def _drive_direction_result(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> dict:
+def _drive_direction_result(
+    rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int
+) -> dict:
     response = _send_request(
         "drive_direction",
         {
@@ -162,7 +176,9 @@ def _drive_direction_result(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int
     return response["result"]
 
 
-def drive_direction_verbose(rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int) -> tuple[str, dict]:
+def drive_direction_verbose(
+    rgb: np.ndarray, goal_spec: GoalSpec, frame_idx: int
+) -> tuple[str, dict]:
     """Query the VLA for a single discrete direction (one of
     qwen_response_parser.DIRECTIONS) instead of a free continuous action, and
     return it alongside the raw VLM result dict for logging. `rgb` is expected
@@ -178,7 +194,9 @@ if __name__ == "__main__":
 
     from PIL import Image
 
-    image_path = sys.argv[1] if len(sys.argv) > 1 else "marsyard2022_terrain_texture.png"
+    image_path = (
+        sys.argv[1] if len(sys.argv) > 1 else "marsyard2022_terrain_texture.png"
+    )
     rgb = np.array(Image.open(image_path).convert("RGB"))
 
     dummy_detections = [

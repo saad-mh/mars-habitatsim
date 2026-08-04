@@ -19,9 +19,7 @@ def _detect(rgb: np.ndarray) -> list[Detection]:
     )
 
     if not detections:
-        raise RuntimeError(
-            "no detections found on first frame — cannot resolve a goal"
-        )
+        raise RuntimeError("no detections found on first frame — cannot resolve a goal")
     return detections
 
 

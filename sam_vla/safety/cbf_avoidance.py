@@ -75,7 +75,10 @@ class CbfObstacleAvoidance:
         obstacle_radius: float = 0.25,
         max_yaw_rate: float = 1.0,
     ):
-        from navdp.extensions import nearest_obstacle_point, project_forward_velocity_cbf
+        from navdp.extensions import (
+            nearest_obstacle_point,
+            project_forward_velocity_cbf,
+        )
 
         self._nearest_obstacle_point = nearest_obstacle_point
         self._project_forward_velocity_cbf = project_forward_velocity_cbf
@@ -91,9 +94,13 @@ class CbfObstacleAvoidance:
         self.hard_gate = bool(hard_gate)
         # Physical collision radius (obstacle + rover + margin); the orbit hugs the
         # larger d_safe circle, this smaller radius is only the hard-breach backstop.
-        self.r_cone = float(robot_radius) + float(safety_margin) + float(obstacle_radius)
+        self.r_cone = (
+            float(robot_radius) + float(safety_margin) + float(obstacle_radius)
+        )
         self.max_yaw_rate = float(max_yaw_rate)
-        self._around_side: Optional[float] = None  # committed orbit side (+1 left, -1 right)
+        self._around_side: Optional[float] = (
+            None  # committed orbit side (+1 left, -1 right)
+        )
 
     def nearest_obstacle(
         self, obstacle_mask: np.ndarray, depth: np.ndarray, intrinsics: dict
@@ -104,23 +111,36 @@ class CbfObstacleAvoidance:
             return None
         return self._nearest_obstacle_point(obstacle_mask, depth, intrinsics)
 
-    def is_blocked(self, obstacle_point: Optional[np.ndarray], goal_bearing: Optional[float]) -> bool:
+    def is_blocked(
+        self, obstacle_point: Optional[np.ndarray], goal_bearing: Optional[float]
+    ) -> bool:
         """Pure read of the blocked state (no side effects) -- lets a caller decide
         whether to run some OTHER steering behavior (e.g. lost-goal heading assist)
         before calling apply(), which recomputes the same thing and then acts on it."""
         blocked, _, _ = _blocked(
-            obstacle_point, goal_bearing, self.d_safe, self.deadzone, self.orbit_hyst,
+            obstacle_point,
+            goal_bearing,
+            self.d_safe,
+            self.deadzone,
+            self.orbit_hyst,
             self._around_side is not None,
         )
         return blocked
 
     def apply(
-        self, action: Action, obstacle_point: Optional[np.ndarray], goal_bearing: Optional[float]
+        self,
+        action: Action,
+        obstacle_point: Optional[np.ndarray],
+        goal_bearing: Optional[float],
     ) -> tuple[Action, dict]:
         info = {"blocked": False, "orbiting": False, "hard_gate_fired": False}
         r_gate = self.d_safe
         blocked, L, phi = _blocked(
-            obstacle_point, goal_bearing, r_gate, self.deadzone, self.orbit_hyst,
+            obstacle_point,
+            goal_bearing,
+            r_gate,
+            self.deadzone,
+            self.orbit_hyst,
             self._around_side is not None,
         )
         info["blocked"] = blocked
@@ -137,11 +157,15 @@ class CbfObstacleAvoidance:
                 self._around_side = 1.0 if dl <= dr else -1.0
             corr = max(-1.2, min(1.2, self.orbit_kr * (L - r_gate)))
             psi = _wrap_angle(phi + self._around_side * (0.5 * math.pi - corr))
-            yaw_cmd = float(np.clip(self.pursuit_kp * psi, -self.max_yaw_rate, self.max_yaw_rate))
+            yaw_cmd = float(
+                np.clip(self.pursuit_kp * psi, -self.max_yaw_rate, self.max_yaw_rate)
+            )
             out = Action(v_fwd=self.goaround_forward, v_lat=0.0, yaw_rate=yaw_cmd)
             info["orbiting"] = True
         elif self._around_side is not None:
-            self._around_side = None  # obstacle no longer blocks the goal ray -> release the side
+            self._around_side = (
+                None  # obstacle no longer blocks the goal ray -> release the side
+            )
 
         if self.hard_gate and obstacle_point is not None:
             p_fwd, p_lat = float(obstacle_point[0]), float(obstacle_point[1])
@@ -161,7 +185,9 @@ class CbfObstacleAvoidance:
                     trust=None,
                 )
                 if gated:
-                    out = Action(v_fwd=float(a_arr[0]), v_lat=out.v_lat, yaw_rate=out.yaw_rate)
+                    out = Action(
+                        v_fwd=float(a_arr[0]), v_lat=out.v_lat, yaw_rate=out.yaw_rate
+                    )
                     info["hard_gate_fired"] = True
 
         return out, info

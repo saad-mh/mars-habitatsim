@@ -40,7 +40,9 @@ _MODEL_PATH = os.environ.get("QWEN_ABLATION_MODEL_PATH", QWEN_ABLATION_MODEL_ID)
 _PORT = int(os.environ.get("QWEN_ABLATION_SERVER_PORT", _DEFAULT_PORT))
 
 
-def load_qwen_ablation_model(model_path: str = _MODEL_PATH, device: str = "cuda") -> tuple:
+def load_qwen_ablation_model(
+    model_path: str = _MODEL_PATH, device: str = "cuda"
+) -> tuple:
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -62,18 +64,25 @@ def run_qwen_ablation_inference(
     ]
     messages = [{"role": "user", "content": content}]
 
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[text], images=pil_images, padding=True, return_tensors="pt").to(
-        model.device
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
+    inputs = processor(
+        text=[text], images=pil_images, padding=True, return_tensors="pt"
+    ).to(model.device)
 
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        generated_ids = model.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=False
+        )
     generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        out_ids[len(in_ids) :]
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
     )
     return output_text[0]
 
@@ -84,7 +93,9 @@ def _recv_exact(conn: socket.socket, num_bytes: int) -> bytes:
     while remaining > 0:
         chunk = conn.recv(remaining)
         if not chunk:
-            raise ConnectionError("connection closed before expected bytes were received")
+            raise ConnectionError(
+                "connection closed before expected bytes were received"
+            )
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)

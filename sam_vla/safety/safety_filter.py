@@ -24,7 +24,9 @@ def clamp_velocity(
 if __name__ == "__main__":
     from sam_vla.core.types import Pose
 
-    obs = Observation(rgb=None, depth=None, pose=Pose(x=0.0, y=0.0, z=0.0, yaw=0.0), frame_idx=0)
+    obs = Observation(
+        rgb=None, depth=None, pose=Pose(x=0.0, y=0.0, z=0.0, yaw=0.0), frame_idx=0
+    )
     raw_action = Action(v_fwd=1.5, v_lat=-2.0, yaw_rate=3.0)
 
     filtered = filter(raw_action, obs)

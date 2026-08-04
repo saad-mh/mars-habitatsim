@@ -100,9 +100,7 @@ def _validate_bbox_norm(bbox: tuple[float, float, float, float], name: str) -> N
     x0, y0, x1, y1 = bbox
     for coord_name, coord in (("x0", x0), ("y0", y0), ("x1", x1), ("y1", y1)):
         if not (0.0 <= coord <= 1.0):
-            raise ValueError(
-                f"{name}: {coord_name}={coord!r} is out of range [0, 1]"
-            )
+            raise ValueError(f"{name}: {coord_name}={coord!r} is out of range [0, 1]")
     if x0 >= x1:
         raise ValueError(f"{name}: x0 ({x0!r}) must be < x1 ({x1!r})")
     if y0 >= y1:

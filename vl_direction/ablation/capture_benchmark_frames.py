@@ -83,8 +83,13 @@ def _project_obstacles(obstacles, x, y, z, yaw):
 
 def _make_obstacles():
     rng = np.random.default_rng(kbvl.OBSTACLE_SEED)
-    obstacle_xz = kbvl.make_obstacles(rng, kbvl.NUM_OBSTACLES, kbvl.OBSTACLE_SPAWN_HALF_EXTENT)
-    return [(ox, kb.terrain_height_at(ox, oz) + kbvl.OBSTACLE_RADIUS_M, oz) for ox, oz in obstacle_xz]
+    obstacle_xz = kbvl.make_obstacles(
+        rng, kbvl.NUM_OBSTACLES, kbvl.OBSTACLE_SPAWN_HALF_EXTENT
+    )
+    return [
+        (ox, kb.terrain_height_at(ox, oz) + kbvl.OBSTACLE_RADIUS_M, oz)
+        for ox, oz in obstacle_xz
+    ]
 
 
 def _build_scenarios(obstacles):
@@ -126,13 +131,18 @@ def _build_scenarios(obstacles):
             _circles, nearest_any, _nearest_visible = _project_obstacles(
                 obstacles, x, kb.terrain_height_at(x, z) + kb.INITIAL_CLEARANCE, z, 0.0
             )
-            edge_distance = nearest_any["edge_distance"] if nearest_any else float("inf")
+            edge_distance = (
+                nearest_any["edge_distance"] if nearest_any else float("inf")
+            )
             far_candidates.append((edge_distance, x, z))
     far_candidates.sort(key=lambda t: -t[0])
 
     needed_far = _NUM_EXPLORATION_FAR + _NUM_UNCERTAINTY
     chosen_far = far_candidates[:needed_far]
-    if len(chosen_far) < needed_far or chosen_far[-1][0] <= kbvl.CBF_DISTANCE_THRESHOLD_M:
+    if (
+        len(chosen_far) < needed_far
+        or chosen_far[-1][0] <= kbvl.CBF_DISTANCE_THRESHOLD_M
+    ):
         raise RuntimeError(
             f"could not find {needed_far} rover placements clear of every obstacle "
             f"(best candidates: {far_candidates[:needed_far]}); widen _FAR_CANDIDATE_COORDS"
@@ -145,12 +155,16 @@ def _build_scenarios(obstacles):
     for i in range(_NUM_EXPLORATION_FAR):
         _edge, x, z = chosen_far[i]
         yaw_deg = math.degrees(math.atan2(x, z))
-        scenarios.append({"label": f"exploration_far_{i}", "x": x, "z": z, "yaw_deg": yaw_deg})
+        scenarios.append(
+            {"label": f"exploration_far_{i}", "x": x, "z": z, "yaw_deg": yaw_deg}
+        )
 
     for i in range(_NUM_UNCERTAINTY):
         _edge, x, z = chosen_far[_NUM_EXPLORATION_FAR + i]
         yaw_deg = math.degrees(math.atan2(x, z))
-        scenarios.append({"label": f"uncertainty_{i}", "x": x, "z": z, "yaw_deg": yaw_deg})
+        scenarios.append(
+            {"label": f"uncertainty_{i}", "x": x, "z": z, "yaw_deg": yaw_deg}
+        )
 
     return scenarios
 
@@ -168,7 +182,10 @@ def capture():
     )
 
     scenarios = _build_scenarios(obstacles)
-    print(f"[capture_benchmark_frames] {len(scenarios)} scenarios: " + ", ".join(s["label"] for s in scenarios))
+    print(
+        f"[capture_benchmark_frames] {len(scenarios)} scenarios: "
+        + ", ".join(s["label"] for s in scenarios)
+    )
 
     manifest = []
     for scenario in scenarios:
@@ -184,7 +201,9 @@ def capture():
         obs = sim.get_sensor_observations()
         rgb, _depth_vis, _depth_rgb = kb.rgb_depth_from_obs(obs)
 
-        circles, nearest_any, nearest_visible = _project_obstacles(obstacles, x, y, z, yaw)
+        circles, nearest_any, nearest_visible = _project_obstacles(
+            obstacles, x, y, z, yaw
+        )
         annotated_rgb = kbvl.overlay_obstacles(rgb, circles)
 
         frame_path = OUT_DIR / f"{scenario['label']}.png"
@@ -195,8 +214,12 @@ def capture():
                 "label": scenario["label"],
                 "frame_file": frame_path.name,
                 "pose": {"x": x, "y": y, "z": z, "yaw_deg": scenario["yaw_deg"]},
-                "nearest_any_edge_distance_m": nearest_any["edge_distance"] if nearest_any else None,
-                "nearest_visible_bbox_xyxy": nearest_visible["bbox"] if nearest_visible else None,
+                "nearest_any_edge_distance_m": (
+                    nearest_any["edge_distance"] if nearest_any else None
+                ),
+                "nearest_visible_bbox_xyxy": (
+                    nearest_visible["bbox"] if nearest_visible else None
+                ),
                 "frame_wh": [kbvl._FRAME_W, kbvl._FRAME_H],
             }
         )
@@ -210,7 +233,9 @@ def capture():
         json.dump(manifest, f, indent=2)
 
     sim.close()
-    print(f"[capture_benchmark_frames] wrote {len(manifest)} frames + manifest to {OUT_DIR}")
+    print(
+        f"[capture_benchmark_frames] wrote {len(manifest)} frames + manifest to {OUT_DIR}"
+    )
 
 
 if __name__ == "__main__":

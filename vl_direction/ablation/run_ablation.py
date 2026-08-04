@@ -48,7 +48,9 @@ WARMUP_REPS = 1
 DEFAULT_MEASURED_REPS = 3
 GPU_TEARDOWN_POLL_S = 2.0
 GPU_TEARDOWN_MAX_WAIT_S = 30.0
-UNCERTAINTY_COVARIANCE_VALUE = 2.5  # arbitrary "well past threshold" value for the request-phase call
+UNCERTAINTY_COVARIANCE_VALUE = (
+    2.5  # arbitrary "well past threshold" value for the request-phase call
+)
 
 EPISODE_ID = f"vl-ablation-{int(time.time())}"
 
@@ -87,19 +89,28 @@ def _build_query_args(entry):
 
     mode = (
         "cbf"
-        if nearest_any_edge is not None and nearest_any_edge <= kbvl.CBF_DISTANCE_THRESHOLD_M
+        if nearest_any_edge is not None
+        and nearest_any_edge <= kbvl.CBF_DISTANCE_THRESHOLD_M
         else "exploration"
     )
     fallback_note = ""
 
     if mode == "cbf" and nearest_visible_bbox is not None:
-        context = CBFContext(bbox_xyxy=tuple(nearest_visible_bbox), frame_wh=tuple(entry["frame_wh"]))
+        context = CBFContext(
+            bbox_xyxy=tuple(nearest_visible_bbox), frame_wh=tuple(entry["frame_wh"])
+        )
     else:
         if mode == "cbf":
             fallback_note = " (nearest obstacle not in view, fell back to exploration)"
         mode = "exploration"
-        hint = f"nearest obstacle is {nearest_any_edge:.1f}m away" if nearest_any_edge is not None else None
-        context = ExplorationContext(task_str=kbvl.EXPLORATION_TASK_STR, vague_hint=hint)
+        hint = (
+            f"nearest obstacle is {nearest_any_edge:.1f}m away"
+            if nearest_any_edge is not None
+            else None
+        )
+        context = ExplorationContext(
+            task_str=kbvl.EXPLORATION_TASK_STR, vague_hint=hint
+        )
 
     return mode, context, fallback_note
 
@@ -122,18 +133,24 @@ def _wait_for_gpu_teardown(baseline_mib: int) -> int:
         if last <= baseline_mib + 512:  # small slack for driver bookkeeping
             return last
         time.sleep(GPU_TEARDOWN_POLL_S)
-    print(f"[run_ablation] warning: GPU memory still {last}MiB vs baseline {baseline_mib}MiB after teardown wait")
+    print(
+        f"[run_ablation] warning: GPU memory still {last}MiB vs baseline {baseline_mib}MiB after teardown wait"
+    )
     return last
 
 
 def _make_manager(spec):
     if spec.kind == "internvl":
         return InternVLServerManager(
-            port=ABLATION_INTERNVL_PORT, model_path=spec.model_path, startup_timeout=spec.startup_timeout_s
+            port=ABLATION_INTERNVL_PORT,
+            model_path=spec.model_path,
+            startup_timeout=spec.startup_timeout_s,
         )
     if spec.kind == "qwen":
         return QwenAblationServerManager(
-            port=ABLATION_QWEN_PORT, model_path=spec.model_path, startup_timeout=spec.startup_timeout_s
+            port=ABLATION_QWEN_PORT,
+            model_path=spec.model_path,
+            startup_timeout=spec.startup_timeout_s,
         )
     raise ValueError(f"unknown ModelSpec.kind {spec.kind!r}")
 
@@ -151,13 +168,24 @@ def _run_one_model(spec, scenarios, measured_reps, raw_rows):
         except Exception as e:
             print(f"[run_ablation] {spec.name}: FAILED to start -- {e}")
             raw_rows.append(
-                {"model": spec.name, "scenario": "", "mode": "", "rep": -1, "latency_ms": "", "parse_ok": "", "direction": "", "raw_response": f"START FAILED: {e}"}
+                {
+                    "model": spec.name,
+                    "scenario": "",
+                    "mode": "",
+                    "rep": -1,
+                    "latency_ms": "",
+                    "parse_ok": "",
+                    "direction": "",
+                    "raw_response": f"START FAILED: {e}",
+                }
             )
             return None
         load_time_s = time.monotonic() - t0
         post_load_mib = _gpu_memory_used_mib()
         vram_delta_mib = post_load_mib - baseline_mib
-        print(f"[run_ablation] {spec.name}: loaded in {load_time_s:.1f}s, +{vram_delta_mib}MiB GPU")
+        print(
+            f"[run_ablation] {spec.name}: loaded in {load_time_s:.1f}s, +{vram_delta_mib}MiB GPU"
+        )
 
         client = InternVLSocketClient(host="127.0.0.1", port=manager.port)
 
@@ -174,7 +202,11 @@ def _run_one_model(spec, scenarios, measured_reps, raw_rows):
                         "rep": -1 if is_warmup else rep - WARMUP_REPS,
                         "latency_ms": result.latency_ms,
                         "parse_ok": result.parse_ok,
-                        "direction": result.direction.value if result.direction is not None else "",
+                        "direction": (
+                            result.direction.value
+                            if result.direction is not None
+                            else ""
+                        ),
                         "raw_response": result.raw_response + fallback_note,
                     }
                 except Exception as e:
@@ -195,7 +227,11 @@ def _run_one_model(spec, scenarios, measured_reps, raw_rows):
                     f"{row['direction'] or 'NONE'} -> {row['latency_ms']} -> {row['raw_response']!r}"
                 )
 
-        result_meta = {"name": spec.name, "load_time_s": load_time_s, "vram_delta_mib": vram_delta_mib}
+        result_meta = {
+            "name": spec.name,
+            "load_time_s": load_time_s,
+            "vram_delta_mib": vram_delta_mib,
+        }
     finally:
         # Always torn down, even if manager.start() itself raised (e.g. a
         # timed-out download/load) -- start() sets _owns_process=True right
@@ -215,7 +251,9 @@ def _summarize(raw_rows, model_meta):
 
     summary = []
     for model_name, rows in by_model.items():
-        latencies = [r["latency_ms"] for r in rows if isinstance(r["latency_ms"], (int, float))]
+        latencies = [
+            r["latency_ms"] for r in rows if isinstance(r["latency_ms"], (int, float))
+        ]
         parse_oks = [r["parse_ok"] for r in rows if r["parse_ok"] in (True, False)]
         meta = model_meta.get(model_name, {})
         summary.append(
@@ -223,10 +261,18 @@ def _summarize(raw_rows, model_meta):
                 "model": model_name,
                 "n_calls": len(rows),
                 "n_ok": sum(1 for p in parse_oks if p),
-                "parse_success_rate": (sum(1 for p in parse_oks if p) / len(parse_oks)) if parse_oks else 0.0,
+                "parse_success_rate": (
+                    (sum(1 for p in parse_oks if p) / len(parse_oks))
+                    if parse_oks
+                    else 0.0
+                ),
                 "latency_mean_ms": statistics.mean(latencies) if latencies else None,
                 "latency_p50_ms": statistics.median(latencies) if latencies else None,
-                "latency_p95_ms": (sorted(latencies)[int(0.95 * (len(latencies) - 1))] if latencies else None),
+                "latency_p95_ms": (
+                    sorted(latencies)[int(0.95 * (len(latencies) - 1))]
+                    if latencies
+                    else None
+                ),
                 "load_time_s": meta.get("load_time_s"),
                 "vram_delta_mib": meta.get("vram_delta_mib"),
             }
@@ -236,9 +282,17 @@ def _summarize(raw_rows, model_meta):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--reps", type=int, default=DEFAULT_MEASURED_REPS, help="measured reps per scenario")
     parser.add_argument(
-        "--models", nargs="*", default=None, help="subset of ModelSpec.name values to run (default: all)"
+        "--reps",
+        type=int,
+        default=DEFAULT_MEASURED_REPS,
+        help="measured reps per scenario",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="*",
+        default=None,
+        help="subset of ModelSpec.name values to run (default: all)",
     )
     args = parser.parse_args()
 
@@ -251,19 +305,38 @@ def main():
         specs = [s for s in specs if s.name in wanted]
         missing = wanted - {s.name for s in specs}
         if missing:
-            raise ValueError(f"unknown model name(s): {missing}; available: {[s.name for s in MODEL_SPECS]}")
+            raise ValueError(
+                f"unknown model name(s): {missing}; available: {[s.name for s in MODEL_SPECS]}"
+            )
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = int(time.time())
     raw_path = RESULTS_DIR / f"ablation_raw_{timestamp}.csv"
     summary_path = RESULTS_DIR / f"ablation_summary_{timestamp}.csv"
-    raw_fieldnames = ["model", "scenario", "mode", "rep", "latency_ms", "parse_ok", "direction", "raw_response"]
-    summary_fieldnames = [
-        "model", "n_calls", "n_ok", "parse_success_rate",
-        "latency_mean_ms", "latency_p50_ms", "latency_p95_ms",
-        "load_time_s", "vram_delta_mib",
+    raw_fieldnames = [
+        "model",
+        "scenario",
+        "mode",
+        "rep",
+        "latency_ms",
+        "parse_ok",
+        "direction",
+        "raw_response",
     ]
-    print(f"[run_ablation] writing incrementally to {raw_path} and {summary_path} as each model finishes")
+    summary_fieldnames = [
+        "model",
+        "n_calls",
+        "n_ok",
+        "parse_success_rate",
+        "latency_mean_ms",
+        "latency_p50_ms",
+        "latency_p95_ms",
+        "load_time_s",
+        "vram_delta_mib",
+    ]
+    print(
+        f"[run_ablation] writing incrementally to {raw_path} and {summary_path} as each model finishes"
+    )
 
     raw_rows = []
     model_meta = {}
@@ -292,7 +365,9 @@ def main():
             writer.writerows(summary)
 
         print(f"[run_ablation] {spec.name} done -- updated {summary_path.name}")
-        print(f"{'model':<24} {'parse%':>7} {'mean_ms':>9} {'p50_ms':>8} {'p95_ms':>8} {'load_s':>7} {'vram_MiB':>9}")
+        print(
+            f"{'model':<24} {'parse%':>7} {'mean_ms':>9} {'p50_ms':>8} {'p95_ms':>8} {'load_s':>7} {'vram_MiB':>9}"
+        )
         for row in summary:
             print(
                 f"{row['model']:<24} "

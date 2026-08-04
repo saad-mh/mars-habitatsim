@@ -106,7 +106,11 @@ def synthesize_window(
 
 
 def build_predictor(
-    version: str, checkpoint_path: str | None, compile_: bool, num_objects: int, use_fa3: bool
+    version: str,
+    checkpoint_path: str | None,
+    compile_: bool,
+    num_objects: int,
+    use_fa3: bool,
 ):
     from sam3 import build_sam3_predictor
 
@@ -121,10 +125,14 @@ def build_predictor(
     return build_sam3_predictor(**build_kwargs)
 
 
-def run_one_window(predictor, window_dir: str, vocab_terms: list[str], output_prob_thresh: float):
+def run_one_window(
+    predictor, window_dir: str, vocab_terms: list[str], output_prob_thresh: float
+):
     """One batched-re-window cycle. Returns (total_latency_s, breakdown_dict, num_masks_last_frame)."""
     t_open0 = time.perf_counter()
-    resp = predictor.handle_request({"type": "start_session", "resource_path": window_dir})
+    resp = predictor.handle_request(
+        {"type": "start_session", "resource_path": window_dir}
+    )
     session_id = resp["session_id"]
     t_open1 = time.perf_counter()
 
@@ -172,16 +180,24 @@ def run_one_window(predictor, window_dir: str, vocab_terms: list[str], output_pr
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SAM3 batched re-window spike/benchmark")
+    parser = argparse.ArgumentParser(
+        description="SAM3 batched re-window spike/benchmark"
+    )
     parser.add_argument("--version", choices=["sam3", "sam3.1"], default="sam3.1")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--window-frames", type=int, nargs="+", default=[5, 10, 20, 30])
-    parser.add_argument("--trials", type=int, default=5, help="timed trials per window size")
+    parser.add_argument(
+        "--trials", type=int, default=5, help="timed trials per window size"
+    )
     parser.add_argument("--warmup-trials", type=int, default=2)
     parser.add_argument("--width", type=int, default=RGB_WIDTH)
     parser.add_argument("--height", type=int, default=RGB_HEIGHT)
-    parser.add_argument("--num-small", type=int, default=2, help="small-rock stand-in circles")
-    parser.add_argument("--num-big", type=int, default=2, help="big-rock stand-in circles")
+    parser.add_argument(
+        "--num-small", type=int, default=2, help="small-rock stand-in circles"
+    )
+    parser.add_argument(
+        "--num-big", type=int, default=2, help="big-rock stand-in circles"
+    )
     parser.add_argument("--small-radius", type=int, default=15)
     parser.add_argument("--big-radius", type=int, default=45)
     parser.add_argument("--speed", type=int, default=15)
@@ -245,7 +261,12 @@ def main():
             run_one_window(predictor, window_dir, vocab_terms, args.output_prob_thresh)
 
         latencies = []
-        breakdown_sum = {"open_s": 0.0, "prompt_s": 0.0, "propagate_s": 0.0, "close_s": 0.0}
+        breakdown_sum = {
+            "open_s": 0.0,
+            "prompt_s": 0.0,
+            "propagate_s": 0.0,
+            "close_s": 0.0,
+        }
         last_num_masks = 0
         for _ in range(args.trials):
             latency, breakdown, last_num_masks = run_one_window(

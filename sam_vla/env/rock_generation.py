@@ -37,9 +37,11 @@ class RockFieldConfig:
     num_rocks: int = 12
     radius_min: float = 0.25
     radius_max: float = 0.7
-    min_spacing: float = 0.4          # extra clearance kept between rock surfaces
-    boundary_margin: float = 2.0      # keep every rock's edge this far from the scene bound
-    exclude_zones: List[ExcludeZone] = field(default_factory=list)  # e.g. spawn keep-out
+    min_spacing: float = 0.4  # extra clearance kept between rock surfaces
+    boundary_margin: float = 2.0  # keep every rock's edge this far from the scene bound
+    exclude_zones: List[ExcludeZone] = field(
+        default_factory=list
+    )  # e.g. spawn keep-out
     max_attempts_per_rock: int = 300
 
 
@@ -55,7 +57,11 @@ class RockSpec:
 
 
 def _make_rock_mesh(
-    rng: random.Random, radius: float, segments: int = 10, rings: int = 6, jitter: float = 0.28
+    rng: random.Random,
+    radius: float,
+    segments: int = 10,
+    rings: int = 6,
+    jitter: float = 0.28,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """A low-poly, irregular rock: a UV-sphere with per-vertex radial jitter and a
     vertical squash, centered at the origin with its lowest vertex at y=0 -- so
@@ -69,7 +75,13 @@ def _make_rock_mesh(
         for seg in range(segments):
             theta = 2.0 * math.pi * seg / segments
             jitter_scale = 1.0 + rng.uniform(-jitter, jitter)
-            verts.append((ring_r * math.cos(theta) * jitter_scale, y * jitter_scale, ring_r * math.sin(theta) * jitter_scale))
+            verts.append(
+                (
+                    ring_r * math.cos(theta) * jitter_scale,
+                    y * jitter_scale,
+                    ring_r * math.sin(theta) * jitter_scale,
+                )
+            )
     verts = np.asarray(verts, dtype=np.float64)
     verts[:, 1] *= squash
     verts *= radius
@@ -93,25 +105,36 @@ _ROCK_COLOR_JITTER = 0.0  # per-channel +/- jitter so rocks aren't a flat, unifo
 
 def _rock_diffuse_color(rng: random.Random) -> Tuple[float, float, float]:
     return tuple(
-        min(1.0, max(0.0, c + rng.uniform(-_ROCK_COLOR_JITTER, _ROCK_COLOR_JITTER))) for c in _ROCK_BASE_RGB
+        min(1.0, max(0.0, c + rng.uniform(-_ROCK_COLOR_JITTER, _ROCK_COLOR_JITTER)))
+        for c in _ROCK_BASE_RGB
     )
 
 
-def _too_close(x: float, z: float, r: float, placed: Sequence[Tuple[float, float, float]], min_spacing: float) -> bool:
+def _too_close(
+    x: float,
+    z: float,
+    r: float,
+    placed: Sequence[Tuple[float, float, float]],
+    min_spacing: float,
+) -> bool:
     for px, pz, pr in placed:
         if math.hypot(x - px, z - pz) < (r + pr + min_spacing):
             return True
     return False
 
 
-def _in_exclude_zone(x: float, z: float, r: float, exclude_zones: Sequence[ExcludeZone]) -> bool:
+def _in_exclude_zone(
+    x: float, z: float, r: float, exclude_zones: Sequence[ExcludeZone]
+) -> bool:
     for ex, ez, er in exclude_zones:
         if math.hypot(x - ex, z - ez) < (er + r):
             return True
     return False
 
 
-def generate_rock_field(config: RockFieldConfig, terrain: Terrain, out_dir: Path) -> List[RockSpec]:
+def generate_rock_field(
+    config: RockFieldConfig, terrain: Terrain, out_dir: Path
+) -> List[RockSpec]:
     """Rejection-sample `config.num_rocks` non-overlapping rocks within the scene
     bounds, each dropped onto the terrain height under it, and write each one's
     already-placed mesh to `out_dir/rocks/rock_NNN.obj`. Deterministic given
@@ -144,7 +167,9 @@ def generate_rock_field(config: RockFieldConfig, terrain: Terrain, out_dir: Path
             break
 
         if placement is None:
-            print(f"[rocks] WARN could not place rock {i} after {config.max_attempts_per_rock} attempts; skipping")
+            print(
+                f"[rocks] WARN could not place rock {i} after {config.max_attempts_per_rock} attempts; skipping"
+            )
             continue
 
         x, z, radius = placement
@@ -164,12 +189,18 @@ def generate_rock_field(config: RockFieldConfig, terrain: Terrain, out_dir: Path
         save_obj(str(mesh_path), world, faces, diffuse_rgb=_rock_diffuse_color(rng))
 
         placed.append((x, z, radius))
-        rocks.append(RockSpec(id=i, x=x, y=y, z=z, yaw=yaw, radius=radius, mesh_path=str(mesh_path)))
+        rocks.append(
+            RockSpec(
+                id=i, x=x, y=y, z=z, yaw=yaw, radius=radius, mesh_path=str(mesh_path)
+            )
+        )
 
     return rocks
 
 
-def save_rock_field(rocks: Sequence[RockSpec], config: RockFieldConfig, path: Path) -> None:
+def save_rock_field(
+    rocks: Sequence[RockSpec], config: RockFieldConfig, path: Path
+) -> None:
     payload = {"config": asdict(config), "rocks": [asdict(r) for r in rocks]}
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(payload, indent=2))
@@ -181,11 +212,15 @@ def load_rock_field(path: Path) -> Tuple[List[RockSpec], RockFieldConfig]:
     rocks = [RockSpec(**r) for r in payload["rocks"]]
     for rock in rocks:
         if not Path(rock.mesh_path).exists():
-            raise FileNotFoundError(f"rock field manifest {path} references missing mesh {rock.mesh_path}")
+            raise FileNotFoundError(
+                f"rock field manifest {path} references missing mesh {rock.mesh_path}"
+            )
     return rocks, config
 
 
-def register_rocks(sim, rocks: Sequence[RockSpec], semantic_id: int = ROCK_SEMANTIC_ID) -> List:
+def register_rocks(
+    sim, rocks: Sequence[RockSpec], semantic_id: int = ROCK_SEMANTIC_ID
+) -> List:
     """Add every rock's already-placed mesh into the sim as a render-only,
     non-collidable object (physics is disabled scene-wide; obstacle avoidance
     reads the semantic mask + depth, not physics collisions). All rocks share
@@ -202,8 +237,12 @@ if __name__ == "__main__":
     from sam_vla.env.terrain import HeightmapGrid
 
     HERE = Path(__file__).resolve().parent.parent.parent
-    ap = argparse.ArgumentParser(description="Generate a seeded, non-overlapping rock field on the Mars terrain.")
-    ap.add_argument("--heightmap", default=str(HERE / "marsyard2022_terrain_hm_1025.tif"))
+    ap = argparse.ArgumentParser(
+        description="Generate a seeded, non-overlapping rock field on the Mars terrain."
+    )
+    ap.add_argument(
+        "--heightmap", default=str(HERE / "marsyard2022_terrain_hm_1025.tif")
+    )
     ap.add_argument("--out-dir", default=str(HERE / "rock_envs" / "default"))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--num-rocks", type=int, default=12)

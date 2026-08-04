@@ -39,9 +39,7 @@ def filter_run(run_dir: Path, dry_run: bool = False) -> Tuple[int, int]:
             spot_check_path.unlink()
 
     if not dry_run:
-        jsonl_path.write_text(
-            "".join(json.dumps(rec) + "\n" for rec in kept)
-        )
+        jsonl_path.write_text("".join(json.dumps(rec) + "\n" for rec in kept))
         summary_path = run_dir / "summary.json"
         if summary_path.exists():
             summary = json.loads(summary_path.read_text())

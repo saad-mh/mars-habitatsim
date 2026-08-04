@@ -48,7 +48,9 @@ def compute_multi_goal_metrics(logs: List[MultiEpisodeLog]) -> Dict[str, float]:
                 err = mu - true_goal
                 var = np.clip(sigma_diag, _MIN_VAR, None)
 
-                (err_visible if visible else err_occluded).append(float(np.linalg.norm(err)))
+                (err_visible if visible else err_occluded).append(
+                    float(np.linalg.norm(err))
+                )
 
                 nll = 0.5 * np.sum(err**2 / var + np.log(var))
                 nll_terms.append(float(nll))
@@ -71,12 +73,17 @@ def compute_multi_goal_metrics(logs: List[MultiEpisodeLog]) -> Dict[str, float]:
     coverage_2sigma = float(np.mean(hit_2sigma)) if hit_2sigma else float("nan")
 
     return {
-        "mean_err_visible": float(np.mean(err_visible)) if err_visible else float("nan"),
-        "mean_err_occluded": float(np.mean(err_occluded)) if err_occluded else float("nan"),
+        "mean_err_visible": (
+            float(np.mean(err_visible)) if err_visible else float("nan")
+        ),
+        "mean_err_occluded": (
+            float(np.mean(err_occluded)) if err_occluded else float("nan")
+        ),
         "calibration_nll": float(np.mean(nll_terms)) if nll_terms else float("nan"),
         "coverage_1sigma": coverage_1sigma,
         "coverage_2sigma": coverage_2sigma,
-        "coverage_deviation": abs(coverage_1sigma - _NOMINAL_1SIGMA) + abs(coverage_2sigma - _NOMINAL_2SIGMA),
+        "coverage_deviation": abs(coverage_1sigma - _NOMINAL_1SIGMA)
+        + abs(coverage_2sigma - _NOMINAL_2SIGMA),
         "completion_rate": n_finished / n_episodes,
         "mean_steps_per_leg": float(np.mean(leg_steps)) if leg_steps else float("nan"),
         "n_episodes": float(n_episodes),

@@ -62,7 +62,9 @@ class ClipGoalClassifier:
         crop's raw CLIP image embedding (stored on TrackedGoal for later
         match_or_mint re-ID calls).
         """
-        image_input = self.preprocess(Image.fromarray(crop)).unsqueeze(0).to(self.device)
+        image_input = (
+            self.preprocess(Image.fromarray(crop)).unsqueeze(0).to(self.device)
+        )
         with torch.no_grad():
             image_features = self.model.encode_image(image_input)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -89,7 +91,9 @@ class ClipGoalClassifier:
         best_goal_id = None
         best_sim = -1.0
         for goal_id, goal in tracked_goals.items():
-            other_norm = goal.clip_embedding / (np.linalg.norm(goal.clip_embedding) + 1e-8)
+            other_norm = goal.clip_embedding / (
+                np.linalg.norm(goal.clip_embedding) + 1e-8
+            )
             sim = float(np.dot(emb_norm, other_norm))
             if sim > best_sim:
                 best_sim = sim

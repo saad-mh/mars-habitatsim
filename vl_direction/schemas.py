@@ -80,8 +80,13 @@ class HeadingResponse:
         if self.angle_deg is None and self.angle_range_deg is None:
             raise ValueError("HeadingResponse requires angle_deg or angle_range_deg")
         if self.angle_deg is not None and self.angle_range_deg is not None:
-            raise ValueError("HeadingResponse: supply angle_deg OR angle_range_deg, not both")
-        if self.angle_range_deg is not None and self.angle_range_deg[0] >= self.angle_range_deg[1]:
+            raise ValueError(
+                "HeadingResponse: supply angle_deg OR angle_range_deg, not both"
+            )
+        if (
+            self.angle_range_deg is not None
+            and self.angle_range_deg[0] >= self.angle_range_deg[1]
+        ):
             raise ValueError(
                 f"HeadingResponse.angle_range_deg must be (low, high) with low < high, "
                 f"got {self.angle_range_deg!r}"
@@ -105,7 +110,9 @@ class UncertaintyContext:
         if self.human_heading_response is not None:
             self.human_heading_response.validate()
         if self.attempt < 0:
-            raise ValueError(f"UncertaintyContext.attempt must be >= 0, got {self.attempt!r}")
+            raise ValueError(
+                f"UncertaintyContext.attempt must be >= 0, got {self.attempt!r}"
+            )
 
 
 @dataclass
@@ -135,17 +142,25 @@ class VLDirectiveResult:
 
     def validate(self) -> None:
         if not (0.0 <= self.confidence <= 1.0):
-            raise ValueError(f"VLDirectiveResult.confidence must be in [0, 1], got {self.confidence!r}")
+            raise ValueError(
+                f"VLDirectiveResult.confidence must be in [0, 1], got {self.confidence!r}"
+            )
         is_uncertainty = self.identity_token == IdentityToken.UNCERTAINTY
         if is_uncertainty:
             if self.direction is not None:
-                raise ValueError("VLDirectiveResult.direction must be None for uncertainty mode")
+                raise ValueError(
+                    "VLDirectiveResult.direction must be None for uncertainty mode"
+                )
             if self.uncertainty_payload is None:
-                raise ValueError("VLDirectiveResult.uncertainty_payload must be set for uncertainty mode")
+                raise ValueError(
+                    "VLDirectiveResult.uncertainty_payload must be set for uncertainty mode"
+                )
         else:
             if self.uncertainty_payload is not None:
                 raise ValueError(
                     f"VLDirectiveResult.uncertainty_payload must be None for {self.identity_token!r} mode"
                 )
             if self.parse_ok and self.direction is None:
-                raise ValueError("VLDirectiveResult.direction must be set when parse_ok is True")
+                raise ValueError(
+                    "VLDirectiveResult.direction must be set when parse_ok is True"
+                )

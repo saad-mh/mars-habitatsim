@@ -119,7 +119,11 @@ if __name__ == "__main__":
         print(f"caught ValueError: {e}")
 
     print("\n parsed direction:")
-    print(parse_direction_response('{"direction": "turn_left", "reasoning": "goal is left"}'))
+    print(
+        parse_direction_response(
+            '{"direction": "turn_left", "reasoning": "goal is left"}'
+        )
+    )
 
     print("\n invalid direction:")
     try:

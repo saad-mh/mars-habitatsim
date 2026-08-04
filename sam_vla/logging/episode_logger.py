@@ -109,7 +109,9 @@ class EpisodeLogger:
     # -- internal -----------------------------------------------------------
 
     def _write_json_now(self, filename: str, obj: Dict[str, Any]) -> None:
-        (self.run_dir / filename).write_text(json.dumps(obj, indent=2, default=_json_default))
+        (self.run_dir / filename).write_text(
+            json.dumps(obj, indent=2, default=_json_default)
+        )
 
     def _elapsed(self) -> float:
         return time.monotonic() - self._start_monotonic
@@ -150,7 +152,9 @@ class EpisodeLogger:
             except Exception as e:  # pragma: no cover - best-effort side channel
                 print(f"EpisodeLogger: failed to save frame {step}: {e}")
             return
-        self._files[kind].write(json.dumps(payload, separators=(",", ":"), default=_json_default) + "\n")
+        self._files[kind].write(
+            json.dumps(payload, separators=(",", ":"), default=_json_default) + "\n"
+        )
 
     def _flush_all(self) -> None:
         for fh in self._files.values():
@@ -323,10 +327,12 @@ class EpisodeLogger:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if not self._closed:
-            self.finalize({
-                "success": False,
-                "termination_reason": "exception" if exc_type else "unfinalized",
-            })
+            self.finalize(
+                {
+                    "success": False,
+                    "termination_reason": "exception" if exc_type else "unfinalized",
+                }
+            )
         return False
 
 
@@ -355,15 +361,23 @@ if __name__ == "__main__":
         logger = EpisodeLogger(run_id, config, log_root=tmp_root, save_frames=False)
 
         obstacles = [
-            {"id": f"rock_{i:02d}", "position": [float(i * 2), 0.0, float(i)],
-             "orientation": [0.0, 0.0, 0.0, 1.0], "radius": 0.4, "is_goal": (i == 3)}
+            {
+                "id": f"rock_{i:02d}",
+                "position": [float(i * 2), 0.0, float(i)],
+                "orientation": [0.0, 0.0, 0.0, 1.0],
+                "radius": 0.4,
+                "is_goal": (i == 3),
+            }
             for i in range(5)
         ]
         logger.write_obstacles(obstacles, goal_id="rock_03")
 
         for step in range(20):
             dist_to_goal = max(0.1, 10.0 - step * 0.5)
-            distances = {o["id"]: max(0.2, 5.0 - abs(step - i * 2) * 0.3) for i, o in enumerate(obstacles)}
+            distances = {
+                o["id"]: max(0.2, 5.0 - abs(step - i * 2) * 0.3)
+                for i, o in enumerate(obstacles)
+            }
             near_obstacle = min(distances.values()) < 2.0
             cbf_active = near_obstacle and step % 3 == 0
 
@@ -374,7 +388,11 @@ if __name__ == "__main__":
                 action={"v": 0.3, "w": 0.1 if step % 4 else -0.1},
                 distances_to_obstacles=distances,
                 cbf_active=cbf_active,
-                goal_belief={"range": dist_to_goal, "bearing": 12.5 - step, "source": "observed"},
+                goal_belief={
+                    "range": dist_to_goal,
+                    "bearing": 12.5 - step,
+                    "source": "observed",
+                },
             )
 
             if cbf_active:
@@ -395,15 +413,22 @@ if __name__ == "__main__":
                     step=step,
                     query_type="action_suggestion",
                     trigger="goal_proximity",
-                    input_data={"goal_belief": {"range": dist_to_goal, "bearing": 12.5 - step}},
-                    output_data={"action": "forward", "reasoning": "goal roughly ahead"},
+                    input_data={
+                        "goal_belief": {"range": dist_to_goal, "bearing": 12.5 - step}
+                    },
+                    output_data={
+                        "action": "forward",
+                        "reasoning": "goal roughly ahead",
+                    },
                     latency_ms=(time.monotonic() - t0) * 1000.0,
                 )
 
-        summary = logger.finalize({
-            "success": True,
-            "termination_reason": "goal_reached",
-        })
+        summary = logger.finalize(
+            {
+                "success": True,
+                "termination_reason": "goal_reached",
+            }
+        )
         print("summary:", json.dumps(summary, indent=2))
 
         run_dir = Path(tmp_root) / run_id
@@ -416,7 +441,9 @@ if __name__ == "__main__":
         assert (run_dir / "summary.json").exists()
         with open(run_dir / "frames.jsonl") as f:
             frame_lines = f.readlines()
-        assert len(frame_lines) == 20, f"expected 20 frame lines, got {len(frame_lines)}"
+        assert (
+            len(frame_lines) == 20
+        ), f"expected 20 frame lines, got {len(frame_lines)}"
         json.loads(frame_lines[0])  # each line parses independently
         print("\nOK: all files present, frames.jsonl has 20 well-formed lines.")
     finally:

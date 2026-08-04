@@ -69,7 +69,9 @@ def run_multi_episode(
     true_goals: Dict[str, np.ndarray] = {}
     occlusions: Dict[str, _OcclusionProcess] = {}
     for gid in goal_ids:
-        bearing0 = math.radians(rng.uniform(-env_cfg.bearing0_deg, env_cfg.bearing0_deg))
+        bearing0 = math.radians(
+            rng.uniform(-env_cfg.bearing0_deg, env_cfg.bearing0_deg)
+        )
         range0 = float(rng.uniform(*env_cfg.range0))
         true_goals[gid] = np.array(
             [range0 * math.cos(bearing0), range0 * math.sin(bearing0)], dtype=np.float32
@@ -104,8 +106,14 @@ def run_multi_episode(
             visible = occlusions[gid].step()
             visible_this_step[gid] = visible
             if visible:
-                noise = rng.normal(0.0, env_cfg.obs_noise_std, size=2).astype(np.float32)
-                obs[gid] = {"visible": True, "position": true_goals[gid] + noise, "confidence": 1.0}
+                noise = rng.normal(0.0, env_cfg.obs_noise_std, size=2).astype(
+                    np.float32
+                )
+                obs[gid] = {
+                    "visible": True,
+                    "position": true_goals[gid] + noise,
+                    "confidence": 1.0,
+                }
             else:
                 obs[gid] = {"visible": False, "position": None, "confidence": 0.0}
 
@@ -114,14 +122,24 @@ def run_multi_episode(
 
         log.t.append(t)
         log.true_goals.append({gid: true_goals[gid].copy() for gid in goal_ids})
-        log.mu.append({gid: np.asarray(bank.get(gid).mu[:2], dtype=np.float32).copy() for gid in goal_ids})
-        log.sigma_diag.append(
+        log.mu.append(
             {
-                gid: np.array([bank.get(gid).Sigma[0, 0], bank.get(gid).Sigma[1, 1]], dtype=np.float32)
+                gid: np.asarray(bank.get(gid).mu[:2], dtype=np.float32).copy()
                 for gid in goal_ids
             }
         )
-        log.confidence.append({gid: float(bank.get(gid).confidence) for gid in goal_ids})
+        log.sigma_diag.append(
+            {
+                gid: np.array(
+                    [bank.get(gid).Sigma[0, 0], bank.get(gid).Sigma[1, 1]],
+                    dtype=np.float32,
+                )
+                for gid in goal_ids
+            }
+        )
+        log.confidence.append(
+            {gid: float(bank.get(gid).confidence) for gid in goal_ids}
+        )
         log.visible.append(visible_this_step)
 
         # RouteManager.update's "active_goal" is the goal that was being
@@ -135,7 +153,9 @@ def run_multi_episode(
         if route.is_finished():
             log.finished = True
             log.final_route_index = route.get_route_index()
-            log.final_true_dists = {gid: float(np.linalg.norm(true_goals[gid])) for gid in goal_ids}
+            log.final_true_dists = {
+                gid: float(np.linalg.norm(true_goals[gid])) for gid in goal_ids
+            }
             return log
 
         # "next_active_goal" is post-advance-aware: whichever goal is now
@@ -145,7 +165,9 @@ def run_multi_episode(
         steer_slot = bank.get(steer_goal_id)
         steer_mu = np.asarray(steer_slot.mu[:2], dtype=np.float32)
         sigma_ale = sigma_ale_from_bank(bank, steer_goal_id)
-        v_fwd, v_lat, yaw = p_controller(steer_mu, env_cfg.turn_kp, env_cfg.base_forward, env_cfg.max_yaw_rate)
+        v_fwd, v_lat, yaw = p_controller(
+            steer_mu, env_cfg.turn_kp, env_cfg.base_forward, env_cfg.max_yaw_rate
+        )
         strength = strength_from_sigma_ale(
             sigma_ale,
             sigma_low=gate_cfg.strength_sigma_low,
@@ -156,9 +178,17 @@ def run_multi_episode(
         v_fwd *= 1.0 - strength
 
         for gid in goal_ids:
-            true_goals[gid] = ego_motion_true(true_goals[gid], v_fwd, v_lat, yaw, env_cfg.dt)
-        prev_dx, prev_dy, prev_dtheta = v_fwd * env_cfg.dt, v_lat * env_cfg.dt, yaw * env_cfg.dt
+            true_goals[gid] = ego_motion_true(
+                true_goals[gid], v_fwd, v_lat, yaw, env_cfg.dt
+            )
+        prev_dx, prev_dy, prev_dtheta = (
+            v_fwd * env_cfg.dt,
+            v_lat * env_cfg.dt,
+            yaw * env_cfg.dt,
+        )
 
     log.final_route_index = route.get_route_index()
-    log.final_true_dists = {gid: float(np.linalg.norm(true_goals[gid])) for gid in goal_ids}
+    log.final_true_dists = {
+        gid: float(np.linalg.norm(true_goals[gid])) for gid in goal_ids
+    }
     return log

@@ -39,13 +39,25 @@ class MockInternVLClient:
     one exercised by this package's tests (next.md sec 9: tests never
     require a live InternVL checkpoint)."""
 
-    def __init__(self, canned_response: str = "LEFT", canned_responses: typing.Optional[list] = None):
-        self._responses = canned_responses if canned_responses is not None else [canned_response]
+    def __init__(
+        self,
+        canned_response: str = "LEFT",
+        canned_responses: typing.Optional[list] = None,
+    ):
+        self._responses = (
+            canned_responses if canned_responses is not None else [canned_response]
+        )
         self._cycle = itertools.cycle(self._responses)
         self.calls: list = []
 
     def generate(self, frames: list, prompt: str, max_new_tokens: int) -> str:
-        self.calls.append({"frame_count": len(frames), "prompt": prompt, "max_new_tokens": max_new_tokens})
+        self.calls.append(
+            {
+                "frame_count": len(frames),
+                "prompt": prompt,
+                "max_new_tokens": max_new_tokens,
+            }
+        )
         return next(self._cycle)
 
 
@@ -63,7 +75,9 @@ def _recv_exact(conn: socket.socket, num_bytes: int) -> bytes:
     while remaining > 0:
         chunk = conn.recv(remaining)
         if not chunk:
-            raise ConnectionError("connection closed before expected bytes were received")
+            raise ConnectionError(
+                "connection closed before expected bytes were received"
+            )
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -85,7 +99,12 @@ def _send_request(payload: dict, host: str, port: int, timeout: float) -> dict:
 
 
 class InternVLSocketClient:
-    def __init__(self, host: typing.Optional[str] = None, port: typing.Optional[int] = None, timeout: float = 30.0):
+    def __init__(
+        self,
+        host: typing.Optional[str] = None,
+        port: typing.Optional[int] = None,
+        timeout: float = 30.0,
+    ):
         self.host = host or config.INTERNVL_SERVER_HOST
         self.port = port or config.INTERNVL_SERVER_PORT
         self.timeout = timeout
@@ -116,4 +135,8 @@ def get_client(backend: typing.Optional[str] = None) -> InternVLClient:
 
 if __name__ == "__main__":
     client = get_client("mock")
-    print(client.generate([np.zeros((4, 4, 3), dtype=np.uint8)], "test prompt", max_new_tokens=8))
+    print(
+        client.generate(
+            [np.zeros((4, 4, 3), dtype=np.uint8)], "test prompt", max_new_tokens=8
+        )
+    )

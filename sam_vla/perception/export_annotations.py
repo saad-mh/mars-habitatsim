@@ -56,7 +56,9 @@ def load_run(run_dir: Path) -> Tuple[List[dict], List[str]]:
     return records, class_names
 
 
-def _polygons_from_instance_mask(instance_mask: np.ndarray, mesh_id: int) -> List[List[float]]:
+def _polygons_from_instance_mask(
+    instance_mask: np.ndarray, mesh_id: int
+) -> List[List[float]]:
     """Traces the exact silhouette of one object (mesh_id == pixel value) into
     COCO-style flattened polygons [x1, y1, x2, y2, ...], one per external
     contour -- an object split into disjoint regions (e.g. occluded by
@@ -93,7 +95,8 @@ def export_coco(
     run_dir = Path(run_dir)
     categories = [
         {"id": i, "name": name, "supercategory": "object"}
-        for i, name in enumerate(class_names) if i > 0
+        for i, name in enumerate(class_names)
+        if i > 0
     ]
 
     images = []
@@ -102,25 +105,31 @@ def export_coco(
     fallback_polygon_count = 0
     for image_id, rec in enumerate(records, start=1):
         instance_mask = (
-            iio.imread(run_dir / rec["instance_mask_path"]) if with_segmentation else None
+            iio.imread(run_dir / rec["instance_mask_path"])
+            if with_segmentation
+            else None
         )
         if instance_mask is not None:
             height, width = instance_mask.shape[:2]
         else:
             height, width = iio.improps(run_dir / rec["rgb_path"]).shape[:2]
 
-        images.append({
-            "id": image_id,
-            "file_name": rec["rgb_path"],
-            "width": int(width),
-            "height": int(height),
-        })
+        images.append(
+            {
+                "id": image_id,
+                "file_name": rec["rgb_path"],
+                "width": int(width),
+                "height": int(height),
+            }
+        )
 
         for obj in rec["objects"]:
             x, y, w, h = obj["bbox"]
             segmentation = []
             if with_segmentation:
-                segmentation = _polygons_from_instance_mask(instance_mask, obj["mesh_id"])
+                segmentation = _polygons_from_instance_mask(
+                    instance_mask, obj["mesh_id"]
+                )
             if not segmentation:
                 # no traceable contour (e.g. a 1px sliver) -- fall back to the
                 # bbox itself so every object still gets a valid segmentation
@@ -128,15 +137,17 @@ def export_coco(
                 segmentation = [[x, y, x + w, y, x + w, y + h, x, y + h]]
                 fallback_polygon_count += 1
 
-            annotations.append({
-                "id": ann_id,
-                "image_id": image_id,
-                "category_id": class_names.index(obj["category"]),
-                "bbox": [x, y, w, h],
-                "area": obj["pixel_count"],
-                "segmentation": segmentation,
-                "iscrowd": 0,
-            })
+            annotations.append(
+                {
+                    "id": ann_id,
+                    "image_id": image_id,
+                    "category_id": class_names.index(obj["category"]),
+                    "bbox": [x, y, w, h],
+                    "area": obj["pixel_count"],
+                    "segmentation": segmentation,
+                    "iscrowd": 0,
+                }
+            )
             ann_id += 1
 
     coco = {
@@ -152,8 +163,10 @@ def export_coco(
     out_path.write_text(json.dumps(coco))
 
     if fallback_polygon_count:
-        print(f"[export_annotations] {fallback_polygon_count} object(s) had no traceable "
-              f"contour, used bbox-rectangle segmentation instead")
+        print(
+            f"[export_annotations] {fallback_polygon_count} object(s) had no traceable "
+            f"contour, used bbox-rectangle segmentation instead"
+        )
     return coco
 
 
@@ -165,8 +178,10 @@ def _symlink_images_dir(run_dir: Path, yolo_dir: Path) -> None:
     try:
         images_link.symlink_to(target, target_is_directory=True)
     except OSError as e:
-        print(f"[export_annotations] could not symlink {images_link} -> {target} ({e}); "
-              f"point your data.yaml's image path at {run_dir / 'rgb'} manually")
+        print(
+            f"[export_annotations] could not symlink {images_link} -> {target} ({e}); "
+            f"point your data.yaml's image path at {run_dir / 'rgb'} manually"
+        )
 
 
 def export_yolo(
@@ -215,7 +230,9 @@ def export_yolo(
                     (v / width if i % 2 == 0 else v / height)
                     for i, v in enumerate(points)
                 ]
-                lines.append(" ".join([str(class_id)] + [f"{v:.6f}" for v in normalized]))
+                lines.append(
+                    " ".join([str(class_id)] + [f"{v:.6f}" for v in normalized])
+                )
             else:
                 x, y, w, h = obj["bbox"]
                 cx, cy = (x + w / 2) / width, (y + h / 2) / height
@@ -237,12 +254,16 @@ def export_yolo(
     )
 
     if segmentation and empty_polygon_count:
-        print(f"[export_annotations] {empty_polygon_count} object(s) had no traceable "
-              f"contour and were dropped from YOLO-seg labels")
+        print(
+            f"[export_annotations] {empty_polygon_count} object(s) had no traceable "
+            f"contour and were dropped from YOLO-seg labels"
+        )
     return out_dir
 
 
-def export_annotations(run_dir: Path, out_dir: Path, formats: Sequence[str]) -> Dict[str, Path]:
+def export_annotations(
+    run_dir: Path, out_dir: Path, formats: Sequence[str]
+) -> Dict[str, Path]:
     run_dir = Path(run_dir)
     out_dir = Path(out_dir)
     records, class_names = load_run(run_dir)
@@ -271,16 +292,21 @@ if __name__ == "__main__":
         help="a run directory produced by run_segmentation_sweep.py",
     )
     ap.add_argument(
-        "--formats", default="coco,yolo",
+        "--formats",
+        default="coco,yolo",
         help=f"comma-separated subset of {ALL_FORMATS}",
     )
-    ap.add_argument("--out-dir", default=None, help="default: <run-dir>/annotations_export/")
+    ap.add_argument(
+        "--out-dir", default=None, help="default: <run-dir>/annotations_export/"
+    )
     args = ap.parse_args()
 
     formats = [f.strip() for f in args.formats.split(",") if f.strip()]
     unknown = set(formats) - set(ALL_FORMATS)
     if unknown:
-        raise SystemExit(f"unknown format(s) {sorted(unknown)}, choose from {ALL_FORMATS}")
+        raise SystemExit(
+            f"unknown format(s) {sorted(unknown)}, choose from {ALL_FORMATS}"
+        )
 
     run_dir = Path(args.run_dir)
     out_dir = Path(args.out_dir) if args.out_dir else run_dir / "annotations_export"
