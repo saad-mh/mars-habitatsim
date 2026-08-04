@@ -3,11 +3,13 @@ conda activate habitat
 python -m sam_vla.run_navdp_rollout \
     --scene-path assets/marsyard2022.glb \
     --heightmap-path marsyard2022_terrain_hm_1025.tif \
-    --ckpt navdp/runs/belief_only_policy/belief_only_policy.pt \
+    --ckpt navdp/ckpt_last.pt \
     --navdp-root ./navdp \
+    --start-x -2 --start-z 8 --start-yaw 120 \
     --base-station --dwell-seconds 3 --goal-success-radius 1.0 \
-    --max-steps 100 --cbf --save-video --save-frames \
-    --out-dir base_station_smoke_test
+    --lost-goal-forward 0.2 \
+    --max-steps 900 --cbf \
+    --out-dir outputs/base_station_smoke_test
 
 """
 
@@ -398,6 +400,19 @@ def run(
                 route=["goal_1", "base_station"], success_radius=goal_success_radius
             )
             bank = SubgoalBeliefBank(goal_ids=["goal_1", "base_station"])
+            # Seed base_station's belief as "seen at [0, 0]" (the robot's own local
+            # frame right now) since the rover spawns exactly there -- without this,
+            # the slot stays uninitialized (belief_bank.py's update() resets it to
+            # zero/large-uncertainty every step instead of dead-reckoning) until the
+            # marker happens to be glimpsed in-frame, which next.md §6 explicitly
+            # says may never happen on the way back. Seeding here means ordinary
+            # per-step odometry dead-reckoning (already running every OUTBOUND step
+            # below) tracks the true return offset the whole way out.
+            bank.update(
+                {"base_station": {"visible": True, "position": [0.0, 0.0], "confidence": 1.0}},
+                odom_delta=[0.0, 0.0, 0.0],
+                step=-1,
+            )
             phase = "OUTBOUND"
             dwell_steps_total = max(round(dwell_seconds / dt), 0)
             dwell_steps_remaining = 0

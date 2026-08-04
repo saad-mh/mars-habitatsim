@@ -201,15 +201,38 @@ class RolloutLogger:
 
     def save_video(self, out_dir: str, fps: int = 10) -> None:
         """Encode the logged frames (goal/obstacle-overlaid if available) into
-        rollout.mp4 (imageio + ffmpeg backend)."""
-        import imageio.v3 as iio
+        rollout.mp4, muxing via PyAV directly rather than imageio.v3's pyav
+        plugin: PyAV >=15 leaves stream.codec_context.time_base unset until
+        the first frame is muxed, which that plugin doesn't account for and
+        crashes on (`AttributeError: 'NoneType' object has no attribute
+        'numerator'` from av.frame.Frame.time_base.__set__) -- setting it
+        explicitly here sidesteps the incompatibility."""
+        import av
+        from fractions import Fraction
 
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         video_path = out_path / "rollout.mp4"
 
         frames = self._output_frames()
-        iio.imwrite(video_path, np.stack(frames), fps=fps, codec="libx264")
+        height, width = np.asarray(frames[0]).shape[:2]
+
+        container = av.open(str(video_path), mode="w")
+        stream = container.add_stream("libx264", rate=fps)
+        stream.height = height
+        stream.width = width
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.time_base = Fraction(1, fps)
+
+        for rgb in frames:
+            frame = av.VideoFrame.from_ndarray(
+                np.asarray(rgb, dtype=np.uint8), format="rgb24"
+            )
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
 
         print(
             f"RolloutLogger: saved video ({len(frames)} frames @ {fps}fps) -> {video_path}"
