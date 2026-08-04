@@ -14,8 +14,10 @@ classes.
 
 `exp.md` is a long-form written explainer of the NavDP belief system (state → refinement → encoding →
 policy integration → runtime control) — read it before touching anything belief-related instead of
-re-deriving it from `navdp/`. `next.md` documents the current annotation/segmentation pipeline design
-(including the two-pass RGB/semantic rendering fix). `stats.md` logs SAM2-LoRA training runs.
+re-deriving it from `navdp/`. `next.md` currently documents the base-station out-and-back (two-goal)
+navigation plan — read it before touching goal-sequencing/route logic instead of re-deriving it.
+`vl_direction/DESIGN.md` holds that module's own design doc (moved out of `next.md`, which no longer
+tracks it). `stats.md` logs SAM2-LoRA training runs.
 
 ## Conda environments
 
@@ -163,7 +165,7 @@ episode_id) -> VLDirectiveResult` is the *only* integration point, backed by Int
 and closed-vocabulary output enforced by `parser.py` (never trust free text past `raw_response`). Exists
 to support an HCI study (VL-autonomy vs. human-teleop-intervention), so `intervention/mode_flag.py` +
 `logging/hci_metrics.py` track session mode and aggregate success/intervention metrics. Full design
-rationale is in the module's own docstrings and `next.md`-adjacent design notes — read
+rationale is in the module's own docstrings and `vl_direction/DESIGN.md` — read
 `vl_direction/directive_engine.py` and `schemas.py` first when extending it.
 
 ### `belief_exp/` — offline belief-parameter tuning harness
