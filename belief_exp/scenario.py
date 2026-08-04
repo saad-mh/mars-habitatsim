@@ -1,4 +1,4 @@
-"""Closed-loop synthetic episode simulator driving the REAL navdp.SubgoalBeliefBank.
+"""Closed-loop synthetic episode simulator driving the navdp.SubgoalBeliefBank.
 
 Every belief number in an EpisodeLog (mu, Sigma, confidence, RouteManager's advance
 decision) comes directly from navdp's own SubgoalBeliefBank / RouteManager classes.
