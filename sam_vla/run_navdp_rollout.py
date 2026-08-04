@@ -12,7 +12,11 @@ from sam_vla.goal_resolution import first_frame_resolver
 from sam_vla.policy.navdp_policy import NavdpPolicy
 from sam_vla.safety.safety_filter import filter as safety_filter_fn
 from sam_vla.safety.cbf_avoidance import CbfObstacleAvoidance
-from sam_vla.core.belief_tracking import BeliefGoalTracker, lost_goal_heading_assist
+from sam_vla.core.belief_tracking import (
+    BeliefGoalTracker,
+    lost_goal_heading_assist,
+    mask_to_body,
+)
 from sam_vla.core.goal_geometry import (
     MESH_GOAL_ID,
     MESH_OBST_ID,
@@ -90,6 +94,23 @@ def _body_odom_from_poses(prev_pose, cur_pose):
     right = dx_world * sin_yaw - dz_world * cos_yaw
     dtheta = (yaw1 - yaw0 + math.pi) % (2.0 * math.pi) - math.pi
     return [forward, -right, dtheta]
+
+
+def _goal_observation(
+    mask: np.ndarray, depth: np.ndarray, min_px: int, hfov_deg: float, fallback_range: float
+) -> dict:
+    """SubgoalBeliefBank observation dict for one goal_id, computed straight from its
+    current MESH_GOAL_ID mask via belief_tracking.mask_to_body -- the base-station
+    mode's replacement for SAMDepthTargetExtractor (see next.md §1: goals here are
+    persistent registered meshes, not live SAM3 detections, so there's nothing to
+    extract from a detector)."""
+    if int((np.asarray(mask) > 0).sum()) < min_px:
+        return {"visible": False, "position": None, "confidence": 0.0}
+    height, width = np.asarray(depth).shape[:2]
+    seed = mask_to_body(mask, depth, height, width, hfov_deg, fallback_range, min_px)
+    if seed is None:
+        return {"visible": False, "position": None, "confidence": 0.0}
+    return {"visible": True, "position": seed, "confidence": 1.0}
 
 
 def _multi_goal_resegment(
@@ -207,7 +228,16 @@ def run(
     goal_vocab: str = None,
     stop_on_route_finished: bool = True,
     max_goals: int = 8,
+    base_station: bool = False,
+    dwell_seconds: float = 5.0,
+    goal_success_radius: float = 1.0,
+    base_marker_radius: float = None,
 ) -> None:
+    if base_station and multi_goal:
+        raise ValueError(
+            "--base-station and --multi-goal are mutually exclusive -- they solve "
+            "different problems, see next.md §1"
+        )
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     # Still needed for the one-shot first-frame goal selection below
@@ -238,6 +268,11 @@ def run(
         ) = None
         last_known_masks: dict = {}
         prev_body_pose = (obs0.pose.x, obs0.pose.z, obs0.pose.yaw)
+
+        # base-station state -- left None/unset on every other path.
+        goal_1_obj = base_station_obj = base_position = None
+        phase = "OUTBOUND"
+        dwell_steps_total = dwell_steps_remaining = 0
 
         if multi_goal:
             from navdp.extensions import (
@@ -291,6 +326,57 @@ def run(
                 f"[multi-goal] vocabulary={vocab_terms} instruction={instruction_text!r}",
                 flush=True,
             )
+        elif base_station:
+            from navdp.extensions import RouteManager, SubgoalBeliefBank
+
+            goal_spec, goal_vlm_result, sam_detections = (
+                first_frame_resolver.resolve_verbose(obs0.rgb)
+            )
+            goal_position = backproject_goal_position(
+                obs0, goal_spec, hfov_deg=HFOV_DEG
+            )
+            logger.log_goal_resolution(goal_spec, goal_vlm_result, goal_position)
+            logger.save_sam_first_frame(obs0.rgb, sam_detections, goal_spec, out_dir)
+            print(
+                f"resolved goal_spec: {goal_spec.instruction_text} | goal_position={goal_position}"
+            )
+
+            goal_1_obj = None
+            if goal_position is not None:
+                goal_1_obj = env.register_object_mask(
+                    goal_position, MESH_GOAL_ID, obj_mask_radius, out_dir, "goal"
+                )
+            else:
+                print("[WARN] goal bbox had no valid depth; skipping goal mask", flush=True)
+            register_obstacle_masks_only(
+                env, obs0, goal_spec.obstacle_bboxes_norm, obj_mask_radius, out_dir
+            )
+
+            # Base station = the rover's own spawn pose, not a detection -- registered
+            # with semantic_id=0 (neutral: invisible to both goal/obstacle channels
+            # until DWELL re-tags it), per next.md §3. terrain_patch_mesh ignores
+            # world_pos's own y and resamples height from self._terrain itself, so
+            # there's no second height lookup to keep in sync with register_object_mask's.
+            base_marker_r = (
+                base_marker_radius if base_marker_radius is not None else obj_mask_radius
+            )
+            base_position = (start_x, 0.0, start_z)
+            base_station_obj = env.register_object_mask(
+                base_position, 0, base_marker_r, out_dir, "base_station"
+            )
+
+            route = RouteManager(
+                route=["goal_1", "base_station"], success_radius=goal_success_radius
+            )
+            bank = SubgoalBeliefBank(goal_ids=["goal_1", "base_station"])
+            phase = "OUTBOUND"
+            dwell_steps_total = max(round(dwell_seconds / dt), 0)
+            dwell_steps_remaining = 0
+            print(
+                f"[base-station] base_position={base_position} "
+                f"dwell_steps={dwell_steps_total} success_radius={goal_success_radius}",
+                flush=True,
+            )
         else:
             goal_spec, goal_vlm_result, sam_detections = (
                 first_frame_resolver.resolve_verbose(obs0.rgb)
@@ -326,7 +412,7 @@ def run(
         # importable -- see its docstring).
         belief_tracker = (
             None
-            if multi_goal
+            if (multi_goal or base_station)
             else BeliefGoalTracker(
                 hfov_deg=HFOV_DEG,
                 goal_range=belief_goal_range,
@@ -362,6 +448,9 @@ def run(
 
             active_goal_id = None
             active_slot = None
+            route_finished_this_step = False
+            just_entered_dwell = False
+            phase_for_log = phase
             if multi_goal:
                 goal_masks = {}
                 if step % seg_interval_steps == 0:
@@ -417,9 +506,110 @@ def run(
                     obstacle_bboxes_norm=[],
                     instruction_text=multi_goal_spec.instruction_text,
                 )
+            elif base_station:
+                if phase in ("OUTBOUND", "RETURN"):
+                    active_goal_id = route.get_active_goal()
+                    active_mask = semantic == MESH_GOAL_ID
+                    observations = {
+                        gid: (
+                            _goal_observation(
+                                active_mask,
+                                obs.depth,
+                                lost_goal_min_px,
+                                HFOV_DEG,
+                                belief_goal_range,
+                            )
+                            if gid == active_goal_id
+                            else {"visible": False}
+                        )
+                        for gid in ("goal_1", "base_station")
+                    }
+                    cur_body_pose = (obs.pose.x, obs.pose.z, obs.pose.yaw)
+                    odom_delta = _body_odom_from_poses(prev_body_pose, cur_body_pose)
+                    prev_body_pose = cur_body_pose
+                    bank.update(observations, odom_delta=odom_delta, step=step)
+                    route_status = route.update(
+                        robot_position=[0.0, 0.0], belief_bank=bank
+                    )
+                    active_slot = bank.get(active_goal_id)
+                    goal_visible = bool(active_slot.visible)
+                    goal_bearing = (
+                        math.atan2(float(active_slot.mu[1]), float(active_slot.mu[0]))
+                        if active_slot.initialized
+                        else None
+                    )
+
+                    if route_status["advanced"]:
+                        if phase == "OUTBOUND":
+                            # Re-tag now, immediately after this step's semantic frame
+                            # was already fetched+consumed above (still correctly
+                            # OUTBOUND-tagged), so this same step finishes out as a
+                            # normal (final) OUTBOUND drive step below, and the *next*
+                            # get_semantic_frame() call -- the first real DWELL step's,
+                            # at the top of the next loop iteration -- is the first one
+                            # to see the swap. Retagging any later would leave a frame
+                            # with two goal-tagged regions at once (next.md §3/§6);
+                            # retagging into this step's own semantic_render would
+                            # instead make this step's already-computed belief/route
+                            # update inconsistent with what it drove on.
+                            if goal_1_obj is not None:
+                                goal_1_obj.semantic_id = MESH_OBST_ID
+                            if base_station_obj is not None:
+                                base_station_obj.semantic_id = MESH_GOAL_ID
+                            phase = "DWELL"
+                            dwell_steps_remaining = dwell_steps_total
+                            just_entered_dwell = True
+                        else:  # RETURN -> DONE
+                            route_finished_this_step = True
+
+                    phase_for_log = (
+                        "DONE"
+                        if route_finished_this_step
+                        else "OUTBOUND" if just_entered_dwell else phase
+                    )
+
+                semantic_render = semantic
+                goal_spec_for_policy = goal_spec
             else:
                 semantic_render = semantic
                 goal_spec_for_policy = goal_spec
+
+            if base_station and phase == "DWELL" and not just_entered_dwell:
+                # Hold position -- skip the policy/CBF call entirely (next.md §4) but
+                # keep stepping/logging so the saved video shows a clean stationary
+                # hold instead of a gap.
+                action = Action(v_fwd=0.0, v_lat=0.0, yaw_rate=0.0)
+                new_pose = obs.pose
+                env.step(new_pose)
+                dwell_steps_remaining -= 1
+
+                dist = (
+                    distance_to_goal(new_pose, base_position)
+                    if base_position is not None
+                    else None
+                )
+                dist_txt = f"{dist:.2f}m" if dist is not None else "n/a"
+                overlay_text = f"t={step} DWELL dist={dist_txt} v=[0.00,0.00] yaw_rate=0.00"
+                vis_rgb = overlay_semantic_masks(
+                    obs.rgb, semantic_render, text=overlay_text
+                )
+                goal_mask = (semantic_render == MESH_GOAL_ID).astype("uint8") * 255
+                vla_result = {
+                    "phase": "DWELL",
+                    "route_index": route.get_route_index(),
+                    "dwell_steps_remaining": max(dwell_steps_remaining, 0),
+                }
+                logger.log_step(
+                    obs, action, new_pose, vla_result=vla_result, vis_rgb=vis_rgb
+                )
+                if step % 10 == 0:
+                    print(
+                        f"[traj] step={step} | phase=DWELL | "
+                        f"dwell_steps_remaining={max(dwell_steps_remaining, 0)}"
+                    )
+                if dwell_steps_remaining <= 0:
+                    phase = "RETURN"
+                continue
 
             raw_action, vla_result = policy.act_verbose(
                 obs, semantic_render, goal_spec_for_policy, step
@@ -428,7 +618,7 @@ def run(
 
             goal_mask = (semantic_render == MESH_GOAL_ID).astype("uint8") * 255
             obstacle_mask = (semantic_render == MESH_OBST_ID).astype("uint8") * 255
-            if not multi_goal:
+            if not multi_goal and not base_station:
                 goal_visible = belief_tracker.observe(goal_mask, obs.depth)
                 goal_bearing = belief_tracker.bearing()
 
@@ -470,12 +660,18 @@ def run(
 
             new_pose = integrate_mars(obs.pose, action, dt)
             env.step(new_pose)
-            if not multi_goal:
+            if not multi_goal and not base_station:
                 belief_tracker.propagate(action, dt)
 
+            if base_station:
+                dist_target = (
+                    goal_position if active_goal_id == "goal_1" else base_position
+                )
+            else:
+                dist_target = goal_position
             dist = (
-                distance_to_goal(new_pose, goal_position)
-                if goal_position is not None
+                distance_to_goal(new_pose, dist_target)
+                if dist_target is not None
                 else None
             )
             dist_txt = f"{dist:.2f}m" if dist is not None else "n/a"
@@ -501,6 +697,21 @@ def run(
                     "num_goals": len(multi_goal_spec.goals),
                     **cbf_info,
                 }
+            elif base_station:
+                vla_result = {
+                    **vla_result,
+                    "phase": phase_for_log,
+                    "belief_forward": (
+                        None if active_slot is None else float(active_slot.mu[0])
+                    ),
+                    "belief_left": (
+                        None if active_slot is None else float(active_slot.mu[1])
+                    ),
+                    "goal_visible": goal_visible,
+                    "active_goal_id": active_goal_id,
+                    "route_index": route.get_route_index(),
+                    **cbf_info,
+                }
             else:
                 vla_result = {
                     **vla_result,
@@ -523,7 +734,12 @@ def run(
 
             if step % 10 == 0:
                 goal_pixel = mask_pixel_center(goal_mask)
-                extra = f" active_goal={active_goal_id}" if multi_goal else ""
+                if multi_goal:
+                    extra = f" active_goal={active_goal_id}"
+                elif base_station:
+                    extra = f" phase={phase_for_log} active_goal={active_goal_id}"
+                else:
+                    extra = ""
                 print(
                     f"[traj] step={step} | distance_to_goal={dist} | "
                     f"goal_pixel={goal_pixel} | action={action}{extra}"
@@ -536,6 +752,10 @@ def run(
                 and route.is_finished()
             ):
                 print(f"[multi-goal] route finished at step={step}", flush=True)
+                break
+
+            if base_station and route_finished_this_step:
+                print(f"[base-station] route finished at step={step}", flush=True)
                 break
 
         if avoidance is not None:
@@ -686,8 +906,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--lost-goal-ghost",
-        action="store_true",
-        help="proportional heading assist toward the tracked goal belief when it's off-centre or out of view",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="proportional heading assist toward the tracked goal belief when it's off-centre "
+        "or out of view. Default: off, except under --base-station where it defaults on "
+        "(next.md §6) -- pass --no-lost-goal-ghost to force it off there too.",
     )
     parser.add_argument("--lost-goal-turn-kp", type=float, default=1.4)
     parser.add_argument(
@@ -755,7 +978,44 @@ if __name__ == "__main__":
         default=8,
         help="cap on simultaneously tracked goals in the multi-goal path",
     )
+    parser.add_argument(
+        "--base-station",
+        action="store_true",
+        help="After reaching the resolved first-frame goal, dwell then drive back to the "
+        "rover's own spawn pose (two fixed, known-ahead-of-time goals -- see next.md). "
+        "Mutually exclusive with --multi-goal.",
+    )
+    parser.add_argument(
+        "--dwell-seconds",
+        type=float,
+        default=5.0,
+        help="hold duration (s) at goal_1 before returning to the base station",
+    )
+    parser.add_argument(
+        "--goal-success-radius",
+        type=float,
+        default=1.0,
+        help="success radius (m) for both legs of the base-station route "
+        "(RouteManager.success_radius)",
+    )
+    parser.add_argument(
+        "--base-marker-radius",
+        type=float,
+        default=None,
+        help="radius (m) of the synthetic base-station marker disc (default: --obj-mask-radius)",
+    )
     args = parser.parse_args()
+
+    if args.base_station and args.multi_goal:
+        parser.error("--base-station and --multi-goal are mutually exclusive")
+    # next.md §6: without a steering signal toward the (initially out-of-frame) base
+    # marker, the return leg has nothing to steer on until it happens to enter view --
+    # recommended on by default for this mode, overridable via --no-lost-goal-ghost.
+    lost_goal_ghost = (
+        args.lost_goal_ghost
+        if args.lost_goal_ghost is not None
+        else bool(args.base_station)
+    )
 
     run(
         scene_path=args.scene_path,
@@ -794,7 +1054,7 @@ if __name__ == "__main__":
         belief_goal_range=args.belief_goal_range,
         belief_odom_noise=args.belief_odom_noise,
         lost_goal_min_px=args.lost_goal_min_px,
-        lost_goal_ghost=args.lost_goal_ghost,
+        lost_goal_ghost=lost_goal_ghost,
         lost_goal_turn_kp=args.lost_goal_turn_kp,
         lost_goal_forward=args.lost_goal_forward,
         lost_goal_bearing_deg=args.lost_goal_bearing_deg,
@@ -807,4 +1067,8 @@ if __name__ == "__main__":
         goal_vocab=args.goal_vocab,
         stop_on_route_finished=args.stop_on_route_finished,
         max_goals=args.max_goals,
+        base_station=args.base_station,
+        dwell_seconds=args.dwell_seconds,
+        goal_success_radius=args.goal_success_radius,
+        base_marker_radius=args.base_marker_radius,
     )
