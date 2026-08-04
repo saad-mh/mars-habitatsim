@@ -40,7 +40,14 @@ def ping(host=DEFAULT_HOST, port=DEFAULT_PORT):
     return _request({"cmd": "ping"}, host, port)
 
 
-def query_vlm_persistent(rgb_path, prompt=None, max_new_tokens=None, host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=10.0):
+def query_vlm_persistent(
+    rgb_path,
+    prompt=None,
+    max_new_tokens=None,
+    host=DEFAULT_HOST,
+    port=DEFAULT_PORT,
+    timeout=10.0,
+):
     req = {"cmd": "infer", "rgb": rgb_path}
     if prompt is not None:
         req["prompt"] = prompt

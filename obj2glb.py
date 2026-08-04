@@ -11,7 +11,7 @@ def parse_arguments():
             "  blender --background --python obj2glb.py -- input.obj output.glb"
         )
 
-    args = sys.argv[sys.argv.index("--") + 1:]
+    args = sys.argv[sys.argv.index("--") + 1 :]
 
     if len(args) != 2:
         raise RuntimeError(
@@ -64,16 +64,11 @@ def import_obj(filepath):
         )
 
     else:
-        raise RuntimeError(
-            "No OBJ importer is available in this Blender installation."
-        )
+        raise RuntimeError("No OBJ importer is available in this Blender installation.")
 
 
 def prepare_meshes():
-    mesh_objects = [
-        obj for obj in bpy.context.scene.objects
-        if obj.type == "MESH"
-    ]
+    mesh_objects = [obj for obj in bpy.context.scene.objects if obj.type == "MESH"]
 
     if not mesh_objects:
         raise RuntimeError("The OBJ import produced no mesh objects.")

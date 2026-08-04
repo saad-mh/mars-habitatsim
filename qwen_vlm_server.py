@@ -41,7 +41,10 @@ def load_model():
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
-    print(f"[qwen_vlm_server] {MODEL_ID} loaded in {time.time() - t0:.1f}s", file=sys.stderr)
+    print(
+        f"[qwen_vlm_server] {MODEL_ID} loaded in {time.time() - t0:.1f}s",
+        file=sys.stderr,
+    )
     return processor, model
 
 
@@ -55,7 +58,9 @@ def run_inference(processor, model, rgb_path, prompt, max_new_tokens=256):
             ],
         }
     ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text],
@@ -69,11 +74,13 @@ def run_inference(processor, model, rgb_path, prompt, max_new_tokens=256):
         generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
     generated_ids_trimmed = [
-        out_ids[len(in_ids):]
+        out_ids[len(in_ids) :]
         for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     return processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
     )[0]
 
 
@@ -124,10 +131,15 @@ def serve(host, port):
                     continue
                 t0 = time.time()
                 text = run_inference(
-                    processor, model, req["rgb"], req.get("prompt", DEFAULT_PROMPT),
+                    processor,
+                    model,
+                    req["rgb"],
+                    req.get("prompt", DEFAULT_PROMPT),
                     max_new_tokens=req.get("max_new_tokens", 256),
                 )
-                send_msg(conn, {"ok": True, "text": text, "latency_s": time.time() - t0})
+                send_msg(
+                    conn, {"ok": True, "text": text, "latency_s": time.time() - t0}
+                )
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:

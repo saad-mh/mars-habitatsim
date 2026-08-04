@@ -73,25 +73,63 @@ def _verify_load(scene: Path, heightmap: Path, manifest: Path) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scene", default=str(DEFAULT_SCENE), help="Path to the environment .glb")
-    ap.add_argument("--heightmap", default=str(DEFAULT_HEIGHTMAP), help="Grayscale terrain heightmap for this scene")
-    ap.add_argument("--out-dir", required=True, help="Output dir for rock meshes + rock_field.json")
-    ap.add_argument("--seed", type=int, default=0, help="Random seed; same seed+params -> identical rock field")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--scene", default=str(DEFAULT_SCENE), help="Path to the environment .glb"
+    )
+    ap.add_argument(
+        "--heightmap",
+        default=str(DEFAULT_HEIGHTMAP),
+        help="Grayscale terrain heightmap for this scene",
+    )
+    ap.add_argument(
+        "--out-dir", required=True, help="Output dir for rock meshes + rock_field.json"
+    )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed; same seed+params -> identical rock field",
+    )
     ap.add_argument("--num-rocks", type=int, default=12)
-    ap.add_argument("--radius-min", type=float, default=0.25, help="Min rock radius (m)")
+    ap.add_argument(
+        "--radius-min", type=float, default=0.25, help="Min rock radius (m)"
+    )
     ap.add_argument("--radius-max", type=float, default=0.7, help="Max rock radius (m)")
-    ap.add_argument("--min-spacing", type=float, default=0.4, help="Min clearance (m) kept between rock surfaces")
-    ap.add_argument("--boundary-margin", type=float, default=2.0, help="Keep every rock's edge this far (m) from the scene bound")
+    ap.add_argument(
+        "--min-spacing",
+        type=float,
+        default=0.4,
+        help="Min clearance (m) kept between rock surfaces",
+    )
+    ap.add_argument(
+        "--boundary-margin",
+        type=float,
+        default=2.0,
+        help="Keep every rock's edge this far (m) from the scene bound",
+    )
     ap.add_argument("--max-attempts-per-rock", type=int, default=300)
     ap.add_argument(
-        "--exclude", action="append", default=[], metavar="X,Z,RADIUS",
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="X,Z,RADIUS",
         help="Keep-out circle (world x, world z, radius) rocks may not spawn inside, e.g. the rover "
         "spawn point. Repeatable. Default (if none given): a 3m circle around (0, 8), matching the "
         "rollout scripts' default --start-x/--start-z.",
     )
-    ap.add_argument("--skip-scene-check", action="store_true", help="Skip the up-front glb load sanity check")
-    ap.add_argument("--verify", action="store_true", help="After generating, re-load the manifest and register it into a live sim")
+    ap.add_argument(
+        "--skip-scene-check",
+        action="store_true",
+        help="Skip the up-front glb load sanity check",
+    )
+    ap.add_argument(
+        "--verify",
+        action="store_true",
+        help="After generating, re-load the manifest and register it into a live sim",
+    )
     args = ap.parse_args()
 
     scene = Path(args.scene)

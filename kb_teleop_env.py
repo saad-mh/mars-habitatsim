@@ -36,7 +36,10 @@ from sam_vla.perception.segmentation_capture import (
     capture_frame_record,
     write_segmentation_assets,
 )
-from sam_vla.perception.spot_check_segmentation import build_palette, overlay_category_mask
+from sam_vla.perception.spot_check_segmentation import (
+    build_palette,
+    overlay_category_mask,
+)
 
 HERE = Path(__file__).resolve().parent
 
@@ -163,7 +166,11 @@ class MarsTeleopApp:
         self.pose_y = obs.pose.y
 
         self.category_mask, self.objects = capture_frame_record(
-            obs.rgb, obs.semantic, self.env.annotation_mesh_id_map, self.lut, self.class_names
+            obs.rgb,
+            obs.semantic,
+            self.env.annotation_mesh_id_map,
+            self.lut,
+            self.class_names,
         )
 
         panels = [obs.rgb]
@@ -172,7 +179,11 @@ class MarsTeleopApp:
         if SHOW_MASK_OVERLAY:
             panels.append(
                 overlay_category_mask(
-                    obs.rgb, self.category_mask, self.class_names, self.palette, MASK_OVERLAY_ALPHA
+                    obs.rgb,
+                    self.category_mask,
+                    self.class_names,
+                    self.palette,
+                    MASK_OVERLAY_ALPHA,
                 )
             )
         img_arr = np.hstack(panels)
@@ -225,7 +236,12 @@ class MarsTeleopApp:
                 }
                 for o in self.objects
             ],
-            camera_pose={"x": obs.pose.x, "y": obs.pose.y, "z": obs.pose.z, "yaw": obs.pose.yaw},
+            camera_pose={
+                "x": obs.pose.x,
+                "y": obs.pose.y,
+                "z": obs.pose.z,
+                "yaw": obs.pose.yaw,
+            },
             **paths,
         )
 

@@ -6,6 +6,7 @@ by eye (e.g. mars_belief_demo1/frames/mask_0006.png).
 
 Usage: python test_goal_pixel_ratio.py [path/to/mask.png]
 """
+
 import sys
 
 import numpy as np
@@ -29,9 +30,13 @@ def main():
     result = goal_pixel_ratio(goal_mask)
 
     total_px = goal_mask.shape[0] * goal_mask.shape[1]
-    assert result["goal_px"] + result["rest_px"] == total_px, "goal_px + rest_px must equal total pixel count"
+    assert (
+        result["goal_px"] + result["rest_px"] == total_px
+    ), "goal_px + rest_px must equal total pixel count"
     assert 0.0 <= result["frame_fraction"] <= 1.0, "frame_fraction must be in [0, 1]"
-    assert result["goal_px"] == int(np.count_nonzero(goal_mask)), "goal_px must match nonzero count in mask"
+    assert result["goal_px"] == int(
+        np.count_nonzero(goal_mask)
+    ), "goal_px must match nonzero count in mask"
 
     print(f"[test] mask: {mask_path} ({goal_mask.shape[1]}x{goal_mask.shape[0]})")
     print(f"[test] goal_px={result['goal_px']} rest_px={result['rest_px']}")

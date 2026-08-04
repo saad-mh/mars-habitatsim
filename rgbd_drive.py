@@ -111,9 +111,7 @@ def make_sim():
     agent_cfg = AgentConfiguration()
     agent_cfg.sensor_specifications = [rgb, depth]
 
-    return habitat_sim.Simulator(
-        habitat_sim.Configuration(sim_cfg, [agent_cfg])
-    )
+    return habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
 
 
 def save_obs(obs, idx, pose):
@@ -123,17 +121,13 @@ def save_obs(obs, idx, pose):
     if rgb.shape[-1] == 4:
         rgb = rgb[:, :, :3]
 
-    Image.fromarray(rgb.astype(np.uint8)).save(
-        f"{OUT_DIR}/rgb_{idx:04d}.png"
-    )
+    Image.fromarray(rgb.astype(np.uint8)).save(f"{OUT_DIR}/rgb_{idx:04d}.png")
 
     depth = obs["depth"]
     depth_clip = np.clip(depth, 0.0, 10.0)
     depth_vis = (depth_clip / 10.0 * 255.0).astype(np.uint8)
 
-    Image.fromarray(depth_vis).save(
-        f"{OUT_DIR}/depth_{idx:04d}.png"
-    )
+    Image.fromarray(depth_vis).save(f"{OUT_DIR}/depth_{idx:04d}.png")
 
     with open(f"{OUT_DIR}/poses.txt", "a") as f:
         f.write(

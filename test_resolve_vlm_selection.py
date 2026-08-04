@@ -3,6 +3,7 @@ Standalone test for resolve_vlm_selection(): imports it directly (no Tk, no labe
 
 Usage: python test_resolve_vlm_selection.py [frame_idx]
 """
+
 import json
 import sys
 
@@ -16,14 +17,21 @@ def main():
     overlay_path = f"{OUT_DIR}/rgb_{frame_idx:04d}_at.png"
     annotation_path = f"{ANNOTATIONS_DIR}/rgb_{frame_idx:04d}.json"
 
-    success, result, status_msg = resolve_vlm_selection(rgb_path, overlay_path, annotation_path, frame_idx)
+    success, result, status_msg = resolve_vlm_selection(
+        rgb_path, overlay_path, annotation_path, frame_idx
+    )
     if not success:
         print(f"[test] FAILED: {status_msg}")
         sys.exit(1)
 
     response, goal_mesh, obstacle_meshes = result
     print("[test] resolve_vlm_selection() succeeded")
-    print(json.dumps({"vlm_response": response, "goal": goal_mesh, "obstacles": obstacle_meshes}, indent=2))
+    print(
+        json.dumps(
+            {"vlm_response": response, "goal": goal_mesh, "obstacles": obstacle_meshes},
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

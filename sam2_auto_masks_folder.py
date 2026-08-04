@@ -36,16 +36,19 @@ MIN_MASK_REGION_AREA = 0
 
 OVERLAY_ALPHA = 0.45
 
+
 def natural_sort_key(path: Path):
     import re
+
     return [
-        int(part) if part.isdigit() else part
-        for part in re.split(r"(\d+)", path.name)
+        int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path.name)
     ]
+
 
 def load_rgb(path: Path) -> np.ndarray:
     img = Image.open(path).convert("RGB")
     return np.array(img)
+
 
 def make_overlay(image: np.ndarray, masks: list, alpha: float = 0.45):
     overlay = image.astype(np.float32).copy()
@@ -66,6 +69,7 @@ def make_overlay(image: np.ndarray, masks: list, alpha: float = 0.45):
 
     overlay = np.clip(overlay, 0, 255).astype(np.uint8)
     return overlay, id_map, masks_sorted
+
 
 def serialize_mask_metadata(masks_sorted: list):
     meta = []
@@ -90,6 +94,7 @@ def serialize_mask_metadata(masks_sorted: list):
         meta.append(item)
 
     return meta
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -244,9 +249,10 @@ def main():
     print("Mask IDs:", mask_dir)
     print("Metadata:", meta_dir)
 
+
 if __name__ == "__main__":
     main()
 
-'''
+"""
 ausage: python sam2_auto_masks_folder.py --input mars_teleop_out1783002646 --output sam2_test_out --sam2-root ~/Desktop/pineapple/sam2 --model-cfg configs/sam2.1/sam2.1_hiera_t.yaml --checkpoint checkpoints/sam2.1_hiera_tiny.pt --max-frames 5
-'''
+"""

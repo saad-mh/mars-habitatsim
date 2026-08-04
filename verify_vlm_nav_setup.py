@@ -19,6 +19,7 @@ from conda_env import resolve_conda_base
 
 HERE = Path(__file__).resolve().parent
 
+
 def check(description, condition):
     """Print a check result."""
     symbol = "✓" if condition else "✗"
@@ -26,10 +27,11 @@ def check(description, condition):
     print(f"[{symbol}] {description}: {status}")
     return condition
 
+
 def main():
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("VLM Navigation Interactive Setup Verification")
-    print("="*70 + "\n")
+    print("=" * 70 + "\n")
 
     all_pass = True
 
@@ -47,7 +49,7 @@ def main():
     all_pass &= check("Labels file (labels.txt)", os.path.exists(labels))
 
     if os.path.exists(labels):
-        with open(labels, 'r') as f:
+        with open(labels, "r") as f:
             content = f.read().strip()
             has_labels = "sand" in content and "rock" in content
             all_pass &= check("Labels file contains 'sand' and 'rock'", has_labels)
@@ -72,10 +74,7 @@ def main():
     if labelme_bin is not None and os.path.exists(labelme_bin):
         try:
             result = subprocess.run(
-                [labelme_bin, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5
+                [labelme_bin, "--version"], capture_output=True, text=True, timeout=5
             )
             version_ok = result.returncode == 0
             all_pass &= check("Labelme --version works", version_ok)
@@ -93,6 +92,7 @@ def main():
 
     try:
         import numpy
+
         all_pass &= check("numpy", True)
     except Exception as e:
         all_pass &= check("numpy", False)
@@ -100,6 +100,7 @@ def main():
 
     try:
         from PIL import Image, ImageTk
+
         all_pass &= check("PIL (Image, ImageTk)", True)
     except Exception as e:
         all_pass &= check("PIL (Image, ImageTk)", False)
@@ -107,6 +108,7 @@ def main():
 
     try:
         import tkinter as tk
+
         all_pass &= check("tkinter", True)
     except Exception as e:
         all_pass &= check("tkinter", False)
@@ -114,6 +116,7 @@ def main():
 
     try:
         import quaternion
+
         all_pass &= check("quaternion", True)
     except Exception as e:
         all_pass &= check("quaternion", False)
@@ -121,6 +124,7 @@ def main():
 
     try:
         import habitat_sim
+
         all_pass &= check("habitat_sim", True)
     except Exception as e:
         all_pass &= check("habitat_sim", False)
@@ -160,18 +164,25 @@ def main():
                 "description": "",
                 "shape_type": "rectangle",
                 "flags": {},
-                "mask": None
+                "mask": None,
             }
         ],
         "imagePath": "test.png",
         "imageData": None,
         "imageHeight": 480,
-        "imageWidth": 640
+        "imageWidth": 640,
     }
 
     try:
         # Validate required keys
-        required_keys = ["version", "flags", "shapes", "imagePath", "imageHeight", "imageWidth"]
+        required_keys = [
+            "version",
+            "flags",
+            "shapes",
+            "imagePath",
+            "imageHeight",
+            "imageWidth",
+        ]
         missing = [k for k in required_keys if k not in test_json]
         has_required = len(missing) == 0
 
@@ -190,7 +201,7 @@ def main():
     print()
 
     # Summary
-    print("="*70)
+    print("=" * 70)
     if all_pass:
         print("✓ ALL CHECKS PASSED - Ready to run vlm_nav_interactive.py")
         print("\n  Usage:")
@@ -199,7 +210,8 @@ def main():
     else:
         print("✗ SOME CHECKS FAILED - See errors above")
         sys.exit(1)
-    print("="*70 + "\n")
+    print("=" * 70 + "\n")
+
 
 if __name__ == "__main__":
     main()

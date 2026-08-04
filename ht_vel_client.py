@@ -5,10 +5,12 @@ import time
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5055
 
+
 def send_command(host, port, command):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.sendto(command.encode("utf-8"), (host, port))
     sock.close()
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -26,7 +28,7 @@ def main():
     rec = sub.add_parser("rec")
     rec.add_argument("mode", choices=["on", "off", "toggle"])
     sub.add_parser("save")
-    clearance =sub.add_parser("clearance")
+    clearance = sub.add_parser("clearance")
     clearance.add_argument("meters", type=float)
     sub.add_parser("quit")
 

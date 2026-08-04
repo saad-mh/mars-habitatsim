@@ -132,10 +132,14 @@ class GoToGoalController:
         target_bearing = -np.arctan2(dx, -dz)
 
         if debug:
-            print(f"[DEBUG] rover: ({rover_x:.2f}, {rover_z:.2f}) yaw={np.rad2deg(rover_yaw):.1f}°")
+            print(
+                f"[DEBUG] rover: ({rover_x:.2f}, {rover_z:.2f}) yaw={np.rad2deg(rover_yaw):.1f}°"
+            )
             print(f"[DEBUG] target: ({self.target_x:.2f}, {self.target_z:.2f})")
             print(f"[DEBUG] delta: dx={dx:.2f}, dz={dz:.2f}")
-            print(f"[DEBUG] bearing={np.rad2deg(target_bearing):.1f}°, distance={distance:.2f}m")
+            print(
+                f"[DEBUG] bearing={np.rad2deg(target_bearing):.1f}°, distance={distance:.2f}m"
+            )
 
         # Heading error: wrap to [-pi, pi]
         heading_error = target_bearing - rover_yaw
@@ -152,7 +156,11 @@ class GoToGoalController:
         # Rotate in place if heading error is large
         elif abs(heading_error) > HEADING_ERROR_THRESHOLD:
             linear_x = 0.0
-            angular_y = np.sign(heading_error) * MAX_ANGULAR_VELOCITY * PROPORTIONAL_GAIN_ANGULAR
+            angular_y = (
+                np.sign(heading_error)
+                * MAX_ANGULAR_VELOCITY
+                * PROPORTIONAL_GAIN_ANGULAR
+            )
         # Drive forward with heading correction
         else:
             linear_x = MAX_LINEAR_VELOCITY
@@ -252,9 +260,7 @@ def make_sim():
     agent_cfg = AgentConfiguration()
     agent_cfg.sensor_specifications = [rgb]
 
-    return habitat_sim.Simulator(
-        habitat_sim.Configuration(sim_cfg, [agent_cfg])
-    )
+    return habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
 
 
 def rgb_from_obs(obs):
@@ -343,7 +349,9 @@ class SegmentationResultWindow:
         btn_frame = tk.Frame(self.win)
         btn_frame.pack(pady=8)
         tk.Button(btn_frame, text="Save", command=self.save).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Close", command=self.win.destroy).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Close", command=self.win.destroy).pack(
+            side=tk.LEFT, padx=5
+        )
 
         self.win.bind("<KeyPress-s>", lambda e: self.save())
 
@@ -351,7 +359,9 @@ class SegmentationResultWindow:
     def _draw_box(draw, box, color):
         x, y, w, h = box["x"], box["y"], box["width"], box["height"]
         draw.rectangle([x, y, x + w, y + h], outline=color, width=2)
-        draw.text((x, max(0, y - 12)), f"{box['class_name']} ({box['area']})", fill=color)
+        draw.text(
+            (x, max(0, y - 12)), f"{box['class_name']} ({box['area']})", fill=color
+        )
 
     def save(self):
         os.makedirs(OUT_DIR, exist_ok=True)
@@ -446,7 +456,9 @@ class MarsCameraApp:
     def capture_and_segment(self):
         rgb = self.latest_rgb.copy()
         pose = {
-            "x": self.x, "y": self.y, "z": self.z,
+            "x": self.x,
+            "y": self.y,
+            "z": self.z,
             "yaw_deg": float(np.rad2deg(self.yaw)),
         }
 

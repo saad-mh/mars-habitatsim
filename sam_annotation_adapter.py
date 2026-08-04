@@ -72,13 +72,15 @@ def sam_boxes_to_shapes(sam_boxes):
         label = SAM_LABEL_MAP[class_name]
         for box in sam_boxes.get(class_name, []):
             x, y, w, h = box["x"], box["y"], box["width"], box["height"]
-            shapes.append({
-                "label": label,
-                "points": [[x, y], [x + w, y + h]],
-                "group_id": None,
-                "shape_type": "rectangle",
-                "flags": {},
-            })
+            shapes.append(
+                {
+                    "label": label,
+                    "points": [[x, y], [x + w, y + h]],
+                    "group_id": None,
+                    "shape_type": "rectangle",
+                    "flags": {},
+                }
+            )
     return shapes
 
 
@@ -205,7 +207,9 @@ def run_sam_vlm_on_frame(source_frame_idx, target_frame_idx, model=None):
 
     rgb_path = f"{OUT_DIR}/rgb_{target_frame_idx:04d}.png"
     annotation_path = f"{ANNOTATIONS_DIR}/rgb_{target_frame_idx:04d}.json"
-    annotation_path, is_valid, status = sam_frame_to_annotation(rgb_path, annotation_path, model=model)
+    annotation_path, is_valid, status = sam_frame_to_annotation(
+        rgb_path, annotation_path, model=model
+    )
     print(f"[sam] wrote {annotation_path} valid={is_valid} status={status!r}")
     if not is_valid:
         raise RuntimeError(f"SAM annotation failed validate_annotation_json: {status}")
@@ -219,18 +223,26 @@ if __name__ == "__main__":
         # a fresh frame slot so an existing labelme annotation is untouched.
         # usage: python sam_annotation_adapter.py --full <source_frame_idx> <target_frame_idx>
         if len(sys.argv) < 4:
-            print("usage: python sam_annotation_adapter.py --full <source_frame_idx> <target_frame_idx>")
+            print(
+                "usage: python sam_annotation_adapter.py --full <source_frame_idx> <target_frame_idx>"
+            )
             sys.exit(1)
         run_sam_vlm_on_frame(int(sys.argv[2]), int(sys.argv[3]))
     else:
         image_path = sys.argv[1] if len(sys.argv) > 1 else "vlm_nav_out/rgb_0000.png"
         out_path = sys.argv[2] if len(sys.argv) > 2 else "annotations/rgb_0000_sam.json"
 
-        annotation_path, is_valid, status = sam_frame_to_annotation(image_path, out_path)
+        annotation_path, is_valid, status = sam_frame_to_annotation(
+            image_path, out_path
+        )
         print(f"[adapter] wrote {annotation_path}")
-        print(f"[adapter] validate_annotation_json -> valid={is_valid} status={status!r}")
+        print(
+            f"[adapter] validate_annotation_json -> valid={is_valid} status={status!r}"
+        )
 
         with open(annotation_path) as f:
             data = json.load(f)
         for shape in data["shapes"]:
-            print(f"  id={shape['id']} label={shape['label']!r} points={shape['points']}")
+            print(
+                f"  id={shape['id']} label={shape['label']!r} points={shape['points']}"
+            )

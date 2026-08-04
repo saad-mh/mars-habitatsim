@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-
 # ============================================================
 # SETTINGS
 # ============================================================
@@ -29,22 +28,14 @@ def natural_key(path):
     Sort rgb_0001.png, rgb_0002.png, ..., rgb_0010.png correctly.
     """
     name = os.path.basename(path)
-    return [
-        int(part) if part.isdigit() else part
-        for part in re.split(r"(\d+)", name)
-    ]
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
 
 
 def find_latest_recording_folder(pattern):
-    folders = [
-        p for p in glob.glob(pattern)
-        if os.path.isdir(p)
-    ]
+    folders = [p for p in glob.glob(pattern) if os.path.isdir(p)]
 
     if not folders:
-        raise FileNotFoundError(
-            f"No recording folders found with pattern: {pattern}"
-        )
+        raise FileNotFoundError(f"No recording folders found with pattern: {pattern}")
 
     folders.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return folders[0]
@@ -57,6 +48,7 @@ def get_ffmpeg():
     """
     try:
         import imageio_ffmpeg
+
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return "ffmpeg"
@@ -87,11 +79,16 @@ def frames_to_video(files, out_video, fps):
         cmd = [
             ffmpeg,
             "-y",
-            "-framerate", str(fps),
-            "-i", input_pattern,
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-framerate",
+            str(fps),
+            "-i",
+            input_pattern,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
             out_video,
         ]
 
@@ -112,7 +109,7 @@ def main():
         "--input",
         default=None,
         help="Recording folder. Example: mars_teleop_out1783002246. "
-             "If omitted, latest mars_teleop_out* folder is used.",
+        "If omitted, latest mars_teleop_out* folder is used.",
     )
 
     parser.add_argument(

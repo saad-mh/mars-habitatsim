@@ -45,10 +45,16 @@ def build_prompt(prompt, annotation_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rgb", required=True, help="path to raw RGB frame")
-    parser.add_argument("--overlay", required=False, help="path to annotated overlay image")
-    parser.add_argument("--annotation", required=True, help="path to labelme annotation JSON")
+    parser.add_argument(
+        "--overlay", required=False, help="path to annotated overlay image"
+    )
+    parser.add_argument(
+        "--annotation", required=True, help="path to labelme annotation JSON"
+    )
     parser.add_argument("--prompt", required=True, help="question to ask the VLM")
-    parser.add_argument("--out", required=True, help="path to write the generated response")
+    parser.add_argument(
+        "--out", required=True, help="path to write the generated response"
+    )
     args = parser.parse_args()
 
     text_prompt = build_prompt(args.prompt, args.annotation)
@@ -93,7 +99,7 @@ def main():
         generated_ids = model.generate(**inputs, max_new_tokens=1024)
 
     generated_ids_trimmed = [
-        out_ids[len(in_ids):]
+        out_ids[len(in_ids) :]
         for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     output_text = processor.batch_decode(

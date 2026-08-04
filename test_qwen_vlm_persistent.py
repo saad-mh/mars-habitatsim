@@ -32,8 +32,11 @@ def main():
     for i in range(args.n):
         t0 = time.time()
         text = query_vlm_persistent(
-            args.rgb, prompt=args.prompt, max_new_tokens=args.max_new_tokens,
-            host=args.host, port=args.port,
+            args.rgb,
+            prompt=args.prompt,
+            max_new_tokens=args.max_new_tokens,
+            host=args.host,
+            port=args.port,
         )
         dt = time.time() - t0
         latencies.append(dt)

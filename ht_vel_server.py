@@ -37,8 +37,8 @@ START_YAW_DEG = 0.0
 UPDATE_HZ = 30.0
 
 # Velocity limits
-MAX_LINEAR_X = 1.0       # m/s
-MAX_ANGULAR_Y = 1.5      # rad/s
+MAX_LINEAR_X = 1.0  # m/s
+MAX_ANGULAR_Y = 1.5  # rad/s
 
 # Deadband
 LINEAR_DEADBAND = 0.01
@@ -91,8 +91,10 @@ def load_heightmap(path):
 
     return y
 
+
 HEIGHT = load_heightmap(HEIGHTMAP)
 HM_H, HM_W = HEIGHT.shape
+
 
 def terrain_height_at(x, z):
     if SWAP_HEIGHTMAP_XZ:
@@ -121,6 +123,7 @@ def terrain_height_at(x, z):
     h1 = h01 * (1.0 - dx) + h11 * dx
     return float(h0 * (1.0 - dy) + h1 * dy)
 
+
 def make_sensor(uuid, sensor_type):
     spec = habitat_sim.CameraSensorSpec()
     spec.uuid = uuid
@@ -130,6 +133,7 @@ def make_sensor(uuid, sensor_type):
     spec.position = [0.0, 0.0, 0.0]
     return spec
 
+
 def make_sim():
     sim_cfg = habitat_sim.SimulatorConfiguration()
     sim_cfg.scene_id = SCENE
@@ -138,9 +142,8 @@ def make_sim():
     depth = make_sensor("depth", habitat_sim.SensorType.DEPTH)
     agent_cfg = AgentConfiguration()
     agent_cfg.sensor_specifications = [rgb, depth]
-    return habitat_sim.Simulator(
-        habitat_sim.Configuration(sim_cfg, [agent_cfg])
-    )
+    return habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
+
 
 def rgb_depth_from_obs(obs):
     rgb = obs["rgb"]
@@ -152,6 +155,7 @@ def rgb_depth_from_obs(obs):
     depth_vis = (depth_clip / DEPTH_VIS_MAX_METERS * 255.0).astype(np.uint8)
     depth_rgb = np.stack([depth_vis, depth_vis, depth_vis], axis=-1)
     return rgb, depth_vis, depth_rgb
+
 
 def apply_boundary(x, z, old_x, old_z):
     inside = (
@@ -166,6 +170,7 @@ def apply_boundary(x, z, old_x, old_z):
         float(np.clip(x, -BOUNDARY_LIMIT, BOUNDARY_LIMIT)),
         float(np.clip(z, -BOUNDARY_LIMIT, BOUNDARY_LIMIT)),
     )
+
 
 class HabitatVelocityServer:
     def __init__(self):
@@ -197,8 +202,7 @@ class HabitatVelocityServer:
         self.info_label = tk.Label(
             self.root,
             text=(
-                "UDP ht_vel server | SPACE record | P save | "
-                "Q/E height | X/ESC quit"
+                "UDP ht_vel server | SPACE record | P save | " "Q/E height | X/ESC quit"
             ),
             font=("Arial", 12),
         )
@@ -227,7 +231,9 @@ class HabitatVelocityServer:
         cmd = parts[0].lower()
         if cmd == "ht_vel":
             if len(parts) != 3:
-                print("[e] bad ht_vel command. suggested usage: ht_vel <linear_x> <angular_y>")
+                print(
+                    "[e] bad ht_vel command. suggested usage: ht_vel <linear_x> <angular_y>"
+                )
                 return
             lin = float(parts[1])
             ang = float(parts[2])
@@ -276,7 +282,9 @@ class HabitatVelocityServer:
 
         elif cmd == "ht_clearance":
             if len(parts) != 2:
-                print("[e] bad ht_clearance command. suggested usage: ht_clearance <meters>")
+                print(
+                    "[e] bad ht_clearance command. suggested usage: ht_clearance <meters>"
+                )
                 return
 
             self.clearance = float(parts[1])
@@ -374,8 +382,7 @@ class HabitatVelocityServer:
         )
 
         controls = (
-            "UDP: ht_vel lin_x ang_y | SPACE rec | "
-            "P save | Q/E height | X quit"
+            "UDP: ht_vel lin_x ang_y | SPACE rec | " "P save | Q/E height | X quit"
         )
 
         draw.rectangle([0, 0, img.width, 60], fill=(0, 0, 0))

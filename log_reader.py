@@ -7,6 +7,7 @@ Single-episode mode:
 Batch mode (walks every episode dir under a root):
     python log_reader.py --root-dir logs --k 5 --format csv --output out.csv
 """
+
 import argparse
 import csv
 import json
@@ -48,12 +49,16 @@ def closest_obstacles(summary: dict, k: int):
 
 def parse_episode(episode_dir: Path, k: int):
     summary = load_json(episode_dir / "summary.json")
-    config = load_json(episode_dir / "config.json") if (episode_dir / "config.json").is_file() else {}
+    config = (
+        load_json(episode_dir / "config.json")
+        if (episode_dir / "config.json").is_file()
+        else {}
+    )
     qwen_queries = load_jsonl(episode_dir / "qwen_queries.jsonl")
     cbf_events = load_jsonl(episode_dir / "cbf_events.jsonl")
 
     top_k = closest_obstacles(summary, k)
-    overall_closest_id, overall_closest_dist = (top_k[0] if top_k else (None, None))
+    overall_closest_id, overall_closest_dist = top_k[0] if top_k else (None, None)
 
     return {
         "run_id": summary.get("run_id", episode_dir.name),
@@ -84,8 +89,10 @@ def print_episode_table(rows, k):
         print(f"final_distance_to_goal: {row['final_distance_to_goal']}")
         print(f"num_cbf_interventions:  {row['num_cbf_interventions']}")
         print(f"num_qwen_queries:       {row['num_qwen_queries']}")
-        print(f"goal_mode/steering:     {row['goal_mode']}/{row['steering_mode']}  "
-              f"(obstacles={row['obstacle_count']}, seed={row['obstacle_seed']})")
+        print(
+            f"goal_mode/steering:     {row['goal_mode']}/{row['steering_mode']}  "
+            f"(obstacles={row['obstacle_count']}, seed={row['obstacle_seed']})"
+        )
         print(f"{k} closest obstacles:")
         for obs_id, dist in row["top_k_closest"]:
             print(f"    {obs_id:20s} {dist:.3f}")
@@ -96,23 +103,45 @@ def print_aggregate_table(rows):
     n = len(rows)
     n_success = sum(1 for r in rows if r["success"])
     steps = [r["total_steps"] for r in rows if r["total_steps"] is not None]
-    closest = [r["closest_obstacle_dist"] for r in rows if r["closest_obstacle_dist"] is not None]
+    closest = [
+        r["closest_obstacle_dist"]
+        for r in rows
+        if r["closest_obstacle_dist"] is not None
+    ]
     qwen = [r["num_qwen_queries"] for r in rows if r["num_qwen_queries"] is not None]
 
     print(f"episodes:          {n}")
-    print(f"successes:         {n_success} ({100.0 * n_success / n:.1f}%)" if n else "successes:         0")
+    print(
+        f"successes:         {n_success} ({100.0 * n_success / n:.1f}%)"
+        if n
+        else "successes:         0"
+    )
     if steps:
-        print(f"steps  min/avg/max: {min(steps)} / {sum(steps) / len(steps):.1f} / {max(steps)}")
+        print(
+            f"steps  min/avg/max: {min(steps)} / {sum(steps) / len(steps):.1f} / {max(steps)}"
+        )
     if closest:
-        print(f"closest-obstacle min/avg/max: {min(closest):.3f} / {sum(closest) / len(closest):.3f} / {max(closest):.3f}")
+        print(
+            f"closest-obstacle min/avg/max: {min(closest):.3f} / {sum(closest) / len(closest):.3f} / {max(closest):.3f}"
+        )
     if qwen:
-        print(f"qwen queries min/avg/max: {min(qwen)} / {sum(qwen) / len(qwen):.1f} / {max(qwen)}")
+        print(
+            f"qwen queries min/avg/max: {min(qwen)} / {sum(qwen) / len(qwen):.1f} / {max(qwen)}"
+        )
     print("-" * 60)
-    print(f"{'run_id':<45} {'success':<8} {'steps':<6} {'reason':<20} {'closest_id':<15} {'closest_dist':<12} {'qwen':<5}")
+    print(
+        f"{'run_id':<45} {'success':<8} {'steps':<6} {'reason':<20} {'closest_id':<15} {'closest_dist':<12} {'qwen':<5}"
+    )
     for r in rows:
-        cd = f"{r['closest_obstacle_dist']:.3f}" if r["closest_obstacle_dist"] is not None else "-"
-        print(f"{r['run_id']:<45} {str(r['success']):<8} {str(r['total_steps']):<6} "
-              f"{str(r['termination_reason']):<20} {str(r['closest_obstacle_id']):<15} {cd:<12} {str(r['num_qwen_queries']):<5}")
+        cd = (
+            f"{r['closest_obstacle_dist']:.3f}"
+            if r["closest_obstacle_dist"] is not None
+            else "-"
+        )
+        print(
+            f"{r['run_id']:<45} {str(r['success']):<8} {str(r['total_steps']):<6} "
+            f"{str(r['termination_reason']):<20} {str(r['closest_obstacle_id']):<15} {cd:<12} {str(r['num_qwen_queries']):<5}"
+        )
 
 
 def write_json(rows, path):
@@ -129,18 +158,42 @@ def write_csv(rows, path):
         writer.writeheader()
         for row in rows:
             out = {k: row[k] for k in fieldnames}
-            out["top_k_closest"] = ";".join(f"{oid}:{dist:.3f}" for oid, dist in row["top_k_closest"])
+            out["top_k_closest"] = ";".join(
+                f"{oid}:{dist:.3f}" for oid, dist in row["top_k_closest"]
+            )
             writer.writerow(out)
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--log-dir", type=Path, help="Path to a single episode log directory")
-    src.add_argument("--root-dir", type=Path, help="Path to logs/ root; parses every episode dir inside it")
-    ap.add_argument("-k", type=int, default=5, help="Number of closest obstacle distances to report per episode (default: 5)")
-    ap.add_argument("--format", choices=["table", "json", "csv"], default="table", help="Output format (default: table)")
-    ap.add_argument("--output", type=Path, help="Write output to this file instead of stdout (required for csv/json unless --format table)")
+    src.add_argument(
+        "--log-dir", type=Path, help="Path to a single episode log directory"
+    )
+    src.add_argument(
+        "--root-dir",
+        type=Path,
+        help="Path to logs/ root; parses every episode dir inside it",
+    )
+    ap.add_argument(
+        "-k",
+        type=int,
+        default=5,
+        help="Number of closest obstacle distances to report per episode (default: 5)",
+    )
+    ap.add_argument(
+        "--format",
+        choices=["table", "json", "csv"],
+        default="table",
+        help="Output format (default: table)",
+    )
+    ap.add_argument(
+        "--output",
+        type=Path,
+        help="Write output to this file instead of stdout (required for csv/json unless --format table)",
+    )
     args = ap.parse_args()
 
     root = args.log_dir if args.log_dir else args.root_dir
