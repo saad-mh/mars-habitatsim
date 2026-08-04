@@ -1,3 +1,16 @@
+"""
+conda activate habitat
+python -m sam_vla.run_navdp_rollout \
+    --scene-path assets/marsyard2022.glb \
+    --heightmap-path marsyard2022_terrain_hm_1025.tif \
+    --ckpt navdp/runs/belief_only_policy/belief_only_policy.pt \
+    --navdp-root ./navdp \
+    --base-station --dwell-seconds 3 --goal-success-radius 1.0 \
+    --max-steps 100 --cbf --save-video --save-frames \
+    --out-dir base_station_smoke_test
+
+"""
+
 import argparse
 import math
 import time, datetime
@@ -242,6 +255,13 @@ def run(
             "--base-station and --multi-goal are mutually exclusive -- they solve "
             "different problems, see next.md §1"
         )
+    # Both --multi-goal and --base-station need `from navdp.extensions import ...`
+    # before NavdpPolicy is constructed below (that's normally what puts navdp_root
+    # on sys.path, via its own _add_navdp_to_path call) -- do it here first so those
+    # earlier imports resolve regardless of setup order.
+    from sam_vla.policy.navdp_policy import _add_navdp_to_path, _resolve_navdp_root
+
+    _add_navdp_to_path(_resolve_navdp_root(navdp_root))
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     # Still needed for the one-shot first-frame goal selection below
