@@ -209,7 +209,7 @@ def run(
     dt: float = 0.1,
     save_video: bool = False,
     save_frames: bool = False,
-    video_fps: int = 10,
+    video_fps: int = 30,
     start_x: float = 0.0,
     start_z: float = 8.0,
     start_yaw_deg: float = 0.0,
@@ -409,7 +409,13 @@ def run(
             # per-step odometry dead-reckoning (already running every OUTBOUND step
             # below) tracks the true return offset the whole way out.
             bank.update(
-                {"base_station": {"visible": True, "position": [0.0, 0.0], "confidence": 1.0}},
+                {
+                    "base_station": {
+                        "visible": True,
+                        "position": [0.0, 0.0],
+                        "confidence": 1.0,
+                    }
+                },
                 odom_delta=[0.0, 0.0, 0.0],
                 step=-1,
             )
