@@ -18,7 +18,7 @@ Also drives vl_direction's third mode, "uncertainty", via UncertaintySession --
 this script has no real belief tracker, so a synthetic covariance proxy drifts
 up while no synthetic obstacle is close enough to act as a visual anchor and
 resets when one is. Crossing the threshold halts keyboard movement and normal
-cbf/exploration dispatch, asks InternVL for a sweep description, and waits for
+cbf/exploration dispatch, asks Qwen for a sweep description, and waits for
 a human-supplied heading (numpad keys 1/2/3/4/6/7/8/9, or R to retry) before
 resuming -- press U at any time to force-trigger the halt for testing instead
 of waiting on/tuning the organic drift.
@@ -28,12 +28,12 @@ boundary clamping) via import rather than duplicating it -- this script only
 adds the obstacle field, projection/overlay, and the VL call.
 
 Run inside the "habitat" conda env from the repo root (so vl_direction is
-importable and InternVLServerManager's subprocess cwd is correct):
+importable and QwenServerManager's subprocess cwd is correct):
     conda activate habitat && python kb_teleop_vl.py [--vl-every-n-frames N]
-InternVLServerManager spawns internvl_server.py in the "vl" conda env on
-first use and loads InternVL3-8B (weights are already cached locally, so
-this is mostly GPU-load time); the window opens once that health check
-passes.
+QwenServerManager spawns vl_direction/qwen_server.py in the "qwen_vlm" conda
+env on first use and loads Qwen2.5-VL-3B-Instruct (weights are already
+cached locally, so this is mostly GPU-load time); the window opens once that
+health check passes.
 
 VL queries are dispatched on a background thread and gated to run every
 --vl-every-n-frames frames or every VL_QUERY_EVERY_N_SECONDS seconds,
@@ -58,10 +58,16 @@ import tkinter as tk
 import quaternion
 
 import kb_teleop as kb
+from sam_vla.core.belief_tracking import uncertainty_growth_increment
+from sam_vla.core.ghost_mask import (
+    draw_ghost_mask,
+    project_body_point_to_pixel,
+    uncertainty_to_radius_px,
+)
 from vl_direction import config as vl_dir_config
 from vl_direction.client import get_client
 from vl_direction.directive_engine import query as vl_query
-from vl_direction.internvl_server_manager import InternVLServerManager
+from vl_direction.qwen_server_manager import QwenServerManager
 from vl_direction.schemas import CBFContext, ExplorationContext
 from vl_direction.uncertainty_session import UncertaintySession
 
@@ -79,6 +85,15 @@ EXPLORATION_TASK_STR = "explore the terrain ahead"
 UNCERTAINTY_GROUNDING_RANGE_M = CBF_DISTANCE_THRESHOLD_M
 DEFAULT_UNCERTAINTY_COVARIANCE_THRESHOLD = vl_dir_config.DEFAULT_COVARIANCE_THRESHOLD
 DEFAULT_UNCERTAINTY_GROWTH_PER_STEP = 0.1
+DEFAULT_UNCERTAINTY_GROWTH_RATE = 0.0
+
+# --- ghost mask: translucent green circle at the stand-in "lost goal" (nearest
+# obstacle's body-frame point, reused here only because this script has no
+# real goal-tracking subsystem) whose radius tracks self.uncertainty_covariance,
+# same value that drives the uncertainty halt above -- see sam_vla/core/ghost_mask.py
+# and next.md's Phase 1. Scale is picked so the ghost saturates to
+# OVERLAY_MAX_PIXEL_RADIUS right as uncertainty reaches the halt threshold. ---
+GHOST_ALPHA = 0.45
 UNCERTAINTY_HEADING_KEYS = {
     "8": 0.0,
     "9": 45.0,
@@ -138,6 +153,19 @@ def project_point(px_world, py_world, pz_world, rover_x, rover_y, rover_z, yaw):
     return pixel_x, pixel_y, depth
 
 
+def body_frame_forward_left(px_world, pz_world, rover_x, rover_z, yaw):
+    """World-plane point -> body-frame [forward, left], the same convention
+    BeliefGoalTracker/ghost_mask use. Ground-plane-only counterpart of
+    project_point's forward/right math above (no vertical/pixel component)."""
+    dx = px_world - rover_x
+    dz = pz_world - rover_z
+    forward_x, forward_z = -math.sin(yaw), -math.cos(yaw)
+    right_x, right_z = math.cos(yaw), -math.sin(yaw)
+    forward = dx * forward_x + dz * forward_z
+    right = dx * right_x + dz * right_z
+    return forward, -right
+
+
 def overlay_obstacles(rgb, projected_circles):
     """Alpha-blends solid red circles onto rgb (uint8 HWC) at each
     (pixel_x, pixel_y, pixel_radius) in projected_circles."""
@@ -161,6 +189,7 @@ class VLTeleopApp:
         vl_query_every_n_frames=DEFAULT_VL_QUERY_EVERY_N_FRAMES,
         uncertainty_covariance_threshold=DEFAULT_UNCERTAINTY_COVARIANCE_THRESHOLD,
         uncertainty_growth_per_step=DEFAULT_UNCERTAINTY_GROWTH_PER_STEP,
+        uncertainty_growth_rate=DEFAULT_UNCERTAINTY_GROWTH_RATE,
     ):
         self.vl_query_every_n_frames = vl_query_every_n_frames
         self.vl_query_every_n_seconds = VL_QUERY_EVERY_N_SECONDS
@@ -171,11 +200,18 @@ class VLTeleopApp:
 
         self.uncertainty_covariance_threshold = uncertainty_covariance_threshold
         self.uncertainty_growth_per_step = uncertainty_growth_per_step
+        self.uncertainty_growth_rate = uncertainty_growth_rate
         self.uncertainty_covariance = 0.0
+        self.uncertainty_time_since_seen = 0.0
         self.halted_for_uncertainty = False
         self.uncertainty_request_in_flight = False
         self.last_uncertainty_line = ""
         self.last_annotated_rgb = None
+        # Ghost radius saturates to OVERLAY_MAX_PIXEL_RADIUS right as
+        # uncertainty_covariance reaches the halt threshold.
+        self.ghost_radius_scale = OVERLAY_MAX_PIXEL_RADIUS / max(
+            uncertainty_covariance_threshold, 1e-6
+        )
 
         self.sim = kb.make_sim()
         self.agent = self.sim.initialize_agent(0)
@@ -197,15 +233,15 @@ class VLTeleopApp:
             + ", ".join(f"({o[0]:.1f},{o[2]:.1f})" for o in self.obstacles)
         )
 
-        self.server_manager = InternVLServerManager()
+        self.server_manager = QwenServerManager()
         if USE_MOCK_CLIENT:
             self.client = get_client("mock")
         else:
             print(
-                "[VLTeleopApp] starting InternVL server (loads InternVL3-8B in the 'vl' conda env)"
+                "[VLTeleopApp] starting Qwen server (loads Qwen2.5-VL-3B-Instruct in the 'qwen_vlm' conda env)"
             )
             self.server_manager.start()
-            self.client = get_client()
+            self.client = get_client("qwen")
 
         print(
             f"[VLTeleopApp] VL query cadence: every {self.vl_query_every_n_frames} frames "
@@ -228,7 +264,7 @@ class VLTeleopApp:
         self.last_vl_line = ""
 
         self.root = tk.Tk()
-        self.root.title("Kb Teleop + InternVL")
+        self.root.title("Kb Teleop + Qwen")
 
         self.image_label = tk.Label(self.root)
         self.image_label.pack()
@@ -271,7 +307,14 @@ class VLTeleopApp:
         for ox, oy, oz in self.obstacles:
             edge_distance = math.hypot(ox - self.x, oz - self.z) - OBSTACLE_RADIUS_M
             if nearest_any is None or edge_distance < nearest_any["edge_distance"]:
-                nearest_any = {"edge_distance": edge_distance}
+                forward, left = body_frame_forward_left(
+                    ox, oz, self.x, self.z, self.yaw
+                )
+                nearest_any = {
+                    "edge_distance": edge_distance,
+                    "forward": forward,
+                    "left": left,
+                }
 
             projected = project_point(ox, oy, oz, self.x, self.y, self.z, self.yaw)
             if projected is None:
@@ -404,8 +447,12 @@ class VLTeleopApp:
     def _update_uncertainty_covariance(self, nearest_any):
         """Synthetic proxy for a real covariance signal -- this script has no
         belief tracker to source one from. Drifts up while no obstacle is
-        close enough to act as a visual anchor, resets when one is. Frozen
-        while already halted so it can't re-trigger mid-halt."""
+        close enough to act as a visual anchor, resets when one is, using the
+        same accelerating-drift formula as BeliefGoalTracker.propagate()
+        (sam_vla.core.belief_tracking.uncertainty_growth_increment) so this
+        demo and the real Phase 2 wiring exercise one formula, not two
+        divergent ones. Frozen while already halted so it can't re-trigger
+        mid-halt."""
         if self.halted_for_uncertainty:
             return
         grounded = (
@@ -414,8 +461,14 @@ class VLTeleopApp:
         )
         if grounded:
             self.uncertainty_covariance = 0.0
+            self.uncertainty_time_since_seen = 0.0
         else:
-            self.uncertainty_covariance += self.uncertainty_growth_per_step
+            self.uncertainty_time_since_seen += 1.0  # one render() call per step
+            self.uncertainty_covariance += uncertainty_growth_increment(
+                self.uncertainty_growth_per_step,
+                self.uncertainty_growth_rate,
+                self.uncertainty_time_since_seen,
+            )
 
     def _dispatch_uncertainty_request(self, retry):
         """Enters (or re-enters, on retry) the uncertainty halt: dispatches
@@ -437,7 +490,7 @@ class VLTeleopApp:
 
     def _uncertainty_worker(self, session_method, frame):
         """Runs on a background thread -- calls UncertaintySession's request
-        or retry method (a real InternVL sweep-description call). Never
+        or retry method (a real Qwen sweep-description call). Never
         touches Tkinter directly; schedules the UI update via root.after."""
         try:
             result = session_method(frame)
@@ -494,6 +547,7 @@ class VLTeleopApp:
         print(line)
         self.last_uncertainty_line = line
         self.uncertainty_covariance = 0.0
+        self.uncertainty_time_since_seen = 0.0
         self.halted_for_uncertainty = False
         self.render()
 
@@ -505,6 +559,33 @@ class VLTeleopApp:
 
         circles, nearest_any, nearest_visible = self._project_obstacles()
         annotated_rgb = overlay_obstacles(rgb, circles)
+
+        # Ghost mask: translucent green circle at a stand-in "lost goal" point
+        # (nearest obstacle's body-frame position -- this script has no real
+        # goal to track), radius driven by self.uncertainty_covariance, the
+        # same synthetic uncertainty signal that drives the halt above. Purely
+        # visual/advisory: only ever touches this VLM/display copy of the
+        # frame, never anything fed to a policy (there is none here).
+        if nearest_any is not None:
+            ghost_px = project_body_point_to_pixel(
+                nearest_any["forward"],
+                nearest_any["left"],
+                CAMERA_HFOV_DEG,
+                _FRAME_H,
+                _FRAME_W,
+            )
+            if ghost_px is not None:
+                ghost_u, ghost_v = ghost_px
+                ghost_radius = uncertainty_to_radius_px(
+                    self.uncertainty_covariance,
+                    OVERLAY_MIN_PIXEL_RADIUS,
+                    OVERLAY_MAX_PIXEL_RADIUS,
+                    self.ghost_radius_scale,
+                )
+                annotated_rgb = draw_ghost_mask(
+                    annotated_rgb, ghost_u, ghost_v, ghost_radius, alpha=GHOST_ALPHA
+                )
+
         self.last_annotated_rgb = annotated_rgb
 
         self._update_uncertainty_covariance(nearest_any)
@@ -624,9 +705,18 @@ def _parse_args():
         "--cov-growth",
         type=float,
         default=DEFAULT_UNCERTAINTY_GROWTH_PER_STEP,
-        help="per-frame covariance growth while no synthetic obstacle is nearby "
+        help="base per-frame covariance growth while no synthetic obstacle is nearby "
         f"(default {DEFAULT_UNCERTAINTY_GROWTH_PER_STEP}); press U in-app to "
         "force-trigger the halt instead of waiting on this",
+    )
+    parser.add_argument(
+        "--cov-growth-rate",
+        type=float,
+        default=DEFAULT_UNCERTAINTY_GROWTH_RATE,
+        help="accelerating-drift factor: growth speeds up the longer the "
+        f"target has been ungrounded (default {DEFAULT_UNCERTAINTY_GROWTH_RATE}, "
+        "i.e. flat per-frame growth unless overridden); also drives the "
+        "ghost-mask radius alongside --cov-growth",
     )
     args = parser.parse_args()
     if args.qwery_n < 1:
@@ -640,5 +730,6 @@ if __name__ == "__main__":
         vl_query_every_n_frames=args.qwery_n,
         uncertainty_covariance_threshold=args.cov_thresh,
         uncertainty_growth_per_step=args.cov_growth,
+        uncertainty_growth_rate=args.cov_growth_rate,
     )
     app.run()

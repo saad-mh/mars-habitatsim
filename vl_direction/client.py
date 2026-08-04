@@ -124,12 +124,44 @@ class InternVLSocketClient:
         return response["result"]["text"]
 
 
+class QwenSocketClient:
+    """Same generate() shape as InternVLSocketClient, talking to
+    vl_direction/qwen_server.py (port distinct from InternVL's and from
+    sam_vla/vlm/qwen_server's) instead of internvl_server.py."""
+
+    def __init__(
+        self,
+        host: typing.Optional[str] = None,
+        port: typing.Optional[int] = None,
+        timeout: float = 30.0,
+    ):
+        self.host = host or config.QWEN_SERVER_HOST
+        self.port = port or config.QWEN_SERVER_PORT
+        self.timeout = timeout
+
+    def generate(self, frames: list, prompt: str, max_new_tokens: int) -> str:
+        payload = {
+            "mode": "generate",
+            "payload": {
+                "images_b64": [_encode_image(f) for f in frames],
+                "prompt": prompt,
+                "max_new_tokens": max_new_tokens,
+            },
+        }
+        response = _send_request(payload, self.host, self.port, self.timeout)
+        if "error" in response:
+            raise ValueError(f"qwen_server generate failed: {response['error']}")
+        return response["result"]["text"]
+
+
 def get_client(backend: typing.Optional[str] = None) -> InternVLClient:
     backend = backend if backend is not None else config.INTERNVL_BACKEND
     if backend == "mock":
         return MockInternVLClient()
     if backend in ("hf", "vllm", "api"):
         return InternVLSocketClient()
+    if backend == "qwen":
+        return QwenSocketClient()
     raise ValueError(f"unknown INTERNVL_BACKEND {backend!r}")
 
 

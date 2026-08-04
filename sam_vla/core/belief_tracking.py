@@ -66,10 +66,38 @@ def propagate_body_point(
     return np.asarray([c * qx - s * qy, s * qx + c * qy], dtype=np.float32)
 
 
+DEFAULT_SIGMA_VISIBLE = 0.05
+"""Uncertainty floor a fresh sighting resets to -- mirrors SubgoalBeliefBank's
+sigma_visible semantics (navdp/navdp/extensions/belief_bank.py) conceptually,
+without importing it."""
+
+
+def uncertainty_growth_increment(
+    odom_noise: float, odom_noise_growth_rate: float, time_since_seen: float
+) -> float:
+    """Accelerating-drift increment added to a scalar uncertainty state for one
+    step while its target is unseen: a base per-step growth (`odom_noise`)
+    scaled up the longer it's been since the last sighting
+    (`odom_noise_growth_rate`). Shared standalone so callers with no full
+    `BeliefGoalTracker` instance -- e.g. kb_teleop_vl.py's synthetic
+    covariance proxy -- exercise the exact same formula rather than a
+    divergent reimplementation."""
+    return float(odom_noise) * (
+        1.0 + float(odom_noise_growth_rate) * float(time_since_seen)
+    )
+
+
 class BeliefGoalTracker:
     """Tracks a body-frame [forward, left] estimate of the goal position. Re-seeds
     from the live rendered goal mask whenever it's visible (>= min_px pixels);
-    dead-reckons by the robot's executed motion the rest of the time."""
+    dead-reckons by the robot's executed motion the rest of the time.
+
+    Also tracks a scalar `uncertainty` state: it resets to `sigma_visible` on
+    every fresh sighting and grows each step the goal stays unseen, at a rate
+    of `odom_noise * (1 + odom_noise_growth_rate * time_since_seen)` -- an
+    accelerating-drift term so a long occlusion is penalized more than a brief
+    one. Numpy-only, no `navdp.extensions`/torch dependency, so this stays
+    runnable in the `habitat` conda env."""
 
     def __init__(
         self,
@@ -77,14 +105,20 @@ class BeliefGoalTracker:
         goal_range: float = 8.0,
         min_px: int = 10,
         odom_noise: float = 0.0,
+        odom_noise_growth_rate: float = 0.0,
+        sigma_visible: float = DEFAULT_SIGMA_VISIBLE,
         seed: int = 0,
     ):
         self.hfov_deg = float(hfov_deg)
         self.goal_range = float(goal_range)
         self.min_px = int(min_px)
         self.odom_noise = float(odom_noise)
+        self.odom_noise_growth_rate = float(odom_noise_growth_rate)
+        self.sigma_visible = float(sigma_visible)
         self._rng = np.random.default_rng(seed)
         self.belief_g: Optional[np.ndarray] = None
+        self.uncertainty = self.sigma_visible
+        self._time_since_seen = 0.0
 
     def observe(self, goal_mask: np.ndarray, depth: np.ndarray) -> bool:
         """Re-seed from the live mask if it's visible enough; returns whether it was."""
@@ -96,12 +130,17 @@ class BeliefGoalTracker:
         )
         if seed is not None:
             self.belief_g = seed
+            self.uncertainty = self.sigma_visible
+            self._time_since_seen = 0.0
         return seed is not None
 
     def propagate(self, action: Action, dt: float) -> None:
         """Dead-reckon the belief by the just-executed action. Action.v_lat is
         RIGHTWARD-positive (sam_vla's pose_integrator convention, see its docstring)
         while propagate_body_point wants the LEFTWARD component -- hence the sign flip.
+        Also grows `uncertainty` for the elapsed dt (called every step regardless
+        of whether observe() just reset it, so a fresh-sighting step accrues one
+        step's worth of growth on top of the floor -- negligible in practice).
         """
         if self.belief_g is None:
             return
@@ -114,6 +153,13 @@ class BeliefGoalTracker:
             odom_noise=self.odom_noise,
             rng=self._rng,
         )
+        self._time_since_seen += float(dt)
+        self.uncertainty += uncertainty_growth_increment(
+            self.odom_noise, self.odom_noise_growth_rate, self._time_since_seen
+        )
+
+    def uncertainty_value(self) -> float:
+        return self.uncertainty
 
     def bearing(self) -> Optional[float]:
         if self.belief_g is None:

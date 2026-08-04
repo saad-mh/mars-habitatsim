@@ -24,6 +24,15 @@ INTERNVL_MODEL_PATH = "OpenGVLab/InternVL3-8B"
 INTERNVL_SERVER_HOST = "127.0.0.1"
 INTERNVL_SERVER_PORT = 8766  # distinct from qwen_server's 8765
 
+# --- Qwen backend (alternative to InternVL above, see qwen_model_runner.py /
+# qwen_server.py) -- same generate(frames, prompt, max_new_tokens) protocol,
+# just backed by Qwen2.5-VL-3B-Instruct via the "qwen_vlm" conda env instead
+# of InternVL3-8B via "vl". Port is distinct from both InternVL's 8766 and
+# sam_vla/vlm/qwen_server's 8765 so all three can run at once if needed. ---
+QWEN_MODEL_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
+QWEN_SERVER_HOST = "127.0.0.1"
+QWEN_SERVER_PORT = 8767
+
 # --- per-mode generation knobs ---
 MAX_NEW_TOKENS = {"cbf": 16, "exploration": 16, "uncertainty": 32}
 FRAME_BURST_SIZE = {
