@@ -1,159 +1,167 @@
-# Plan: Base-Station Out-and-Back Rollout (hardcoded two-goal navigation)
+# Belief-driven ghost mask (VLM exploration cue)
 
-## 0. What this is
+## Original ask (verbatim intent, for reference)
 
-An extension of the existing single-goal NavDP rollout (`sam_vla/run_navdp_rollout.py`) so a run does,
-in order:
+1. Don't plug belief into NavDP/any policy directly. Instead plug it into a VLM/LM/Model,
+   which draws a translucent "ghost mask" — a circular patch, radius optionally proportional
+   to uncertainty — on the frame, given the belief, when the task is to explore. Non-destructive
+   to the underlying render; semi-transparent green.
+2. The policy stays belief-blind; belief only ever reaches it indirectly, through the VLM.
+   Clear separation of concerns between policy and belief-visualization.
+3. The ghost mask updates in real time as belief changes (grows/shrinks/moves as the agent
+   gathers more information).
+4. The policy keeps operating on its own internal state/decisions, taking the ghost mask as a
+   directional/visual cue — i.e. it's supposed to influence driving, eventually.
 
-1. Resolve a goal from the first frame exactly as today (segmentation → one goal + the rest as
-   obstacles).
-2. Drive to it under NavDP + CBF, exactly as today.
-3. **New:** once reached, hold position for a configurable `dwell_seconds`.
-4. **New:** drive back to the rover's own spawn pose ("base station") under the same NavDP + CBF
-   loop, treating the first goal as a now-passed obstacle on the way back.
-5. Stop once back within success radius of the base station.
+## What "ghost mask" and "belief" resolve to in this codebase
 
-Two goals, fixed and known ahead of time (no open-vocabulary discovery involved) — `goal_1` = the
-detected object, `goal_2` = the rover's own `(start_x, start_z, start_yaw_deg)`.
+Two readings were possible for "belief when the task is to explore." Given what already exists
+(below), the coherent one is: **this is the existing "lost-goal" ghost** — the goal is known but
+currently out of view, dead-reckoned by [`BeliefGoalTracker`](sam_vla/core/belief_tracking.py),
+and "explore" means "normal driving, not currently doing CBF obstacle-avoidance" (`vl_direction`
+already models exactly this binary: `"cbf"` vs `"exploration"` mode, see
+[kb_teleop_vl.py:328-333](kb_teleop_vl.py:328)). It is *not* a frontier/unknown-space belief —
+there's no such representation anywhere in this repo.
 
-## 1. Is this already in the system? (short answer: half of it)
+## Confirmed decisions (from planning discussion)
 
-`sam_vla/run_navdp_rollout.py --multi-goal` looks like it should be the answer, but it solves a
-different problem: **dynamic open-vocabulary goal discovery**. It periodically re-runs SAM3 + CLIP
-(`_multi_goal_resegment`) to *mint new goal_ids at runtime* as it recognizes objects matching a
-vocabulary, and only afterward hands them to `navdp.extensions.RouteManager` /
-`SubgoalBeliefBank`. None of that discovery machinery is needed here — both goals are already known
-before the episode starts. Bolting onto `--multi-goal` as-is would mean either faking a SAM3/CLIP
-detection cycle for a goal that's actually just "the spawn point," or leaving the base station
-undiscoverable by CLIP vocabulary, which is backwards.
+- **Target surface, phased**: build the belief-growth + ghost-drawing logic as one shared,
+  policy-agnostic piece first; verify it interactively in
+  [kb_teleop_vl.py](kb_teleop_vl.py); then wire the same piece into the real rollout loop in
+  [sam_vla/run_navdp_rollout.py](sam_vla/run_navdp_rollout.py) as a follow-up phase. Do not
+  attempt both surfaces in one pass.
+- **Uncertainty source**: extend [`BeliefGoalTracker`](sam_vla/core/belief_tracking.py) with a
+  scalar `uncertainty` state, numpy-only (no `navdp.extensions`/torch dependency — keeps it
+  runnable in the `habitat` conda env that `kb_teleop_vl.py` and the sam_vla rollout scripts
+  already use). Growth is driven by **two configurable flags**, not a hardcoded constant:
+  - `odom_noise` — already an existing constructor param (currently only perturbs the
+    dead-reckoned point in `propagate_body_point`); reuse it as the per-step base growth of
+    `uncertainty` while the goal is unseen.
+  - a new `odom_noise_growth_rate` — how much faster `uncertainty` accumulates the longer the
+    goal stays unseen (an accelerating-drift term, e.g. `increment = odom_noise * (1 +
+    odom_noise_growth_rate * time_since_seen)` — exact formula is an implementation-time choice,
+    see Open Questions).
+  - On a fresh sighting (`observe()` returns `True`), reset `uncertainty` to a small floor
+    (mirrors `SubgoalBeliefBank`'s `sigma_visible` semantics in
+    [navdp/navdp/extensions/belief_bank.py](navdp/navdp/extensions/belief_bank.py) conceptually,
+    without importing it).
+  - The real `navdp.extensions.SubgoalBeliefBank` (real Kalman `Sigma`) stays available as a
+    heavier alternative later if the numpy approximation proves insufficient, but is explicitly
+    out of scope for this pass — it only runs in the `sam2`/`sam3` conda envs, not `habitat`.
+- **Action coupling**: **advisory-only**. The VLM's returned `Direction` (LEFT/RIGHT/FRONT/BACK)
+  is rendered on-screen and logged, exactly like `kb_teleop_vl.py` already does for its
+  cbf/exploration calls today (`_vl_worker` only ever prints `result.direction`, never touches
+  an `Action`). No `Action`, `NavigationPolicy`, or `CbfObstacleAvoidance` code changes in this
+  pass. Point 4's "influence driving" is deferred to a later, separately-scoped change once the
+  visualization itself is validated.
 
-What **is** directly reusable, because it's actually goal-id-agnostic and has no SAM3/CLIP coupling:
+## Existing building blocks to reuse (verified in this session)
 
-- **`navdp.extensions.RouteManager`** (`navdp/navdp/extensions/route_manager.py`) — an ordered,
-  index-based pointer over a list of goal_ids, explicitly designed to support repeats
-  (`["A", "B", "A"]` stays well-defined per its own docstring). `route=["goal_1", "base_station"]`
-  is exactly what we want, with zero changes needed.
-- **`navdp.extensions.SubgoalBeliefBank`** (`navdp/navdp/extensions/belief_bank.py`) — a per-goal-id
-  Gaussian belief (`mu`, `Sigma`, `visible`, `confidence`) updated from a plain
-  `{visible, position, confidence}` dict each step, decoupled from how that observation was produced.
-  Reuse directly with `goal_ids=["goal_1", "base_station"]`; feed it the same
-  `belief_tracking.mask_to_body`-derived observation already used for the single-goal path today,
-  computed once per goal instead of routing through `SAMDepthTargetExtractor`.
-
-What's genuinely missing and needs building:
-
-- Any notion of "base station" as a goal (it's not detected, it's just the spawn pose).
-- The dwell-then-return state transition — nothing in the codebase holds position for a duration and
-  then re-targets. `RouteManager.update()` only advances a pointer; it doesn't pause.
-- A way to keep exactly one goal painted as `MESH_GOAL_ID` at a time. `NavdpPolicy.act_verbose`
-  (`sam_vla/policy/navdp_policy.py:156`) reads a **single** goal-mask channel from
-  `MarsHabitatEnv.get_semantic_frame()` — it has no concept of "which of N goals." The existing
-  `--multi-goal` loop dodges this by never registering scene meshes for goals at all — it manually
-  paints only the active goal's last-known SAM3 mask into the semantic frame each step
-  (`run_navdp_rollout.py:409-414`). We have a different, simpler tool available: our goals are static
-  scene meshes (`register_object_mask`), and the returned `ManagedRigidObject` handle's
-  `.semantic_id` is a plain mutable int — re-tagging it live is enough (see §3).
-
-## 2. Base-station world position
-
-No detection needed — it's just the spawn pose already passed to `MarsHabitatEnv`:
-`(start_x, terrain_height(start_x, start_z), start_z)`. Sample the height the same way
-`register_object_mask` already does internally (`terrain_patch_mesh` resamples from `self._terrain`,
-i.e. `sam_vla/env/terrain.py:HeightmapGrid`) — don't hand-roll a second height lookup, since the
-"Known issues" note in `CLAUDE.md` about height-normalization mismatches applies here too.
-
-## 3. Goal-mesh bookkeeping (the part that makes single-goal-channel `NavdpPolicy` work for two goals)
-
-Register **both** meshes once, up front, via `register_object_mask` (`sam_vla/env/habitat_env.py:267`),
-keep their returned handles, and drive visibility purely through `.semantic_id` re-tagging — no
-re-registration, no removal:
-
-| mesh | at episode start | once `goal_1` is reached (→ DWELL) | once base station is reached |
+| Piece | Where | What it gives us | What's missing for this feature |
 |---|---|---|---|
-| `goal_1` marker | `MESH_GOAL_ID` | → `MESH_OBST_ID` (still physically there, now something to steer around on the way back) | unchanged |
-| `base_station` marker | `0` (neutral — invisible to both goal and obstacle channels, so it doesn't distort the outbound leg's CBF or bias the video overlay) | unchanged | → `MESH_GOAL_ID` at the *start* of RETURN, i.e. before that step's `env.get_semantic_frame()` call, so no single frame ever has two goal-tagged regions at once |
+| Ghost-circle projection math | [navdp/navdp/extensions/ghost_geometry.py](navdp/navdp/extensions/ghost_geometry.py) (`gc_intrinsics`, `gc_body_point`, `gc_project`, `gc_make_mask`) | Pure numpy: body-frame bearing/range → world point → pixel (u,v) → filled-circle boolean mask. No torch dependency. | Lives under `navdp/`, which is treated as read-only/external (per CLAUDE.md); radius is a fixed constant, not uncertainty-driven. **Port the math pattern into `sam_vla/`, don't import from `navdp/`.** |
+| Translucent alpha-blend | [sam_vla/perception/semantic_overlay.py:17-52](sam_vla/perception/semantic_overlay.py) `overlay_semantic_masks()` | Established green=goal / red=obstacle convention, `alpha=0.45` default, already used to prep frames for a VLM call (`qwen_discrete_direction_policy.py`, `run_navdp_rollout.py`). | Operates on a semantic-id frame + fixed `goal_id`, not a freestanding circle mask. |
+| Circular translucent overlay (closest template) | [kb_teleop_vl.py:141-155](kb_teleop_vl.py:141) `overlay_obstacles()` | Vectorized `(x-cx)^2+(y-cy)^2<=r^2` mask + alpha blend, already circular, already non-destructive (returns a copy). Same file we're wiring Phase 1 into. | Hardcoded red; radius list comes from known obstacle geometry, not belief uncertainty. |
+| Existing per-step belief tracker | [sam_vla/core/belief_tracking.py](sam_vla/core/belief_tracking.py) `BeliefGoalTracker` | `.observe(goal_mask, depth)`, `.propagate(action, dt)`, `.bearing()`, `.distance()` — already the "lost-goal" belief used in the real rollout loop. | No uncertainty/covariance field at all today — this is the actual gap to fill. |
+| VLM exploration dispatch | [vl_direction/directive_engine.py](vl_direction/directive_engine.py) `query("exploration", frames, ExplorationContext(...), episode_id)` | Already takes `list[np.ndarray]` frames and returns a parsed `Direction`; contract is stable and shouldn't change. | Nothing — reuse as-is. Ghost mask is drawn *before* this call, into the frame(s) passed in. |
+| Real rollout call sites (Phase 2 target) | [sam_vla/run_navdp_rollout.py:457-465](sam_vla/run_navdp_rollout.py:457) (`belief_tracker = BeliefGoalTracker(...)`, single-goal mode only), `:668-710` (`.observe`/`.bearing`/`.propagate` per step), `:679-685` (`blocked = avoidance.is_blocked(...)`, `lost_goal_ghost` gating), `:728-730` (`vis_rgb = overlay_semantic_masks(obs.rgb, semantic_render, text=...)`) | A live `belief_tracker` instance already exists per-step with bearing/distance available, plus an existing "not blocked" gate and an existing `vis_rgb` overlay call site that is *already* visualization-only (never fed back into the policy). | Nothing structural — Phase 2 is additive at these exact lines. |
 
-This re-tagging must happen **before** the semantic frame is fetched for the transition step, not
-after — same ordering bug class as any off-by-one in a state machine driving a render.
+## Explicit non-goals / anti-patterns to avoid
 
-## 4. State machine
+- **Do not** modify anything under `navdp/` (belief_exp's existing rule — "never copies or
+  reimplements" — extends here too: port the *pattern*, not the import).
+- **Do not** repeat `navdp/scripts/rollout_habitat_policy.py:983-1004`'s existing ghost pattern,
+  which overwrites the policy's `goal_channel` input directly with the ghost circle. That's
+  belief reaching the policy *directly* — exactly what point 2 of the original ask rules out.
+  This plan's ghost mask only ever touches a `vis_rgb`/frame-for-VLM copy, never the tensor the
+  policy consumes.
+- **Do not** change `sam_vla/policy/base_policy.py`'s `NavigationPolicy` protocol, `Action`, or
+  `sam_vla/safety/cbf_avoidance.py`'s `apply()` in this pass (advisory-only decision above).
+- **Do not** change `vl_direction`'s public contract (`query()`, `schemas.py`,
+  `ExplorationContext`) — it already accepts arbitrary annotated frames; reuse it unmodified.
 
-Four phases, replacing the flat per-step loop body in `run()` for this mode:
+## Phased plan
 
-```
-OUTBOUND  -- drive toward goal_1 (identical to today's single-goal loop)
-   |  route.update() reports advanced (goal_1 -> base_station)
-   v
-DWELL     -- hold Action(0, 0, 0) for round(dwell_seconds / dt) steps;
-             re-tag goal_1 -> MESH_OBST_ID and base_station -> MESH_GOAL_ID on entry
-   |  dwell counter expires
-   v
-RETURN    -- drive toward base_station (same NavDP + CBF loop, goal_1 now an obstacle)
-   |  route.update() reports finished
-   v
-DONE      -- stop (mirrors today's --stop-on-route-finished)
-```
+### Phase 0 — shared belief-growth + ghost-drawing module
 
-`RouteManager.update(robot_position=[0,0], belief_bank=bank)` drives the OUTBOUND→DWELL and
-RETURN→DONE transitions exactly as it already does in the `--multi-goal` loop
-(`run_navdp_rollout.py:395`) — reused unchanged. `bank.update(...)` needs an `observations` dict each
-step; for the *active* goal only, compute it from that goal's current `MESH_GOAL_ID` mask +
-`belief_tracking.mask_to_body` (reuse, don't reimplement); the inactive goal gets
-`{"visible": False}}` and the bank just carries its uninitialized/decayed state, which is fine since
-nothing reads it until it becomes active.
+New/modified files:
+- **Modify** [sam_vla/core/belief_tracking.py](sam_vla/core/belief_tracking.py):
+  add `uncertainty: float` state to `BeliefGoalTracker`, a `sigma_visible` floor constant, the
+  new `odom_noise_growth_rate` constructor param, growth logic in `propagate()`, reset logic in
+  `observe()`, and an accessor (`.uncertainty_value()` or similar).
+- **New** `sam_vla/core/ghost_mask.py` (name tentative): pure-numpy, mirrors
+  `ghost_geometry.py`'s shape but built against `sam_vla.core.goal_geometry.intrinsics_from_hfov`
+  (already imported by `belief_tracking.py`) and the body-frame `[forward, left]` convention
+  `BeliefGoalTracker` already uses, so it composes directly with `.bearing()`/`.distance()`
+  instead of needing a separate world-frame projection step:
+  - `uncertainty_to_radius_px(uncertainty, min_px, max_px, scale)` — clamped mapping, same
+    clamp pattern `kb_teleop_vl.py` already uses for obstacles
+    (`OVERLAY_MIN_PIXEL_RADIUS`/`OVERLAY_MAX_PIXEL_RADIUS`).
+  - `project_body_point_to_pixel(forward, left, hfov_deg, h, w)` — body-frame point → (u, v) or
+    `None` if behind/out of frame.
+  - `draw_ghost_mask(rgb, u, v, radius_px, color=GREEN, alpha=...) -> np.ndarray` — translucent
+    circular blend, non-destructive (returns a copy), modeled on `overlay_obstacles()`.
+- Unit tests for the two pure-math pieces above (radius mapping, projection) — no sim/GPU
+  needed, straightforward pytest, e.g. under a new `sam_vla/core/tests/` or alongside
+  `vl_direction/tests/`'s style.
 
-`CbfObstacleAvoidance` and `safety_filter_fn` run unchanged across all four phases — the obstacle set
-naturally grows to include `goal_1` once it's re-tagged, no separate wiring needed since
-`obstacle_mask = semantic_render == MESH_OBST_ID` already picks up whatever currently carries that id.
+### Phase 1 — interactive verification in `kb_teleop_vl.py`
 
-During DWELL, skip the policy/CBF call entirely (hold `Action(0,0,0)`) but keep calling
-`env.step(new_pose)` with the unchanged pose and keep logging, so the saved video/frames show a clean
-stationary hold rather than a gap.
+- Generalize the existing synthetic `_update_uncertainty_covariance` growth in
+  [kb_teleop_vl.py:404-418](kb_teleop_vl.py:404) to call the Phase 0 growth logic (so the same
+  formula is exercised here and in Phase 2, not two divergent implementations).
+- After `annotated_rgb = overlay_obstacles(rgb, circles)` in `render()`
+  ([kb_teleop_vl.py:507](kb_teleop_vl.py:507)), call `draw_ghost_mask(...)` using the current
+  synthetic uncertainty value and a projected target point (reuse the nearest-obstacle point as
+  a stand-in "goal" for this demo only — no new goal-tracking subsystem needed here, since this
+  script has no real goal object). Feed the result into both the VLM dispatch
+  ([kb_teleop_vl.py:519](kb_teleop_vl.py:519)) and the on-screen image
+  ([kb_teleop_vl.py:526](kb_teleop_vl.py:526)) — same "one overlay, seen by both" pattern the
+  file already uses for obstacles.
+- No change to `_vl_worker`/`_apply_vl_line` — the direction is already advisory-only (printed +
+  shown in the status line), matching the confirmed decision.
+- Manual verification: run the script, confirm the green circle grows while the stand-in target
+  is unseen/far and shrinks/resets when it's grounded again, stays translucent (background still
+  visible through it), and the printed exploration-mode line keeps updating on the existing
+  cadence.
 
-## 5. New config surface
+### Phase 2 — wire into the real rollout loop (`sam_vla/run_navdp_rollout.py`)
 
-CLI flags on `sam_vla/run_navdp_rollout.py` (or a thin new entry point if the flag surface gets too
-tangled with `--multi-goal` — decide once §4 is actually wired up, don't pre-decide):
+- Pass `odom_noise_growth_rate` through as a new CLI flag alongside the existing
+  `--belief-odom-noise` (wherever that's currently threaded to
+  [run_navdp_rollout.py:457-465](sam_vla/run_navdp_rollout.py:457)).
+- At [run_navdp_rollout.py:728-730](sam_vla/run_navdp_rollout.py:728), where `vis_rgb` is already
+  built purely for visualization/logging, additionally draw the ghost mask when: single-goal mode
+  (`belief_tracker is not None` — already `None` in `multi_goal`/`base_station` modes, so this
+  naturally excludes the base-station DWELL/RETURN phases, which skip the policy/CBF call
+  entirely at [:621-658](sam_vla/run_navdp_rollout.py:621) anyway), not currently `blocked`
+  (reuse the existing `blocked` bool from [:679-685](sam_vla/run_navdp_rollout.py:679) — this is
+  the "cbf vs exploration" gate), and the goal is currently unseen (`not goal_visible`).
+- Dispatch `vl_direction.directive_engine.query("exploration", [vis_rgb_with_ghost],
+  ExplorationContext(task_str=...), episode_id)` at a throttled cadence (mirror
+  `kb_teleop_vl.py`'s every-N-frames-or-M-seconds pattern; a full VLM call every rollout step
+  would be far too slow). Log the returned `Direction` into `vla_result`/`logger.log_step` next
+  to the existing belief/CBF diagnostics — advisory-only, matching Phase 1.
+- No change to `action`, `policy.act_verbose(...)`, or `avoidance.apply(...)` call sites.
 
-- `--base-station` — enables this mode. Mutually exclusive with `--multi-goal` (different problems,
-  see §1 — don't try to make one subsume the other).
-- `--dwell-seconds` (default e.g. `5.0`) — hold duration at goal_1.
-- `--goal-success-radius` (default e.g. `1.0`) — fed to `RouteManager(success_radius=...)`. One value
-  for both legs for v1; `RouteManager` only takes a single radius for the whole route today. If a
-  per-goal radius turns out to matter empirically, extend it then — not preemptively.
-- `--base-marker-radius` (default: reuse `--obj-mask-radius`) — size of the synthetic base-station
-  disc.
-- Reuse every existing `--cbf*`, `--lost-goal-*` flag unchanged.
+## Open questions to settle during implementation (not blocking this plan)
 
-## 6. Known risks / open questions
+- Exact `uncertainty` growth formula (linear vs. compounding via `time_since_seen`) — pick
+  empirically once Phase 0's unit tests make it cheap to compare shapes; not worth debating in
+  the abstract.
+- Ghost-mask pixel-radius clamp bounds for Phase 2 (reuse `kb_teleop_vl.py`'s
+  `OVERLAY_MIN_PIXEL_RADIUS=3` / `OVERLAY_MAX_PIXEL_RADIUS=260` as the starting point, or derive
+  from `image_size` if rollouts use a different resolution).
+- Whether a later phase graduates from advisory-only to actually influencing `Action`
+  (proportional nudge à la `lost_goal_heading_assist`, vs. a harder override à la
+  `qwen_discrete_direction_policy.direction_to_action`) — intentionally deferred; revisit only
+  after Phase 1/2 visualization is validated as correct and useful on its own.
 
-- **No visual target on the way back initially.** The base-station marker is a small flat disc with
-  no elevation — it likely won't be visible in-frame until the rover is already close. Driving back
-  relies on `SubgoalBeliefBank`'s dead-reckoned `mu` (fed by odometry between sightings, same math as
-  `BeliefGoalTracker.propagate`) plus `lost_goal_heading_assist` biasing yaw/forward toward that
-  belief bearing. **Recommend defaulting `--lost-goal-ghost` on for this mode** — without it, the
-  return leg has no steering signal at all until the marker happens to enter frame.
-- **Mesh re-tag ordering.** Get this wrong (re-tag after the frame is grabbed instead of before) and
-  one step's `goal_mask` centroids over two disjoint regions, corrupting that step's belief seed. Worth
-  an explicit assertion or test (see §7) rather than trusting review alone.
-- **Single shared success radius** for both legs (see §5) — flagged, not solved, until there's a
-  reason to solve it.
-- **`goal_1`-as-obstacle proxy is a flat terrain-following disc**, same as every other obstacle bbox
-  in this pipeline — consistent with existing behavior, not a new risk, just noting CBF's avoidance of
-  it will be no more or less accurate than any other registered obstacle.
+## Verification plan
 
-## 7. Validation plan before trusting output
-
-1. Short run (`--max-steps` small, `--dwell-seconds 3`) — confirm the log shows `route_index` go
-   0 → 1, a `phase` field transition OUTBOUND → DWELL → RETURN → DONE, and the dwell duration matches
-   `round(3 / dt)` steps of zero-velocity actions.
-2. Confirm the logged base-station world position matches `(start_x, start_z)` from the CLI args.
-3. Inspect the saved video/frame overlays: `goal_1`'s marker should render obstacle-colored (not
-   goal-colored) for every RETURN-phase frame, and the base marker should render goal-colored only
-   from DWELL onward, never during OUTBOUND.
-4. Confirm final logged `distance_to_goal(final_pose, base_position)` is within
-   `--goal-success-radius`.
-5. Re-run the existing single-goal path (`--base-station` unset) afterward and confirm its output is
-   byte-for-byte unchanged in behavior — this must be strictly additive, same guarantee the
-   `--multi-goal` flag already gives (`run_navdp_rollout.py:232-234`'s comment: unset, behavior is
-   unchanged).
+- **Phase 0**: pytest on `uncertainty_to_radius_px` and `project_body_point_to_pixel` — pure
+  functions, no sim dependency.
+- **Phase 1**: manual visual check in the live Tkinter window (see Phase 1 bullet above).
+- **Phase 2**: spot-check a handful of saved `vis_rgb` frames/video from a real rollout before
+  trusting it at scale — same discipline CLAUDE.md already prescribes for segmentation-sweep
+  overlays ("Sanity-check any new sweep by overlaying masks on rgb for a few frames").
