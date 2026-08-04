@@ -6,7 +6,7 @@ semantic sensor picks up).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import magnum as mn
 import numpy as np
@@ -113,3 +113,22 @@ def register_semantic_mesh(sim, mesh_path: str, semantic_id: int, y_offset: floa
     if y_offset:
         obj.translation = obj.translation + mn.Vector3(0.0, float(y_offset), 0.0)
     return obj
+
+
+# Far outside DEPTH_MAX_RANGE_M (10m) or any sensor's far clip, so an object
+# translated down by this much is guaranteed invisible to every camera
+# regardless of pose.
+ANNOTATION_HIDE_DROP_M = 10_000.0
+
+
+def set_objects_hidden(objects: Dict[int, Any], onstage: Dict[int, mn.Vector3], hidden: bool) -> None:
+    """Toggle a set of registered objects between their real ("onstage")
+    world position and a position dropped ANNOTATION_HIDE_DROP_M straight
+    down, so a render pass can exclude them without the per-frame cost of
+    removing/re-adding them (habitat_sim has no per-sensor visibility flag).
+    Always sets translation from the cached `onstage` value rather than
+    applying a relative delta, so repeated toggles across a long capture
+    run can't drift. `objects`/`onstage` are keyed the same (e.g. mesh_id)."""
+    for key, obj in objects.items():
+        base = onstage[key]
+        obj.translation = base - mn.Vector3(0.0, ANNOTATION_HIDE_DROP_M, 0.0) if hidden else base

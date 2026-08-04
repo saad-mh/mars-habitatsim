@@ -19,8 +19,15 @@ RESERVED_SEMANTIC_IDS = {0, MESH_GOAL_ID, MESH_OBST_ID, ROCK_SEMANTIC_ID}
 # exactly at the heightmap's sampled ground height -- coplanar with the real
 # render terrain, which z-fights almost everywhere instead of rendering the
 # semantic id (see sim_utils.register_semantic_mesh). Lifting the whole
-# object a few cm clears that without touching any saved mesh/annotation.
-DEFAULT_Y_LIFT = 0.05
+# object clears that. habitat_env.get_full_observation renders these meshes
+# only for the semantic pass (never the RGB pass, via sim_utils.set_objects_hidden),
+# so this only has to survive z-fighting on the semantic camera -- not stay
+# small enough to be an unnoticeable RGB artifact. Keep it as small as
+# possible anyway: a larger lift shifts the mesh's projected 2D footprint
+# under oblique-camera parallax, which can offset masks/bboxes from the true
+# rock silhouette. Verify empirically (inspect the semantic buffer for
+# z-fighting holes/speckle) before changing this value.
+DEFAULT_Y_LIFT = 0.005
 
 
 def load_mesh_id_map(annotations_dir: Path) -> Dict[str, Dict[str, str]]:

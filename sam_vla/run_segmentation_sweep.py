@@ -76,6 +76,8 @@ def run_sweep(args: argparse.Namespace) -> dict:
             mesh_id_map, categories, args.background_category
         )
 
+        env.verify_annotation_isolation()  # next.md Step 5: fail loudly, not silently, if this regresses
+
         for i, (x, z, yaw) in enumerate(poses):
             env.step(Pose(x=x, y=0.0, z=z, yaw=yaw))
             obs = env.get_full_observation(
