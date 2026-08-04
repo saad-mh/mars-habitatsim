@@ -97,7 +97,11 @@ def _body_odom_from_poses(prev_pose, cur_pose):
 
 
 def _goal_observation(
-    mask: np.ndarray, depth: np.ndarray, min_px: int, hfov_deg: float, fallback_range: float
+    mask: np.ndarray,
+    depth: np.ndarray,
+    min_px: int,
+    hfov_deg: float,
+    fallback_range: float,
 ) -> dict:
     """SubgoalBeliefBank observation dict for one goal_id, computed straight from its
     current MESH_GOAL_ID mask via belief_tracking.mask_to_body -- the base-station
@@ -347,7 +351,10 @@ def run(
                     goal_position, MESH_GOAL_ID, obj_mask_radius, out_dir, "goal"
                 )
             else:
-                print("[WARN] goal bbox had no valid depth; skipping goal mask", flush=True)
+                print(
+                    "[WARN] goal bbox had no valid depth; skipping goal mask",
+                    flush=True,
+                )
             register_obstacle_masks_only(
                 env, obs0, goal_spec.obstacle_bboxes_norm, obj_mask_radius, out_dir
             )
@@ -358,7 +365,9 @@ def run(
             # world_pos's own y and resamples height from self._terrain itself, so
             # there's no second height lookup to keep in sync with register_object_mask's.
             base_marker_r = (
-                base_marker_radius if base_marker_radius is not None else obj_mask_radius
+                base_marker_radius
+                if base_marker_radius is not None
+                else obj_mask_radius
             )
             base_position = (start_x, 0.0, start_z)
             base_station_obj = env.register_object_mask(
@@ -589,7 +598,9 @@ def run(
                     else None
                 )
                 dist_txt = f"{dist:.2f}m" if dist is not None else "n/a"
-                overlay_text = f"t={step} DWELL dist={dist_txt} v=[0.00,0.00] yaw_rate=0.00"
+                overlay_text = (
+                    f"t={step} DWELL dist={dist_txt} v=[0.00,0.00] yaw_rate=0.00"
+                )
                 vis_rgb = overlay_semantic_masks(
                     obs.rgb, semantic_render, text=overlay_text
                 )
