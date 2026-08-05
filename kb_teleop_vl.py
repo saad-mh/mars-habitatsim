@@ -23,6 +23,19 @@ a human-supplied heading (numpad keys 1/2/3/4/6/7/8/9, or R to retry) before
 resuming -- press U at any time to force-trigger the halt for testing instead
 of waiting on/tuning the organic drift.
 
+Also drives vl_direction's fourth mode, "ghost_mask", whenever the exploration
+mode fires: the belief (bearing/distance/uncertainty to the stand-in lost
+target) is handed to the VLM as text alongside the obstacle-only frame, and
+the VLM answers with JSON pixel coordinates (u, v, radius_px) for where the
+translucent ghost circle should be drawn -- placement is the model's call,
+not caller-side trigonometry (--no-ghost-mask-vlm reverts to the old
+deterministic projection for comparison). Advisory-only, same as exploration/
+cbf: the parsed result only ever changes what gets drawn/printed, never an
+Action. Because this is a second, throttled VLM call, the on-screen circle
+only updates on the existing VL query cadence and holds its last position
+between calls (falls back to the deterministic projection whenever no VLM
+placement has landed yet, or the model's JSON failed to parse).
+
 Reuses kb_teleop.py's habitat_sim setup (make_sim, terrain height lookup,
 boundary clamping) via import rather than duplicating it -- this script only
 adds the obstacle field, projection/overlay, and the VL call.
@@ -68,7 +81,7 @@ from vl_direction import config as vl_dir_config
 from vl_direction.client import get_client
 from vl_direction.directive_engine import query as vl_query
 from vl_direction.qwen_server_manager import QwenServerManager
-from vl_direction.schemas import CBFContext, ExplorationContext
+from vl_direction.schemas import CBFContext, ExplorationContext, GhostMaskContext
 from vl_direction.uncertainty_session import UncertaintySession
 
 NUM_OBSTACLES = 6
@@ -190,7 +203,12 @@ class VLTeleopApp:
         uncertainty_covariance_threshold=DEFAULT_UNCERTAINTY_COVARIANCE_THRESHOLD,
         uncertainty_growth_per_step=DEFAULT_UNCERTAINTY_GROWTH_PER_STEP,
         uncertainty_growth_rate=DEFAULT_UNCERTAINTY_GROWTH_RATE,
+        ghost_mask_use_vlm=True,
     ):
+        self.ghost_mask_use_vlm = ghost_mask_use_vlm
+        self.last_ghost_mask_payload = None
+        self.last_ghost_mask_line = ""
+
         self.vl_query_every_n_frames = vl_query_every_n_frames
         self.vl_query_every_n_seconds = VL_QUERY_EVERY_N_SECONDS
         self.last_vl_frame_idx = None
@@ -360,11 +378,14 @@ class VLTeleopApp:
             return True
         return False
 
-    def _dispatch_vl_query(self, annotated_rgb, nearest_any, nearest_visible):
+    def _dispatch_vl_query(self, annotated_rgb, ghost_frame, nearest_any, nearest_visible):
         """Builds the VL request and hands the actual model call to a
         background thread so render()/movement never blocks on inference
         latency -- the sim keeps stepping on whatever self.last_vl_line
-        already holds (possibly still "", if no result has landed yet)."""
+        already holds (possibly still "", if no result has landed yet).
+        ghost_frame is the obstacle-only frame (no ghost mask baked in yet)
+        -- handed separately to the ghost_mask query so the model isn't
+        shown a circle it's being asked to place."""
         mode = (
             "cbf"
             if nearest_any is not None
@@ -397,13 +418,28 @@ class VLTeleopApp:
 
         thread = threading.Thread(
             target=self._vl_worker,
-            args=(mode, annotated_rgb, context, fallback_note, frame_idx_snapshot),
+            args=(
+                mode,
+                annotated_rgb,
+                ghost_frame,
+                context,
+                fallback_note,
+                frame_idx_snapshot,
+                nearest_any,
+            ),
             daemon=True,
         )
         thread.start()
 
     def _vl_worker(
-        self, mode, annotated_rgb, context, fallback_note, frame_idx_snapshot
+        self,
+        mode,
+        annotated_rgb,
+        ghost_frame,
+        context,
+        fallback_note,
+        frame_idx_snapshot,
+        nearest_any,
     ):
         """Runs on a background thread -- the actual (slow) model call.
         Never touches Tkinter directly; schedules the UI update back onto
@@ -425,21 +461,77 @@ class VLTeleopApp:
 
         print(line)
 
+        ghost_payload, ghost_line = self._maybe_query_ghost_mask(
+            mode, ghost_frame, nearest_any, frame_idx_snapshot
+        )
+        if ghost_line:
+            print(ghost_line)
+
         with self.vl_lock:
             self.vl_query_in_flight = False
 
         if not self.closed:
             try:
-                self.root.after(0, self._apply_vl_line, line)
+                self.root.after(0, self._apply_vl_line, line, ghost_payload, ghost_line)
             except Exception:
                 pass  # window may have been torn down between the check and this call
 
-    def _apply_vl_line(self, line):
+    def _maybe_query_ghost_mask(self, mode, ghost_frame, nearest_any, frame_idx_snapshot):
+        """Second VLM call, gated on --ghost-mask-vlm and only while
+        exploring (a lost-goal cue has no meaning mid-CBF-avoidance -- see
+        next.md's cbf/exploration binary). Belief is handed to the model as
+        text (GhostMaskContext); the model answers with pixel placement
+        instead of sam_vla.core.ghost_mask's trigonometry deciding it.
+        Runs on the same background thread as the direction call above, so
+        this only ever blocks the (already async) worker, never render()."""
+        if not self.ghost_mask_use_vlm or mode != "exploration" or nearest_any is None:
+            return None, None
+
+        bearing_deg = math.degrees(
+            math.atan2(nearest_any["left"], nearest_any["forward"])
+        )
+        distance_m = math.hypot(nearest_any["forward"], nearest_any["left"])
+        ghost_context = GhostMaskContext(
+            bearing_deg=bearing_deg,
+            distance_m=distance_m,
+            uncertainty=self.uncertainty_covariance,
+            frame_wh=(_FRAME_W, _FRAME_H),
+            min_radius_px=float(OVERLAY_MIN_PIXEL_RADIUS),
+            max_radius_px=float(OVERLAY_MAX_PIXEL_RADIUS),
+        )
+        try:
+            ghost_result = vl_query(
+                "ghost_mask", [ghost_frame], ghost_context, EPISODE_ID, client=self.client
+            )
+        except Exception as e:
+            return None, f"[{frame_idx_snapshot:05d}] ghost_mask -> ERROR -> {e}"
+
+        if not ghost_result.parse_ok:
+            return None, (
+                f"[{frame_idx_snapshot:05d}] ghost_mask -> PARSE FAILED, "
+                f"keeping last placement -> {ghost_result.raw_response!r}"
+            )
+
+        payload = ghost_result.ghost_mask_payload
+        line = (
+            f"[{frame_idx_snapshot:05d}] ghost_mask -> "
+            f"u={payload.u:.0f} v={payload.v:.0f} r={payload.radius_px:.0f} -> "
+            f"{ghost_result.latency_ms:.1f}ms -> {ghost_result.raw_response!r}"
+        )
+        return payload, line
+
+    def _apply_vl_line(self, line, ghost_payload=None, ghost_line=None):
         """Runs on the main/Tkinter thread via root.after. Only updates the
-        cached line; does not force a redraw so a slow VL result never
+        cached line(s); does not force a redraw so a slow VL result never
         stalls movement -- it just appears baked into the next
-        keypress-triggered render()."""
+        keypress-triggered render(). A failed ghost-mask parse leaves
+        self.last_ghost_mask_payload untouched (keeps the last good VLM
+        placement rather than snapping back to the deterministic fallback)."""
         self.last_vl_line = line
+        if ghost_payload is not None:
+            self.last_ghost_mask_payload = ghost_payload
+        if ghost_line is not None:
+            self.last_ghost_mask_line = ghost_line
 
     def _update_uncertainty_covariance(self, nearest_any):
         """Synthetic proxy for a real covariance signal -- this script has no
