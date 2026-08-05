@@ -34,11 +34,12 @@ QWEN_SERVER_HOST = "127.0.0.1"
 QWEN_SERVER_PORT = 8767
 
 # --- per-mode generation knobs ---
-MAX_NEW_TOKENS = {"cbf": 16, "exploration": 16, "uncertainty": 32}
+MAX_NEW_TOKENS = {"cbf": 16, "exploration": 16, "uncertainty": 32, "ghost_mask": 32}
 FRAME_BURST_SIZE = {
     "cbf": 1,
     "exploration": 3,
     "uncertainty": 1,
+    "ghost_mask": 1,
 }  # exploration configurable 1-5
 
 # --- uncertainty sub-flow ---

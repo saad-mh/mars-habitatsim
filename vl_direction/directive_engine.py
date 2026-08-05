@@ -18,17 +18,22 @@ import numpy as np
 from vl_direction import config
 from vl_direction.client import InternVLClient, get_client
 from vl_direction.intervention.mode_flag import get_current_mode
-from vl_direction.parser import parse_direction
+from vl_direction.parser import parse_direction, parse_ghost_mask_json
 from vl_direction.prompts.cbf_prompt import build_cbf_prompt, build_cbf_reprompt
 from vl_direction.prompts.exploration_prompt import (
     build_exploration_prompt,
     build_exploration_reprompt,
+)
+from vl_direction.prompts.ghost_mask_prompt import (
+    build_ghost_mask_prompt,
+    build_ghost_mask_reprompt,
 )
 from vl_direction.prompts.uncertainty_prompt import build_sweep_description_prompt
 from vl_direction.schemas import (
     CBFContext,
     Direction,
     ExplorationContext,
+    GhostMaskContext,
     IdentityToken,
     UncertaintyContext,
     UncertaintyPayload,
@@ -36,8 +41,8 @@ from vl_direction.schemas import (
     VLDirectiveResult,
 )
 
-Mode = Literal["cbf", "exploration", "uncertainty"]
-Context = Union[CBFContext, ExplorationContext, UncertaintyContext]
+Mode = Literal["cbf", "exploration", "uncertainty", "ghost_mask"]
+Context = Union[CBFContext, ExplorationContext, UncertaintyContext, GhostMaskContext]
 
 _ALLOWED_DIRECTIONS = {
     "cbf": (Direction.LEFT, Direction.RIGHT),
@@ -68,7 +73,7 @@ def _query_cbf(client, frames, context: CBFContext):
         config.MAX_NEW_TOKENS["cbf"],
     )
     confidence = 1.0 if parse_ok else 0.0
-    return IdentityToken.CBF, direction, confidence, raw, parse_ok, None
+    return IdentityToken.CBF, direction, confidence, raw, parse_ok, None, None
 
 
 def _query_exploration(client, frames, context: ExplorationContext):
@@ -84,7 +89,33 @@ def _query_exploration(client, frames, context: ExplorationContext):
         config.MAX_NEW_TOKENS["exploration"],
     )
     confidence = 1.0 if parse_ok else 0.0
-    return IdentityToken.EXPLORATION, direction, confidence, raw, parse_ok, None
+    return IdentityToken.EXPLORATION, direction, confidence, raw, parse_ok, None, None
+
+
+def _query_ghost_mask(client, frames, context: GhostMaskContext):
+    """Hands the belief (bearing/distance/uncertainty) to the model as text
+    and asks it to place the ghost-mask circle itself, instead of caller-side
+    trigonometry deciding (u, v, radius_px). Free-form JSON output, so this
+    mirrors _generate_with_retry's shape but with a JSON parser + one
+    corrective reprompt in place of parse_direction."""
+    prompt = build_ghost_mask_prompt(context)
+    reprompt = build_ghost_mask_reprompt(context)
+    max_new_tokens = config.MAX_NEW_TOKENS["ghost_mask"]
+
+    raw = client.generate(frames, prompt, max_new_tokens)
+    payload, parse_ok = parse_ghost_mask_json(
+        raw, context.frame_wh, context.min_radius_px, context.max_radius_px
+    )
+    retries = 0
+    while not parse_ok and retries < config.PARSE_RETRY_LIMIT:
+        raw = client.generate(frames, reprompt, max_new_tokens)
+        payload, parse_ok = parse_ghost_mask_json(
+            raw, context.frame_wh, context.min_radius_px, context.max_radius_px
+        )
+        retries += 1
+
+    confidence = 1.0 if parse_ok else 0.0
+    return IdentityToken.GHOST_MASK, None, confidence, raw, parse_ok, None, payload
 
 
 def _query_uncertainty(client, frames, context: UncertaintyContext):
@@ -103,7 +134,7 @@ def _query_uncertainty(client, frames, context: UncertaintyContext):
             rover_front_reference_deg=context.rover_front_reference_deg,
             attempt=context.attempt,
         )
-        return IdentityToken.UNCERTAINTY, None, 1.0, raw, True, payload
+        return IdentityToken.UNCERTAINTY, None, 1.0, raw, True, payload, None
 
     # Submit phase: pure packaging, no VLM call -- the human already supplied
     # the heading, there's nothing left to ask the model.
@@ -125,13 +156,14 @@ def _query_uncertainty(client, frames, context: UncertaintyContext):
         max_units=max_units,
         attempt=context.attempt,
     )
-    return IdentityToken.UNCERTAINTY, None, 1.0, raw, True, payload
+    return IdentityToken.UNCERTAINTY, None, 1.0, raw, True, payload, None
 
 
 _HANDLERS = {
     "cbf": _query_cbf,
     "exploration": _query_exploration,
     "uncertainty": _query_uncertainty,
+    "ghost_mask": _query_ghost_mask,
 }
 
 
@@ -150,7 +182,7 @@ def query(
     call_id = str(uuid.uuid4())
     t0 = time.monotonic()
 
-    identity_token, direction, confidence, raw, parse_ok, uncertainty_payload = (
+    identity_token, direction, confidence, raw, parse_ok, uncertainty_payload, ghost_mask_payload = (
         _HANDLERS[mode](resolved_client, frames, context)
     )
 
@@ -167,6 +199,7 @@ def query(
         call_id=call_id,
         session_mode=get_current_mode(),
         uncertainty_payload=uncertainty_payload,
+        ghost_mask_payload=ghost_mask_payload,
     )
     result.validate()
     return result
@@ -203,3 +236,19 @@ if __name__ == "__main__":
         client=MockInternVLClient(canned_response="looks rocky ahead"),
     )
     print("uncertainty ->", uncertainty_result)
+
+    ghost_mask_result = query(
+        "ghost_mask",
+        [frame],
+        GhostMaskContext(
+            bearing_deg=30.0,
+            distance_m=4.5,
+            uncertainty=1.2,
+            frame_wh=(64, 64),
+            min_radius_px=3.0,
+            max_radius_px=30.0,
+        ),
+        "demo-episode",
+        client=MockInternVLClient(canned_response='{"u": 40, "v": 32, "radius_px": 12}'),
+    )
+    print("ghost_mask ->", ghost_mask_result)
