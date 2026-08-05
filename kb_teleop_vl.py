@@ -23,18 +23,26 @@ a human-supplied heading (numpad keys 1/2/3/4/6/7/8/9, or R to retry) before
 resuming -- press U at any time to force-trigger the halt for testing instead
 of waiting on/tuning the organic drift.
 
-Also drives vl_direction's fourth mode, "ghost_mask", whenever the exploration
-mode fires: the belief (bearing/distance/uncertainty to the stand-in lost
-target) is handed to the VLM as text alongside the obstacle-only frame, and
-the VLM answers with JSON pixel coordinates (u, v, radius_px) for where the
-translucent ghost circle should be drawn -- placement is the model's call,
-not caller-side trigonometry (--no-ghost-mask-vlm reverts to the old
-deterministic projection for comparison). Advisory-only, same as exploration/
-cbf: the parsed result only ever changes what gets drawn/printed, never an
-Action. Because this is a second, throttled VLM call, the on-screen circle
-only updates on the existing VL query cadence and holds its last position
-between calls (falls back to the deterministic projection whenever no VLM
-placement has landed yet, or the model's JSON failed to parse).
+Also drives vl_direction's fourth mode, "ghost_mask", whenever there's a
+belief anchor to visualize and the rover isn't actively dodging an obstacle
+(see _ghost_belief_anchor / _should_query_vl's mode != "cbf" check): the
+belief (bearing/distance/uncertainty) is handed to the VLM as text alongside
+the obstacle-only frame, and the VLM answers with JSON pixel coordinates (u,
+v, radius_px) for where the translucent ghost circle should be drawn --
+placement is the model's spatial-reasoning call, not caller-side
+trigonometry (--no-ghost-mask-vlm reverts to the old deterministic
+projection for comparison). The prompt explicitly steers the model off dead
+center: since the ghost only ever fires while the goal/target is *out of
+view*, a center placement (== "straight ahead") would contradict its own
+premise, and a fixed dead-center worked example in the prompt was found to
+anchor a 3B model there regardless of the real bearing -- see
+vl_direction/prompts/ghost_mask_prompt.py's _worked_example. Advisory-only,
+same as exploration/cbf: the parsed result only ever changes what gets
+drawn/printed, never an Action. Because this is a second, throttled VLM
+call, the on-screen circle only updates on the existing VL query cadence and
+holds its last position between calls (falls back to the deterministic
+projection whenever no VLM placement has landed yet, or the model's JSON
+failed to parse).
 
 Optionally drives a fifth thing: a real, ground-truth goal via --goal-x/--goal-z
 (paired, plus --goal-radius, default 0.5m). On startup the terrain patch within
@@ -45,10 +53,16 @@ blue circle (distinct from the red obstacles / green ghost) and, via the same
 "in frame" check, snaps sam_vla.core.belief_tracking.BeliefGoalTracker onto it
 (BeliefGoalTracker.observe_body_point, since this script has no semantic
 renderer to source a mask from); the tracker then dead-reckons it every
-subsequent frame. Once acquired, self.goal_acquired latches permanently and
-exploration-mode VL calls stop firing for the rest of the run (CBF calls keep
+subsequent frame regardless of whether the goal is in view. Once acquired,
+self.goal_acquired latches permanently and the exploration *direction* call
+(LEFT/RIGHT/FRONT/BACK) stops firing for the rest of the run (CBF calls keep
 firing regardless) -- vl_direction/DESIGN.md's documented caller-side rule,
-"if goal identified -> dormant".
+"if goal identified -> dormant". The ghost_mask call is a separate concern
+and does NOT go dormant: once the goal has ever been seen, its dead-reckoned
+belief keeps driving the ghost mask for as long as it's out of frame again,
+so the VLM has something to steer back toward it with -- see
+_ghost_belief_anchor and _dispatch_vl_query's "dormant" mode, which only
+mutes the direction prompt, not the ghost-mask one.
 
 Reuses kb_teleop.py's habitat_sim setup (make_sim, terrain height lookup,
 boundary clamping) via import rather than duplicating it -- this script only
@@ -112,7 +126,7 @@ EXPLORATION_TASK_STR = "explore the terrain ahead"
 # as a visual anchor, resets when one is. U forces an immediate halt for testing. ---
 UNCERTAINTY_GROUNDING_RANGE_M = CBF_DISTANCE_THRESHOLD_M
 DEFAULT_UNCERTAINTY_COVARIANCE_THRESHOLD = vl_dir_config.DEFAULT_COVARIANCE_THRESHOLD
-DEFAULT_UNCERTAINTY_GROWTH_PER_STEP = 0.1
+DEFAULT_UNCERTAINTY_GROWTH_PER_STEP = 0.01
 DEFAULT_UNCERTAINTY_GROWTH_RATE = 0.0
 
 # --- ghost mask: translucent green circle at the stand-in "lost goal" (nearest
@@ -139,7 +153,7 @@ _FOCAL_PX = (_FRAME_W / 2.0) / math.tan(math.radians(CAMERA_HFOV_DEG / 2.0))
 
 OVERLAY_ALPHA = 0.5
 OVERLAY_MIN_PIXEL_RADIUS = 3
-OVERLAY_MAX_PIXEL_RADIUS = 260
+OVERLAY_MAX_PIXEL_RADIUS = 100
 
 # --- real goal (--goal-x/--goal-z): a terrain patch of radius --goal-radius is
 # extracted to its own OBJ (extract_disc_mesh/write_obj_mesh, same tight-clipping
@@ -281,6 +295,7 @@ def write_obj_mesh(path, verts, faces, name="goal"):
     """Writes verts/faces (as returned by extract_disc_mesh) to a plain OBJ
     file, same minimal format mesh_annotation_tool.py's write_hull_obj uses
     (1-indexed face vertices, no normals/UVs)."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         f.write(f"o {name}\n")
         for v in verts:
@@ -359,7 +374,7 @@ class VLTeleopApp:
             mesh_verts, mesh_faces = extract_disc_mesh(
                 self.goal_x, self.goal_z, self.goal_radius
             )
-            self.goal_mesh_path = Path(f"goal_mesh_{EPISODE_ID}.obj")
+            self.goal_mesh_path = Path(f"output/meshes/goal_mesh_{EPISODE_ID}.obj")
             write_obj_mesh(self.goal_mesh_path, mesh_verts, mesh_faces, name="goal")
 
             self.goal_belief = BeliefGoalTracker(
@@ -552,6 +567,32 @@ class VLTeleopApp:
             self.goal_belief.observe_body_point(forward, left)
             self.goal_acquired = True
 
+    def _ghost_belief_anchor(self, nearest_any, goal_out_of_frame):
+        """Returns (forward, left, uncertainty) to visualize as a ghost mask,
+        or None if there's nothing to show right now. When a real goal is
+        configured (--goal-x/--goal-z), self.goal_belief takes over as the
+        anchor -- and keeps doing so *past* goal_acquired, since
+        BeliefGoalTracker dead-reckons it every frame (_update_goal_belief):
+        the whole point of tracking belief instead of a one-shot fact is
+        that the ghost can keep pointing back toward the goal if it drops
+        out of frame again after being found once. No ghost while the goal
+        is plainly visible in the current frame -- no need to guess where
+        something you can already see is. Falls back to the legacy stand-in
+        (nearest synthetic obstacle + the synthetic uncertainty proxy) when
+        no real goal is configured, unchanged from the original demo
+        behavior."""
+        if self.goal_enabled:
+            if self.goal_belief.belief_g is None or not goal_out_of_frame:
+                return None
+            return (
+                float(self.goal_belief.belief_g[0]),
+                float(self.goal_belief.belief_g[1]),
+                self.goal_belief.uncertainty_value(),
+            )
+        if nearest_any is None:
+            return None
+        return nearest_any["forward"], nearest_any["left"], self.uncertainty_covariance
+
     def _should_query_vl(self):
         """Gate on whichever cadence trigger fires first: every N frames
         (manually configured, default 3) or every VL_QUERY_EVERY_N_SECONDS
@@ -571,7 +612,7 @@ class VLTeleopApp:
         return False
 
     def _dispatch_vl_query(
-        self, annotated_rgb, ghost_frame, nearest_any, nearest_visible
+        self, annotated_rgb, ghost_frame, nearest_any, nearest_visible, ghost_anchor
     ):
         """Builds the VL request and hands the actual model call to a
         background thread so render()/movement never blocks on inference
@@ -579,31 +620,40 @@ class VLTeleopApp:
         already holds (possibly still "", if no result has landed yet).
         ghost_frame is the obstacle-only frame (no ghost mask baked in yet)
         -- handed separately to the ghost_mask query so the model isn't
-        shown a circle it's being asked to place."""
+        shown a circle it's being asked to place. ghost_anchor (from
+        _ghost_belief_anchor, computed once in render() so both this
+        dispatch and the on-screen fallback drawing agree) is threaded
+        through to _maybe_query_ghost_mask below -- fires independently of
+        mode, except mid-CBF, so it keeps guiding back to a since-acquired
+        goal that's dropped out of frame again instead of going silent once
+        self.goal_acquired latches."""
         mode = (
             "cbf"
             if nearest_any is not None
             and nearest_any["edge_distance"] <= CBF_DISTANCE_THRESHOLD_M
-            else "exploration"
+            else ("dormant" if self.goal_acquired else "exploration")
         )
         fallback_note = ""
+        context = None
 
         if mode == "cbf" and nearest_visible is not None:
             context = CBFContext(
                 bbox_xyxy=nearest_visible["bbox"], frame_wh=(_FRAME_W, _FRAME_H)
             )
-        else:
-            if mode == "cbf":
-                fallback_note = (
-                    " (nearest obstacle not in view, fell back to exploration)"
-                )
-            mode = "exploration"
+        elif mode == "cbf":
+            fallback_note = " (nearest obstacle not in view, fell back to exploration)"
+            mode = "dormant" if self.goal_acquired else "exploration"
+
+        if mode == "exploration":
             hint = (
                 f"nearest obstacle is {nearest_any['edge_distance']:.1f}m away"
                 if nearest_any is not None
                 else None
             )
             context = ExplorationContext(task_str=EXPLORATION_TASK_STR, vague_hint=hint)
+        # mode == "dormant": no direction context needed -- _vl_worker skips
+        # the vl_query() call entirely for this mode (it isn't a real
+        # vl_direction Mode), but ghost_mask dispatch below still runs.
 
         frame_idx_snapshot = self.frame_idx
         self.last_vl_frame_idx = self.frame_idx
@@ -619,7 +669,7 @@ class VLTeleopApp:
                 context,
                 fallback_note,
                 frame_idx_snapshot,
-                nearest_any,
+                ghost_anchor,
             ),
             daemon=True,
         )
@@ -633,33 +683,42 @@ class VLTeleopApp:
         context,
         fallback_note,
         frame_idx_snapshot,
-        nearest_any,
+        ghost_anchor,
     ):
         """Runs on a background thread -- the actual (slow) model call.
         Never touches Tkinter directly; schedules the UI update back onto
-        the main loop via root.after so this stays thread-safe."""
-        try:
-            result = vl_query(
-                mode, [annotated_rgb], context, EPISODE_ID, client=self.client
-            )
-        except Exception as e:
-            line = f"[{frame_idx_snapshot:05d}] {mode} -> ERROR -> n/a -> {e}"
+        the main loop via root.after so this stays thread-safe. mode
+        "dormant" (goal already acquired, no obstacle nearby) skips the
+        direction call entirely -- "dormant" isn't a real vl_direction Mode,
+        it's this file's own marker for "nothing to ask the direction
+        prompt" -- but still falls through to the ghost-mask dispatch."""
+        if mode == "dormant":
+            line = f"[{frame_idx_snapshot:05d}] dormant -> goal already acquired, exploration suppressed"
         else:
-            direction_str = (
-                result.direction.value if result.direction is not None else "NONE"
-            )
-            line = (
-                f"[{frame_idx_snapshot:05d}] {mode} -> {direction_str} -> "
-                f"{result.latency_ms:.1f}ms -> {result.raw_response!r}{fallback_note}"
-            )
+            try:
+                result = vl_query(
+                    mode, [annotated_rgb], context, EPISODE_ID, client=self.client
+                )
+            except Exception as e:
+                line = f"[{frame_idx_snapshot:05d}] {mode} -> ERROR -> n/a -> {e}"
+            else:
+                direction_str = (
+                    result.direction.value if result.direction is not None else "NONE"
+                )
+                line = (
+                    f"[{frame_idx_snapshot:05d}] {mode} -> {direction_str} -> "
+                    f"{result.latency_ms:.1f}ms -> {result.raw_response!r}{fallback_note}"
+                )
 
         print(line)
 
-        ghost_payload, ghost_line = self._maybe_query_ghost_mask(
-            mode, ghost_frame, nearest_any, frame_idx_snapshot
-        )
-        if ghost_line:
-            print(ghost_line)
+        ghost_payload, ghost_line = None, None
+        if mode != "cbf" and ghost_anchor is not None:
+            ghost_payload, ghost_line = self._maybe_query_ghost_mask(
+                ghost_frame, ghost_anchor, frame_idx_snapshot
+            )
+            if ghost_line:
+                print(ghost_line)
 
         with self.vl_lock:
             self.vl_query_in_flight = False
@@ -670,27 +729,28 @@ class VLTeleopApp:
             except Exception:
                 pass  # window may have been torn down between the check and this call
 
-    def _maybe_query_ghost_mask(
-        self, mode, ghost_frame, nearest_any, frame_idx_snapshot
-    ):
-        """Second VLM call, gated on --ghost-mask-vlm and only while
-        exploring (a lost-goal cue has no meaning mid-CBF-avoidance -- see
-        next.md's cbf/exploration binary). Belief is handed to the model as
-        text (GhostMaskContext); the model answers with pixel placement
-        instead of sam_vla.core.ghost_mask's trigonometry deciding it.
-        Runs on the same background thread as the direction call above, so
-        this only ever blocks the (already async) worker, never render()."""
-        if not self.ghost_mask_use_vlm or mode != "exploration" or nearest_any is None:
+    def _maybe_query_ghost_mask(self, ghost_frame, ghost_anchor, frame_idx_snapshot):
+        """Second VLM call, gated on --ghost-mask-vlm (checked by the
+        caller alongside mode != "cbf" -- a lost-goal cue has no meaning
+        mid-CBF-avoidance, see next.md's cbf/exploration binary) and on
+        ghost_anchor being available at all (from _ghost_belief_anchor: the
+        real goal's belief once it's ever been seen and is currently out of
+        frame, or the legacy nearest-obstacle stand-in with no real goal
+        configured). Belief is handed to the model as text
+        (GhostMaskContext); the model answers with pixel placement instead
+        of sam_vla.core.ghost_mask's trigonometry deciding it. Runs on the
+        same background thread as the direction call above, so this only
+        ever blocks the (already async) worker, never render()."""
+        if not self.ghost_mask_use_vlm:
             return None, None
 
-        bearing_deg = math.degrees(
-            math.atan2(nearest_any["left"], nearest_any["forward"])
-        )
-        distance_m = math.hypot(nearest_any["forward"], nearest_any["left"])
+        anchor_forward, anchor_left, anchor_uncertainty = ghost_anchor
+        bearing_deg = math.degrees(math.atan2(anchor_left, anchor_forward))
+        distance_m = math.hypot(anchor_forward, anchor_left)
         ghost_context = GhostMaskContext(
             bearing_deg=bearing_deg,
             distance_m=distance_m,
-            uncertainty=self.uncertainty_covariance,
+            uncertainty=anchor_uncertainty,
             frame_wh=(_FRAME_W, _FRAME_H),
             min_radius_px=float(OVERLAY_MIN_PIXEL_RADIUS),
             max_radius_px=float(OVERLAY_MAX_PIXEL_RADIUS),
@@ -862,21 +922,38 @@ class VLTeleopApp:
                 obstacle_rgb, [goal_circle], color=GOAL_COLOR
             )
 
-        # Ghost mask: translucent green circle at a stand-in "lost goal" point
-        # (nearest obstacle's body-frame position -- this script has no real
-        # goal to track). When --ghost-mask-vlm is on (default) and a VLM
-        # placement has landed, u/v/radius come from self.last_ghost_mask_payload
-        # -- the model's own call, given the belief as text (see
-        # _maybe_query_ghost_mask) -- and stay fixed on-screen between VL
-        # query cycles rather than tracking rover motion, unlike the
-        # deterministic path below. Falls back to the old
+        # Real goal / legacy-obstacle CBF proximity + ghost anchor, computed
+        # once and shared by both the on-screen ghost draw below and the VL
+        # dispatch further down so they always agree.
+        near_obstacle = (
+            nearest_any is not None
+            and nearest_any["edge_distance"] <= CBF_DISTANCE_THRESHOLD_M
+        )
+        goal_out_of_frame = self.goal_enabled and goal_bbox is None
+        ghost_anchor = self._ghost_belief_anchor(nearest_any, goal_out_of_frame)
+
+        # Ghost mask: translucent green circle marking the believed goal
+        # location while it's out of frame. With a real goal configured
+        # (--goal-x/--goal-z), the anchor is self.goal_belief -- which stays
+        # usable *after* self.goal_acquired latches, since BeliefGoalTracker
+        # dead-reckons it every frame (_update_goal_belief), so the ghost
+        # keeps pointing back toward the goal if it drops out of view again
+        # instead of going silent once found. Falls back to the legacy
+        # nearest-synthetic-obstacle stand-in when no real goal is
+        # configured (see _ghost_belief_anchor). When --ghost-mask-vlm is on
+        # (default) and a VLM placement has landed, u/v/radius come from
+        # self.last_ghost_mask_payload -- the model's own call, given the
+        # belief as text (see _maybe_query_ghost_mask) -- and stay fixed
+        # on-screen between VL query cycles rather than tracking rover
+        # motion, unlike the deterministic path below. Falls back to the old
         # project_body_point_to_pixel/uncertainty_to_radius_px geometry
         # (sam_vla/core/ghost_mask.py) whenever no VLM placement exists yet,
         # parsing keeps failing, or --no-ghost-mask-vlm was passed. Purely
         # visual/advisory either way: only ever touches this VLM/display copy
         # of the frame, never anything fed to a policy (there is none here).
         annotated_rgb = obstacle_rgb
-        if nearest_any is not None:
+        if ghost_anchor is not None:
+            anchor_forward, anchor_left, anchor_uncertainty = ghost_anchor
             if self.ghost_mask_use_vlm and self.last_ghost_mask_payload is not None:
                 ghost_u = self.last_ghost_mask_payload.u
                 ghost_v = self.last_ghost_mask_payload.v
@@ -886,8 +963,8 @@ class VLTeleopApp:
                 )
             else:
                 ghost_px = project_body_point_to_pixel(
-                    nearest_any["forward"],
-                    nearest_any["left"],
+                    anchor_forward,
+                    anchor_left,
                     CAMERA_HFOV_DEG,
                     _FRAME_H,
                     _FRAME_W,
@@ -895,7 +972,7 @@ class VLTeleopApp:
                 if ghost_px is not None:
                     ghost_u, ghost_v = ghost_px
                     ghost_radius = uncertainty_to_radius_px(
-                        self.uncertainty_covariance,
+                        anchor_uncertainty,
                         OVERLAY_MIN_PIXEL_RADIUS,
                         OVERLAY_MAX_PIXEL_RADIUS,
                         self.ghost_radius_scale,
@@ -914,23 +991,17 @@ class VLTeleopApp:
         ):
             self._dispatch_uncertainty_request(retry=False)
 
-        # Once the goal has been acquired (seen at least once), exploration
-        # calls latch off for the rest of the run -- vl_direction/DESIGN.md's
-        # documented caller-side rule ("if goal identified -> dormant").
-        # Obstacle avoidance is orthogonal, so a still-active CBF prompt
-        # keeps firing regardless of goal_acquired.
-        near_obstacle = (
-            nearest_any is not None
-            and nearest_any["edge_distance"] <= CBF_DISTANCE_THRESHOLD_M
-        )
-        exploration_dormant = self.goal_acquired and not near_obstacle
-        if (
-            not self.halted_for_uncertainty
-            and not exploration_dormant
-            and self._should_query_vl()
-        ):
+        # Dispatch is always attempted (subject to cadence/halt gating) even
+        # once self.goal_acquired latches -- _dispatch_vl_query internally
+        # turns the direction call into a no-op "dormant" mode in that case
+        # (vl_direction/DESIGN.md's "if goal identified -> dormant"), but
+        # still carries ghost_anchor through so the ghost-mask call keeps
+        # firing. Skipping dispatch entirely here would also skip
+        # ghost_mask, which must not go quiet just because the goal was
+        # found once -- it's what points back to it if lost again.
+        if not self.halted_for_uncertainty and self._should_query_vl():
             self._dispatch_vl_query(
-                annotated_rgb, obstacle_rgb, nearest_any, nearest_visible
+                annotated_rgb, obstacle_rgb, nearest_any, nearest_visible, ghost_anchor
             )
         self.frame_idx += 1
 
