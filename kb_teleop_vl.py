@@ -647,33 +647,49 @@ class VLTeleopApp:
         rgb, _, depth_rgb = kb.rgb_depth_from_obs(obs)
 
         circles, nearest_any, nearest_visible = self._project_obstacles()
-        annotated_rgb = overlay_obstacles(rgb, circles)
+        obstacle_rgb = overlay_obstacles(rgb, circles)
 
         # Ghost mask: translucent green circle at a stand-in "lost goal" point
         # (nearest obstacle's body-frame position -- this script has no real
-        # goal to track), radius driven by self.uncertainty_covariance, the
-        # same synthetic uncertainty signal that drives the halt above. Purely
-        # visual/advisory: only ever touches this VLM/display copy of the
-        # frame, never anything fed to a policy (there is none here).
+        # goal to track). When --ghost-mask-vlm is on (default) and a VLM
+        # placement has landed, u/v/radius come from self.last_ghost_mask_payload
+        # -- the model's own call, given the belief as text (see
+        # _maybe_query_ghost_mask) -- and stay fixed on-screen between VL
+        # query cycles rather than tracking rover motion, unlike the
+        # deterministic path below. Falls back to the old
+        # project_body_point_to_pixel/uncertainty_to_radius_px geometry
+        # (sam_vla/core/ghost_mask.py) whenever no VLM placement exists yet,
+        # parsing keeps failing, or --no-ghost-mask-vlm was passed. Purely
+        # visual/advisory either way: only ever touches this VLM/display copy
+        # of the frame, never anything fed to a policy (there is none here).
+        annotated_rgb = obstacle_rgb
         if nearest_any is not None:
-            ghost_px = project_body_point_to_pixel(
-                nearest_any["forward"],
-                nearest_any["left"],
-                CAMERA_HFOV_DEG,
-                _FRAME_H,
-                _FRAME_W,
-            )
-            if ghost_px is not None:
-                ghost_u, ghost_v = ghost_px
-                ghost_radius = uncertainty_to_radius_px(
-                    self.uncertainty_covariance,
-                    OVERLAY_MIN_PIXEL_RADIUS,
-                    OVERLAY_MAX_PIXEL_RADIUS,
-                    self.ghost_radius_scale,
-                )
+            if self.ghost_mask_use_vlm and self.last_ghost_mask_payload is not None:
+                ghost_u = self.last_ghost_mask_payload.u
+                ghost_v = self.last_ghost_mask_payload.v
+                ghost_radius = self.last_ghost_mask_payload.radius_px
                 annotated_rgb = draw_ghost_mask(
-                    annotated_rgb, ghost_u, ghost_v, ghost_radius, alpha=GHOST_ALPHA
+                    obstacle_rgb, ghost_u, ghost_v, ghost_radius, alpha=GHOST_ALPHA
                 )
+            else:
+                ghost_px = project_body_point_to_pixel(
+                    nearest_any["forward"],
+                    nearest_any["left"],
+                    CAMERA_HFOV_DEG,
+                    _FRAME_H,
+                    _FRAME_W,
+                )
+                if ghost_px is not None:
+                    ghost_u, ghost_v = ghost_px
+                    ghost_radius = uncertainty_to_radius_px(
+                        self.uncertainty_covariance,
+                        OVERLAY_MIN_PIXEL_RADIUS,
+                        OVERLAY_MAX_PIXEL_RADIUS,
+                        self.ghost_radius_scale,
+                    )
+                    annotated_rgb = draw_ghost_mask(
+                        obstacle_rgb, ghost_u, ghost_v, ghost_radius, alpha=GHOST_ALPHA
+                    )
 
         self.last_annotated_rgb = annotated_rgb
 
@@ -686,7 +702,9 @@ class VLTeleopApp:
             self._dispatch_uncertainty_request(retry=False)
 
         if not self.halted_for_uncertainty and self._should_query_vl():
-            self._dispatch_vl_query(annotated_rgb, nearest_any, nearest_visible)
+            self._dispatch_vl_query(
+                annotated_rgb, obstacle_rgb, nearest_any, nearest_visible
+            )
         self.frame_idx += 1
 
         if kb.SHOW_DEPTH_BESIDE_RGB:
@@ -701,10 +719,11 @@ class VLTeleopApp:
         if self.halted_for_uncertainty:
             status += "  [HALTED: awaiting heading]"
 
-        draw.rectangle([0, 0, img.width, 75], fill=(0, 0, 0))
+        draw.rectangle([0, 0, img.width, 97], fill=(0, 0, 0))
         draw.text((10, 8), status, fill=(255, 255, 255))
         draw.text((10, 30), self.last_vl_line, fill=(255, 255, 0))
         draw.text((10, 52), self.last_uncertainty_line, fill=(0, 255, 255))
+        draw.text((10, 74), self.last_ghost_mask_line, fill=(0, 255, 0))
 
         self.tk_img = ImageTk.PhotoImage(img)
         self.image_label.configure(image=self.tk_img)
@@ -807,6 +826,21 @@ def _parse_args():
         "i.e. flat per-frame growth unless overridden); also drives the "
         "ghost-mask radius alongside --cov-growth",
     )
+    parser.add_argument(
+        "--ghost-mask-vlm",
+        dest="ghost_mask_vlm",
+        action="store_true",
+        default=True,
+        help="have the VLM place the ghost mask itself, given the belief "
+        "(bearing/distance/uncertainty) as text -- default on",
+    )
+    parser.add_argument(
+        "--no-ghost-mask-vlm",
+        dest="ghost_mask_vlm",
+        action="store_false",
+        help="revert to the deterministic bearing/uncertainty projection "
+        "(sam_vla/core/ghost_mask.py), skipping the extra VLM call entirely",
+    )
     args = parser.parse_args()
     if args.qwery_n < 1:
         parser.error("--qwery-n must be >= 1")
@@ -820,5 +854,6 @@ if __name__ == "__main__":
         uncertainty_covariance_threshold=args.cov_thresh,
         uncertainty_growth_per_step=args.cov_growth,
         uncertainty_growth_rate=args.cov_growth_rate,
+        ghost_mask_use_vlm=args.ghost_mask_vlm,
     )
     app.run()
