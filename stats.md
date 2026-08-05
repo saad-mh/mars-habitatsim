@@ -130,3 +130,19 @@ hole_in_ground             0           0           0           0           0
     idx=  7364  accuracy=0.9998
 [eval] mean accuracy over 10 random image(s): 0.9998
 ```
+
+```
+
+16 real Qwen calls across every bearing bucket (ahead, side, directly behind), with actual rendered frames from the sim, no mocking. The geometry math checks out (I hand-verified the bearing/distance numbers against the trig by hand — correct), but the model's placement barely tracks its own input:
+
+bearing	expected	got (u, frac of width)
+-102.5° (right, behind)	near right edge (~0.85)	u=376, 0.59
+-147.5° (right, far behind)	pinned at right edge	u=376, 0.59 — identical to the -102.5° case
++167.5° (left, far behind)	pinned at left edge	u=300, 0.47 — barely off-center
++77.5° (left)	clearly left of center	u=320, dead center — directly violates the prompt's "NOT near u=320" instruction
+-12.5° (small, right)	barely off-center	u=376, 0.59 — same offset as the -102.5°/-147.5° cases
++32.5° (left)	somewhat left	u=320, dead center
+Side (left/right) is usually right, but magnitude is essentially decoupled from the actual bearing — a 12° bearing and a 147° bearing produce the same pixel offset, and two cases land exactly on the disallowed center pixel despite the prompt explicitly forbidding that. This isn't a bug in the conversion code (belief_to_bearing_range_uncertainty's numbers check out); it's Qwen2.5-VL-3B failing to do proportional numeric reasoning from text, which is exactly your symptom — clustered near center, never near the sides, occasionally nonsensical.
+
+The good news: the deterministic fallback path (project_or_clamp_body_point_to_pixel, which you already extended to clamp to the correct edge instead of disappearing) doesn't have this problem — it's exact trig, always lands on the correct side with proportional magnitude, and already exists behind --no-ghost-mask-vlm.
+```
