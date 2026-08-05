@@ -29,6 +29,7 @@ class IdentityToken(str, Enum):
     CBF = "cbf"
     EXPLORATION = "exploration"
     UNCERTAINTY = "uncertainty"
+    GHOST_MASK = "ghost_mask"
 
 
 class UncertaintyStatus(str, Enum):
@@ -69,6 +70,54 @@ class ExplorationContext:
     def validate(self) -> None:
         if not self.task_str.strip():
             raise ValueError("ExplorationContext.task_str must be non-empty")
+
+
+@dataclass
+class GhostMaskContext:
+    """Belief state handed to the model for GHOST_MASK mode: the model, not
+    caller-side geometry, decides where/how large the ghost mask should be.
+    bearing_deg is body-frame, 0=straight ahead, positive=left, matching
+    BeliefGoalTracker's [forward, left] convention; distance_m is the
+    straight-line body-frame range to the belief point."""
+
+    bearing_deg: float
+    distance_m: float
+    uncertainty: float
+    frame_wh: tuple[int, int]
+    min_radius_px: float
+    max_radius_px: float
+
+    def validate(self) -> None:
+        w, h = self.frame_wh
+        if w <= 0 or h <= 0:
+            raise ValueError(
+                f"GhostMaskContext.frame_wh must be positive, got {self.frame_wh!r}"
+            )
+        if self.distance_m < 0:
+            raise ValueError(
+                f"GhostMaskContext.distance_m must be >= 0, got {self.distance_m!r}"
+            )
+        if self.uncertainty < 0:
+            raise ValueError(
+                f"GhostMaskContext.uncertainty must be >= 0, got {self.uncertainty!r}"
+            )
+        if self.min_radius_px < 0 or self.max_radius_px < self.min_radius_px:
+            raise ValueError(
+                "GhostMaskContext radius bounds invalid: "
+                f"min_radius_px={self.min_radius_px!r}, max_radius_px={self.max_radius_px!r}"
+            )
+
+
+@dataclass
+class GhostMaskPayload:
+    """The model's chosen ghost-mask placement -- pixel center + radius.
+    Always clamped into frame_wh / [min_radius_px, max_radius_px] by the
+    parser before this is constructed, so downstream rendering code never
+    needs to re-validate model output."""
+
+    u: float
+    v: float
+    radius_px: float
 
 
 @dataclass
@@ -139,6 +188,7 @@ class VLDirectiveResult:
     call_id: str
     session_mode: SessionMode
     uncertainty_payload: Optional[UncertaintyPayload] = None
+    ghost_mask_payload: Optional[GhostMaskPayload] = None
 
     def validate(self) -> None:
         if not (0.0 <= self.confidence <= 1.0):
@@ -146,6 +196,7 @@ class VLDirectiveResult:
                 f"VLDirectiveResult.confidence must be in [0, 1], got {self.confidence!r}"
             )
         is_uncertainty = self.identity_token == IdentityToken.UNCERTAINTY
+        is_ghost_mask = self.identity_token == IdentityToken.GHOST_MASK
         if is_uncertainty:
             if self.direction is not None:
                 raise ValueError(
@@ -155,10 +206,31 @@ class VLDirectiveResult:
                 raise ValueError(
                     "VLDirectiveResult.uncertainty_payload must be set for uncertainty mode"
                 )
+            if self.ghost_mask_payload is not None:
+                raise ValueError(
+                    "VLDirectiveResult.ghost_mask_payload must be None for uncertainty mode"
+                )
+        elif is_ghost_mask:
+            if self.direction is not None:
+                raise ValueError(
+                    "VLDirectiveResult.direction must be None for ghost_mask mode"
+                )
+            if self.uncertainty_payload is not None:
+                raise ValueError(
+                    "VLDirectiveResult.uncertainty_payload must be None for ghost_mask mode"
+                )
+            if self.parse_ok and self.ghost_mask_payload is None:
+                raise ValueError(
+                    "VLDirectiveResult.ghost_mask_payload must be set when parse_ok is True"
+                )
         else:
             if self.uncertainty_payload is not None:
                 raise ValueError(
                     f"VLDirectiveResult.uncertainty_payload must be None for {self.identity_token!r} mode"
+                )
+            if self.ghost_mask_payload is not None:
+                raise ValueError(
+                    f"VLDirectiveResult.ghost_mask_payload must be None for {self.identity_token!r} mode"
                 )
             if self.parse_ok and self.direction is None:
                 raise ValueError(

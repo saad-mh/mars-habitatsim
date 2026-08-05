@@ -237,9 +237,7 @@ class VLTeleopApp:
         if USE_MOCK_CLIENT:
             self.client = get_client("mock")
         else:
-            print(
-                "[VLTeleopApp] starting Qwen server (loads Qwen2.5-VL-3B-Instruct in the 'qwen_vlm' conda env)"
-            )
+            print("[VLTeleopApp] starting Qwen server")
             self.server_manager.start()
             self.client = get_client("qwen")
 
@@ -264,7 +262,7 @@ class VLTeleopApp:
         self.last_vl_line = ""
 
         self.root = tk.Tk()
-        self.root.title("Kb Teleop + Qwen")
+        self.root.title("kb teleop")
 
         self.image_label = tk.Label(self.root)
         self.image_label.pack()
@@ -273,7 +271,6 @@ class VLTeleopApp:
             self.root,
             text=(
                 "W/S move | A/D turn | Q/E height | U force-uncertainty-halt | X quit  "
-                "(while halted: 1/2/3/4/6/7/8/9 = submit heading, R = retry)"
             ),
             font=("Arial", 12),
         )
