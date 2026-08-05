@@ -31,7 +31,7 @@ def test_prompt_contains_frame_size_and_radius_bounds():
     prompt = build_ghost_mask_prompt(_context(frame_wh=(320, 240)))
     assert "320x240" in prompt
     assert "3" in prompt
-    assert "260" in prompt
+    assert "100" in prompt
 
 
 def test_prompt_requests_json_schema():
