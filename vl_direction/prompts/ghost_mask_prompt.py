@@ -34,7 +34,11 @@ _JSON_SCHEMA_LINE = (
 def _context_block(context: GhostMaskContext) -> str:
     w, h = context.frame_wh
     cx = w / 2.0
-    side = "left" if context.bearing_deg > 0 else "right" if context.bearing_deg < 0 else "ahead"
+    side = (
+        "left"
+        if context.bearing_deg > 0
+        else "right" if context.bearing_deg < 0 else "ahead"
+    )
     behind = abs(context.bearing_deg) > 90.0
     behind_note = (
         f" The bearing magnitude ({context.bearing_deg:+.0f} degrees) means the "
@@ -124,6 +128,6 @@ if __name__ == "__main__":
         distance_uncertainty_m=1.2,
         frame_wh=(640, 480),
         min_radius_px=3.0,
-        max_radius_px=260.0,
+        max_radius_px=100.0,
     )
     print(build_ghost_mask_prompt(demo))

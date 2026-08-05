@@ -13,7 +13,7 @@ def _context(**overrides):
         distance_uncertainty_m=1.2,
         frame_wh=(640, 480),
         min_radius_px=3.0,
-        max_radius_px=260.0,
+        max_radius_px=100.0,
     )
     defaults.update(overrides)
     return GhostMaskContext(**defaults)

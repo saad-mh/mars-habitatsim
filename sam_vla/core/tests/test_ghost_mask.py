@@ -8,6 +8,7 @@ from sam_vla.core.ghost_mask import (
     draw_ghost_ellipse,
     draw_ghost_mask,
     project_body_point_to_pixel,
+    project_or_clamp_body_point_to_pixel,
     uncertainty_to_radius_px,
 )
 
@@ -55,6 +56,61 @@ def test_project_right_of_body_lands_right_of_center():
 def test_project_far_off_axis_falls_outside_frame_returns_none():
     result = project_body_point_to_pixel(forward=1.0, left=50.0, hfov_deg=90.0, h=480, w=640)
     assert result is None
+
+
+def test_clamp_matches_direct_projection_when_in_view():
+    h, w = 480, 640
+    direct = project_body_point_to_pixel(forward=5.0, left=1.0, hfov_deg=90.0, h=h, w=w)
+    clamped = project_or_clamp_body_point_to_pixel(
+        forward=5.0, left=1.0, hfov_deg=90.0, h=h, w=w
+    )
+    assert direct == pytest.approx(clamped)
+
+
+def test_clamp_off_axis_ahead_lands_on_near_side_edge():
+    h, w = 480, 640
+    u, v = project_or_clamp_body_point_to_pixel(
+        forward=1.0, left=50.0, hfov_deg=90.0, h=h, w=w
+    )
+    assert u == pytest.approx(0.0)  # left-positive -> clamps to left edge
+    assert v == pytest.approx((h - 1) * 0.5)
+
+    u, v = project_or_clamp_body_point_to_pixel(
+        forward=1.0, left=-50.0, hfov_deg=90.0, h=h, w=w
+    )
+    assert u == pytest.approx(float(w - 1))  # right-positive left -> right edge
+
+
+def test_clamp_behind_but_off_to_a_side_lands_on_that_side_edge():
+    h, w = 480, 640
+    u, v = project_or_clamp_body_point_to_pixel(
+        forward=-2.0, left=2.0, hfov_deg=90.0, h=h, w=w
+    )
+    assert u == pytest.approx(0.0)  # behind-left -> left edge
+    assert v == pytest.approx((h - 1) * 0.5)
+
+    u, v = project_or_clamp_body_point_to_pixel(
+        forward=-2.0, left=-2.0, hfov_deg=90.0, h=h, w=w
+    )
+    assert u == pytest.approx(float(w - 1))  # behind-right -> right edge
+
+
+def test_clamp_directly_behind_lands_on_bottom_edge():
+    h, w = 480, 640
+    u, v = project_or_clamp_body_point_to_pixel(
+        forward=-2.0, left=0.0, hfov_deg=90.0, h=h, w=w
+    )
+    assert u == pytest.approx((w - 1) * 0.5)
+    assert v == pytest.approx(float(h - 1))
+
+
+def test_clamp_at_origin_lands_on_bottom_edge():
+    h, w = 480, 640
+    u, v = project_or_clamp_body_point_to_pixel(
+        forward=0.0, left=0.0, hfov_deg=90.0, h=h, w=w
+    )
+    assert u == pytest.approx((w - 1) * 0.5)
+    assert v == pytest.approx(float(h - 1))
 
 
 def test_draw_ghost_mask_is_non_destructive_copy():

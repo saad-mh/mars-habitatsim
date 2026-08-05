@@ -26,23 +26,28 @@ of waiting on/tuning the organic drift.
 Also drives vl_direction's fourth mode, "ghost_mask", whenever there's a
 belief anchor to visualize and the rover isn't actively dodging an obstacle
 (see _ghost_belief_anchor / _should_query_vl's mode != "cbf" check): the
-belief (bearing/distance/uncertainty) is handed to the VLM as text alongside
-the obstacle-only frame, and the VLM answers with JSON pixel coordinates (u,
-v, radius_px) for where the translucent ghost circle should be drawn --
-placement is the model's spatial-reasoning call, not caller-side
-trigonometry (--no-ghost-mask-vlm reverts to the old deterministic
-projection for comparison). The prompt explicitly steers the model off dead
-center: since the ghost only ever fires while the goal/target is *out of
-view*, a center placement (== "straight ahead") would contradict its own
-premise, and a fixed dead-center worked example in the prompt was found to
-anchor a 3B model there regardless of the real bearing -- see
-vl_direction/prompts/ghost_mask_prompt.py's _worked_example. Advisory-only,
-same as exploration/cbf: the parsed result only ever changes what gets
-drawn/printed, never an Action. Because this is a second, throttled VLM
-call, the on-screen circle only updates on the existing VL query cadence and
-holds its last position between calls (falls back to the deterministic
-projection whenever no VLM placement has landed yet, or the model's JSON
-failed to parse).
+belief is packaged as mu (body-frame [forward, left] mean) + Sigma (2x2
+covariance, isotropic today since neither BeliefGoalTracker nor the legacy
+stand-in tracks a real anisotropic one -- see _maybe_query_ghost_mask), run
+through sam_vla.core.ghost_mask.belief_to_bearing_range_uncertainty to get
+bearing/distance plus two independent uncertainty scalars, and handed to the
+VLM as text alongside the obstacle-only frame -- never as raw world x/z,
+which means nothing to the model's spatial reasoning. The VLM answers with
+JSON pixel coordinates (u, v, radius_u_px, radius_v_px) for where the
+translucent ghost ellipse should be drawn -- placement is the model's
+spatial-reasoning call, not caller-side trigonometry (--no-ghost-mask-vlm
+reverts to the old deterministic circle projection for comparison). The
+prompt explicitly steers the model off dead center: since the ghost only
+ever fires while the goal/target is *out of view*, a center placement (==
+"straight ahead") would contradict its own premise, and a fixed dead-center
+worked example in the prompt was found to anchor a 3B model there regardless
+of the real bearing -- see vl_direction/prompts/ghost_mask_prompt.py's
+_worked_example. Advisory-only, same as exploration/cbf: the parsed result
+only ever changes what gets drawn/printed, never an Action. Because this is
+a second, throttled VLM call, the on-screen ellipse only updates on the
+existing VL query cadence and holds its last position between calls (falls
+back to the deterministic circle projection whenever no VLM placement has
+landed yet, or the model's JSON failed to parse).
 
 Optionally drives a fifth thing: a real, ground-truth goal via --goal-x/--goal-z
 (paired, plus --goal-radius, default 0.5m). On startup the terrain patch within
@@ -105,6 +110,7 @@ from sam_vla.core.ghost_mask import (
     draw_ghost_ellipse,
     draw_ghost_mask,
     project_body_point_to_pixel,
+    project_or_clamp_body_point_to_pixel,
     uncertainty_to_radius_px,
 )
 from sam_vla.core.types import Action
@@ -770,6 +776,19 @@ class VLTeleopApp:
             min_radius_px=float(OVERLAY_MIN_PIXEL_RADIUS),
             max_radius_px=float(OVERLAY_MAX_PIXEL_RADIUS),
         )
+        # "kind" here is the same VLM-ellipse-vs-fallback-circle split render()
+        # makes when drawing (see the ghost_anchor block below) -- a stale
+        # self.last_ghost_mask_payload from an earlier successful call still
+        # draws as an ellipse even on a failed/errored extraction this frame,
+        # so it's distinguished from "fallback-default" (the deterministic
+        # project_body_point_to_pixel/uncertainty_to_radius_px circle, drawn
+        # only once no prior VLM placement exists at all).
+        stale_kind = (
+            "ghost-mask-ellipse(stale)"
+            if self.last_ghost_mask_payload is not None
+            else "fallback-default"
+        )
+
         try:
             ghost_result = vl_query(
                 "ghost_mask",
@@ -779,12 +798,16 @@ class VLTeleopApp:
                 client=self.client,
             )
         except Exception as e:
-            return None, f"[{frame_idx_snapshot:05d}] ghost_mask -> ERROR -> {e}"
+            return None, (
+                f"[{frame_idx_snapshot:05d}] ghost_mask -> ERROR -> kind={stale_kind} "
+                f"belief={ghost_context!r} -> {e}"
+            )
 
         if not ghost_result.parse_ok:
             return None, (
                 f"[{frame_idx_snapshot:05d}] ghost_mask -> PARSE FAILED, "
-                f"keeping last placement -> {ghost_result.raw_response!r}"
+                f"keeping last placement -> kind={stale_kind} "
+                f"belief={ghost_context!r} raw={ghost_result.raw_response!r}"
             )
 
         payload = ghost_result.ghost_mask_payload
@@ -792,7 +815,8 @@ class VLTeleopApp:
             f"[{frame_idx_snapshot:05d}] ghost_mask -> "
             f"u={payload.u:.0f} v={payload.v:.0f} "
             f"ru={payload.radius_u_px:.0f} rv={payload.radius_v_px:.0f} -> "
-            f"{ghost_result.latency_ms:.1f}ms -> {ghost_result.raw_response!r}"
+            f"kind=vlm-inferred belief={ghost_context!r} "
+            f"{ghost_result.latency_ms:.1f}ms raw={ghost_result.raw_response!r}"
         )
         return payload, line
 
@@ -964,7 +988,14 @@ class VLTeleopApp:
         # motion, unlike the deterministic path below. Falls back to the old
         # project_body_point_to_pixel/uncertainty_to_radius_px geometry
         # (sam_vla/core/ghost_mask.py) whenever no VLM placement exists yet,
-        # parsing keeps failing, or --no-ghost-mask-vlm was passed. Purely
+        # parsing keeps failing, or --no-ghost-mask-vlm was passed -- that
+        # deterministic path recomputes u/v from the current belief every
+        # single frame (no holding between VL cycles), and when the belief
+        # isn't directly projectable (behind the rover, or beyond the HFOV),
+        # clamps to the frame edge it's headed toward via
+        # project_or_clamp_body_point_to_pixel instead of disappearing: a
+        # side edge if it's closer to one side, the bottom edge if it's
+        # dead behind / effectively underneath the rover. Purely
         # visual/advisory either way: only ever touches this VLM/display copy
         # of the frame, never anything fed to a policy (there is none here).
         annotated_rgb = obstacle_rgb
@@ -991,17 +1022,30 @@ class VLTeleopApp:
                     _FRAME_H,
                     _FRAME_W,
                 )
-                if ghost_px is not None:
-                    ghost_u, ghost_v = ghost_px
-                    ghost_radius = uncertainty_to_radius_px(
-                        anchor_uncertainty,
-                        OVERLAY_MIN_PIXEL_RADIUS,
-                        OVERLAY_MAX_PIXEL_RADIUS,
-                        self.ghost_radius_scale,
+                if ghost_px is None:
+                    # Out of view this frame (behind the rover, or beyond the
+                    # HFOV): rather than drop the ghost, clamp it to the
+                    # frame edge it's headed toward -- side edge if it's
+                    # closer to one side, bottom edge if it's dead behind /
+                    # right underneath -- so it keeps tracking the belief
+                    # every frame instead of vanishing.
+                    ghost_px = project_or_clamp_body_point_to_pixel(
+                        anchor_forward,
+                        anchor_left,
+                        CAMERA_HFOV_DEG,
+                        _FRAME_H,
+                        _FRAME_W,
                     )
-                    annotated_rgb = draw_ghost_mask(
-                        obstacle_rgb, ghost_u, ghost_v, ghost_radius, alpha=GHOST_ALPHA
-                    )
+                ghost_u, ghost_v = ghost_px
+                ghost_radius = uncertainty_to_radius_px(
+                    anchor_uncertainty,
+                    OVERLAY_MIN_PIXEL_RADIUS,
+                    OVERLAY_MAX_PIXEL_RADIUS,
+                    self.ghost_radius_scale,
+                )
+                annotated_rgb = draw_ghost_mask(
+                    obstacle_rgb, ghost_u, ghost_v, ghost_radius, alpha=GHOST_ALPHA
+                )
 
         self.last_annotated_rgb = annotated_rgb
 
@@ -1168,7 +1212,7 @@ def _parse_args():
         action="store_true",
         default=True,
         help="have the VLM place the ghost mask itself, given the belief "
-        "(bearing/distance/uncertainty) as text -- default on",
+        "(mu/Sigma, resolved to bearing/distance/uncertainty text) -- default on",
     )
     parser.add_argument(
         "--no-ghost-mask-vlm",

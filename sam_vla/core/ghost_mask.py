@@ -55,6 +55,47 @@ def project_body_point_to_pixel(
     return u, intr["cy"]
 
 
+def project_or_clamp_body_point_to_pixel(
+    forward: float,
+    left: float,
+    hfov_deg: float,
+    h: int,
+    w: int,
+    back_margin_deg: float = 25.0,
+) -> Tuple[float, float]:
+    """Same body-frame [forward, left] -> pixel (u, v) projection as
+    project_body_point_to_pixel, but never returns None: whenever the point
+    isn't directly projectable, it's clamped to the frame edge it's headed
+    toward instead, so the ghost stays visible and keeps pointing at the
+    belief every frame instead of disappearing while out of view.
+
+    Three cases:
+    - In front (forward > 0) but beyond the horizontal FOV: clamp u to the
+      near edge (0 or w-1) at v=cy -- "the side it'll swing into view from"
+      as the rover turns toward it.
+    - Behind (forward <= 0) but with a meaningful left/right component:
+      same side-edge clamp, since the point is still closer to that side
+      than the other.
+    - Behind and (near-)centered -- bearing within back_margin_deg of
+      straight back, or the point is essentially at the rover's own
+      position (r ~ 0, direction undefined either way: not really left,
+      right, or ahead) -- placed at the bottom edge (v=h-1, u=cx),
+      i.e. "down", since neither side edge is meaningfully closer.
+    """
+    intr = intrinsics_from_hfov(h, w, hfov_deg)
+    r = math.hypot(forward, left)
+    if r < 1e-3:
+        return intr["cx"], float(h - 1)
+    if forward > 1e-3:
+        u = intr["cx"] - float(left) * intr["fx"] / float(forward)
+        u = float(np.clip(u, 0.0, float(w - 1)))
+        return u, intr["cy"]
+    bearing_deg = math.degrees(math.atan2(left, forward))
+    if abs(bearing_deg) >= 180.0 - float(back_margin_deg):
+        return intr["cx"], float(h - 1)
+    return (0.0 if left > 0 else float(w - 1)), intr["cy"]
+
+
 def draw_ghost_mask(
     rgb: np.ndarray,
     u: float,
