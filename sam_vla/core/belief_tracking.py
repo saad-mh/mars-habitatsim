@@ -134,6 +134,16 @@ class BeliefGoalTracker:
             self._time_since_seen = 0.0
         return seed is not None
 
+    def observe_body_point(self, forward: float, left: float) -> None:
+        """Re-seed belief from a known body-frame point directly, bypassing
+        mask/depth -- for callers with ground-truth goal position instead of
+        a rendered mask (e.g. kb_teleop_vl.py's --goal-x/--goal-z, which has
+        no semantic renderer to source a mask from). Same reset semantics as
+        a successful observe(): floor uncertainty, zero time_since_seen."""
+        self.belief_g = np.asarray([forward, left], dtype=np.float32)
+        self.uncertainty = self.sigma_visible
+        self._time_since_seen = 0.0
+
     def propagate(self, action: Action, dt: float) -> None:
         """Dead-reckon the belief by the just-executed action. Action.v_lat is
         RIGHTWARD-positive (sam_vla's pose_integrator convention, see its docstring)

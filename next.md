@@ -165,3 +165,40 @@ New/modified files:
 - **Phase 2**: spot-check a handful of saved `vis_rgb` frames/video from a real rollout before
   trusting it at scale — same discipline CLAUDE.md already prescribes for segmentation-sweep
   overlays ("Sanity-check any new sweep by overlaying masks on rgb for a few frames").
+
+## Addendum: VLM-placed ghost mask (`ghost_mask` mode)
+
+Follow-up ask (mentor-directed): try actually letting the VLM decide the mask, per the *original*
+ask's point 1 ("plug belief into a VLM/LM/Model, which draws a translucent ghost mask") — Phase 1
+above instead kept placement 100% deterministic and only let the VLM *see* the result. This
+addendum does the belief-to-VLM handoff for real, scoped to `kb_teleop_vl.py` only (Phase 2
+rollout-loop wiring is not part of this pass, and point 4 — the policy actually acting on the mask
+— is still out of scope, unchanged from the "Action coupling: advisory-only" decision above).
+
+Qwen2.5-VL-3B-Instruct (the client already wired into `kb_teleop_vl.py`) is a vision-*understanding*
+model, not an image generator — it cannot literally emit pixels. "The VLM draws the mask" resolves
+to: the model receives the belief (`bearing_deg`/`distance_m`/`uncertainty`) as text plus the
+obstacle-only frame, and answers with free-form JSON pixel coordinates `{"u", "v", "radius_px"}`;
+code (`draw_ghost_mask`, unchanged) still does the actual alpha-blend. This is a new fourth
+`vl_direction` mode, `ghost_mask`:
+
+| Piece | Where |
+|---|---|
+| `GhostMaskContext` / `GhostMaskPayload` schemas | `vl_direction/schemas.py` |
+| Prompt (explains bearing/distance/uncertainty, asks for the JSON schema) | `vl_direction/prompts/ghost_mask_prompt.py` |
+| `parse_ghost_mask_json()` — extracts a `{...}` object from free-form text, clamps `u`/`v` into `frame_wh` and `radius_px` into `[min_radius_px, max_radius_px]` | `vl_direction/parser.py` |
+| `_query_ghost_mask()` handler, registered in `_HANDLERS` | `vl_direction/directive_engine.py` |
+| Dispatch: a second VLM call issued alongside the existing exploration-direction call, only when `mode == "exploration"` (ghost mask has no meaning mid-CBF, same binary Phase 1 already established) and `--ghost-mask-vlm` is on (default true; `--no-ghost-mask-vlm` reverts to Phase 1's pure geometry) | `kb_teleop_vl.py`'s `_maybe_query_ghost_mask()` |
+
+Known tradeoff: because this is a second, throttled VLM call (same cadence as the direction query,
+not every frame), the model's `(u, v)` is a **fixed screen position** that holds between calls —
+unlike the deterministic path, it does not re-project to track rover motion frame-to-frame. A
+parse failure keeps the previous VLM placement (not the deterministic fallback) so a single bad
+JSON response doesn't visibly snap the circle; the deterministic projection is only used before any
+VLM placement has landed yet, or when `--no-ghost-mask-vlm` is passed. All 4 additions
+(`schemas.py`, `parser.py`, `directive_engine.py`, the new prompt module) are covered by
+`vl_direction/tests/` (`test_ghost_mask_prompt.py`, ghost-mask cases in `test_parser_fallback.py`
+and `test_directive_engine_contract.py`); the `kb_teleop_vl.py` wiring itself has no pytest
+coverage (same as the rest of that file) — verify visually per the Phase 1 verification plan
+above, or exercise `VLTeleopApp._maybe_query_ghost_mask` directly with a fake `self` +
+`MockInternVLClient` for a quick non-visual smoke check.

@@ -36,6 +36,20 @@ only updates on the existing VL query cadence and holds its last position
 between calls (falls back to the deterministic projection whenever no VLM
 placement has landed yet, or the model's JSON failed to parse).
 
+Optionally drives a fifth thing: a real, ground-truth goal via --goal-x/--goal-z
+(paired, plus --goal-radius, default 0.5m). On startup the terrain patch within
+that radius is extracted to its own OBJ (extract_disc_mesh/write_obj_mesh --
+same tight-clipping approach mesh_annotation_tool.py uses for its polygon hulls,
+just circular). Every frame it actually projects into, it's drawn as a solid
+blue circle (distinct from the red obstacles / green ghost) and, via the same
+"in frame" check, snaps sam_vla.core.belief_tracking.BeliefGoalTracker onto it
+(BeliefGoalTracker.observe_body_point, since this script has no semantic
+renderer to source a mask from); the tracker then dead-reckons it every
+subsequent frame. Once acquired, self.goal_acquired latches permanently and
+exploration-mode VL calls stop firing for the rest of the run (CBF calls keep
+firing regardless) -- vl_direction/DESIGN.md's documented caller-side rule,
+"if goal identified -> dormant".
+
 Reuses kb_teleop.py's habitat_sim setup (make_sim, terrain height lookup,
 boundary clamping) via import rather than duplicating it -- this script only
 adds the obstacle field, projection/overlay, and the VL call.
@@ -71,12 +85,13 @@ import tkinter as tk
 import quaternion
 
 import kb_teleop as kb
-from sam_vla.core.belief_tracking import uncertainty_growth_increment
+from sam_vla.core.belief_tracking import BeliefGoalTracker, uncertainty_growth_increment
 from sam_vla.core.ghost_mask import (
     draw_ghost_mask,
     project_body_point_to_pixel,
     uncertainty_to_radius_px,
 )
+from sam_vla.core.types import Action
 from vl_direction import config as vl_dir_config
 from vl_direction.client import get_client
 from vl_direction.directive_engine import query as vl_query
@@ -125,6 +140,19 @@ _FOCAL_PX = (_FRAME_W / 2.0) / math.tan(math.radians(CAMERA_HFOV_DEG / 2.0))
 OVERLAY_ALPHA = 0.5
 OVERLAY_MIN_PIXEL_RADIUS = 3
 OVERLAY_MAX_PIXEL_RADIUS = 260
+
+# --- real goal (--goal-x/--goal-z): a terrain patch of radius --goal-radius is
+# extracted to its own OBJ (extract_disc_mesh/write_obj_mesh, same tight-clipping
+# approach mesh_annotation_tool.py uses for its polygon hulls, just circular) and
+# ground-truth-projected in blue whenever it's actually in frame -- distinct from
+# the red synthetic obstacles and the green ghost mask. Being in frame is also
+# what snaps BeliefGoalTracker onto it (BeliefGoalTracker.observe_body_point);
+# once acquired, mode dispatch latches out of "exploration" for good (see
+# render()'s exploration_dormant), per vl_direction/DESIGN.md's documented
+# caller-side rule: "if goal identified -> dormant". ---
+DEFAULT_GOAL_RADIUS_M = 0.5
+GOAL_MESH_SPACING_M = 0.05
+GOAL_COLOR = (0.0, 0.0, 255.0)
 
 USE_MOCK_CLIENT = False
 
@@ -179,9 +207,11 @@ def body_frame_forward_left(px_world, pz_world, rover_x, rover_z, yaw):
     return forward, -right
 
 
-def overlay_obstacles(rgb, projected_circles):
-    """Alpha-blends solid red circles onto rgb (uint8 HWC) at each
-    (pixel_x, pixel_y, pixel_radius) in projected_circles."""
+def overlay_obstacles(rgb, projected_circles, color=(255.0, 0.0, 0.0)):
+    """Alpha-blends solid `color` circles onto rgb (uint8 HWC) at each
+    (pixel_x, pixel_y, pixel_radius) in projected_circles. Defaults to red
+    (synthetic obstacles); the real goal marker reuses this with
+    color=GOAL_COLOR (blue) so both share one blend implementation."""
     if not projected_circles:
         return rgb.copy()
 
@@ -191,9 +221,72 @@ def overlay_obstacles(rgb, projected_circles):
     for pixel_x, pixel_y, pixel_radius in projected_circles:
         mask |= (xx - pixel_x) ** 2 + (yy - pixel_y) ** 2 <= pixel_radius**2
 
-    red = np.array([255.0, 0.0, 0.0])
-    annotated[mask] = annotated[mask] * (1.0 - OVERLAY_ALPHA) + red * OVERLAY_ALPHA
+    color_arr = np.array(color, dtype=np.float32)
+    annotated[mask] = (
+        annotated[mask] * (1.0 - OVERLAY_ALPHA) + color_arr * OVERLAY_ALPHA
+    )
     return annotated.astype(np.uint8)
+
+
+def extract_disc_mesh(
+    center_x, center_z, radius, spacing=GOAL_MESH_SPACING_M, max_grid_res=200
+):
+    """Terrain patch mesh within `radius` of (center_x, center_z): a regular
+    (x, z) grid sampled at `spacing`, each vertex's height read from
+    kb.terrain_height_at (bilinear, matches HeightmapGrid's normalize-then-
+    subtract-mean convention), keeping only quads whose 4 corners fall inside
+    the circle -- the same tight-clipping approach
+    mesh_annotation_tool.py's compute_tight_boundary_mesh uses for its
+    polygon hulls, just with a circular inside-test instead of a polygon
+    one. Returns (verts (N,3), faces (M,3) triangle indices)."""
+    n = int(np.clip(round((2.0 * radius) / spacing) + 1, 2, max_grid_res))
+    xs = np.linspace(center_x - radius, center_x + radius, n)
+    zs = np.linspace(center_z - radius, center_z + radius, n)
+    Xg, Zg = np.meshgrid(xs, zs)
+    Yg = np.vectorize(kb.terrain_height_at)(Xg, Zg)
+    inside = (Xg - center_x) ** 2 + (Zg - center_z) ** 2 <= radius**2
+
+    row, col = np.meshgrid(np.arange(n - 1), np.arange(n - 1), indexing="ij")
+    quad_inside = (
+        inside[row, col]
+        & inside[row, col + 1]
+        & inside[row + 1, col + 1]
+        & inside[row + 1, col]
+    ).ravel()
+    i0 = (row * n + col).ravel()
+    i1 = (row * n + col + 1).ravel()
+    i2 = ((row + 1) * n + col + 1).ravel()
+    i3 = ((row + 1) * n + col).ravel()
+    faces = np.concatenate(
+        [
+            np.stack([i0, i1, i2], axis=-1)[quad_inside],
+            np.stack([i0, i2, i3], axis=-1)[quad_inside],
+        ],
+        axis=0,
+    )
+    if len(faces) == 0:
+        raise ValueError(
+            f"--goal-radius {radius} is too small to extract a terrain mesh at "
+            f"spacing {spacing} -- increase --goal-radius or decrease the spacing"
+        )
+
+    verts_full = np.stack([Xg.ravel(), Yg.ravel(), Zg.ravel()], axis=-1)
+    used = np.unique(faces)
+    remap = -np.ones(len(verts_full), dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return verts_full[used], remap[faces]
+
+
+def write_obj_mesh(path, verts, faces, name="goal"):
+    """Writes verts/faces (as returned by extract_disc_mesh) to a plain OBJ
+    file, same minimal format mesh_annotation_tool.py's write_hull_obj uses
+    (1-indexed face vertices, no normals/UVs)."""
+    with open(path, "w") as f:
+        f.write(f"o {name}\n")
+        for v in verts:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for tri in faces:
+            f.write(f"f {tri[0] + 1} {tri[1] + 1} {tri[2] + 1}\n")
 
 
 class VLTeleopApp:
@@ -204,6 +297,9 @@ class VLTeleopApp:
         uncertainty_growth_per_step=DEFAULT_UNCERTAINTY_GROWTH_PER_STEP,
         uncertainty_growth_rate=DEFAULT_UNCERTAINTY_GROWTH_RATE,
         ghost_mask_use_vlm=True,
+        goal_x=None,
+        goal_z=None,
+        goal_radius=DEFAULT_GOAL_RADIUS_M,
     ):
         self.ghost_mask_use_vlm = ghost_mask_use_vlm
         self.last_ghost_mask_payload = None
@@ -250,6 +346,32 @@ class VLTeleopApp:
             f"[VLTeleopApp] {NUM_OBSTACLES} synthetic obstacles (r={OBSTACLE_RADIUS_M}m): "
             + ", ".join(f"({o[0]:.1f},{o[2]:.1f})" for o in self.obstacles)
         )
+
+        self.goal_enabled = goal_x is not None
+        self.goal_acquired = False
+        self.goal_belief = None
+        self._goal_belief_prev_pose = None
+        if self.goal_enabled:
+            self.goal_x = goal_x
+            self.goal_z = goal_z
+            self.goal_radius = goal_radius
+
+            mesh_verts, mesh_faces = extract_disc_mesh(
+                self.goal_x, self.goal_z, self.goal_radius
+            )
+            self.goal_mesh_path = Path(f"goal_mesh_{EPISODE_ID}.obj")
+            write_obj_mesh(self.goal_mesh_path, mesh_verts, mesh_faces, name="goal")
+
+            self.goal_belief = BeliefGoalTracker(
+                hfov_deg=CAMERA_HFOV_DEG,
+                odom_noise=uncertainty_growth_per_step,
+                odom_noise_growth_rate=uncertainty_growth_rate,
+            )
+
+            print(
+                f"[VLTeleopApp] goal at ({self.goal_x:.2f},{self.goal_z:.2f}) r={self.goal_radius}m -- "
+                f"extracted {len(mesh_faces)} tris -> {self.goal_mesh_path}"
+            )
 
         self.server_manager = QwenServerManager()
         if USE_MOCK_CLIENT:
@@ -360,6 +482,76 @@ class VLTeleopApp:
 
         return circles, nearest_any, nearest_visible
 
+    def _project_goal(self):
+        """Ground-truth projection of the goal disc (top of a
+        goal_radius-tall dome, same convention as the obstacle spheres).
+        Returns (circle_for_overlay, bbox) or (None, None) if disabled or
+        not currently in frame -- bbox is what drives both the blue overlay
+        and the belief-snap trigger in _update_goal_belief."""
+        if not self.goal_enabled:
+            return None, None
+
+        goal_y = kb.terrain_height_at(self.goal_x, self.goal_z) + self.goal_radius
+        projected = project_point(
+            self.goal_x, goal_y, self.goal_z, self.x, self.y, self.z, self.yaw
+        )
+        if projected is None:
+            return None, None
+        pixel_x, pixel_y, depth = projected
+        pixel_radius = float(
+            np.clip(
+                _FOCAL_PX * self.goal_radius / depth,
+                OVERLAY_MIN_PIXEL_RADIUS,
+                OVERLAY_MAX_PIXEL_RADIUS,
+            )
+        )
+
+        x1, y1 = pixel_x - pixel_radius, pixel_y - pixel_radius
+        x2, y2 = pixel_x + pixel_radius, pixel_y + pixel_radius
+        x1c, y1c = max(0.0, x1), max(0.0, y1)
+        x2c, y2c = min(float(_FRAME_W), x2), min(float(_FRAME_H), y2)
+        if x2c <= x1c or y2c <= y1c:
+            return None, None  # projects fully outside the frame
+
+        circle = (pixel_x, pixel_y, pixel_radius)
+        bbox = (int(x1c), int(y1c), int(math.ceil(x2c)), int(math.ceil(y2c)))
+        return circle, bbox
+
+    def _update_goal_belief(self, goal_visible):
+        """Dead-reckons self.goal_belief by whatever motion happened since
+        the last render() call (mirrors BeliefGoalTracker.propagate()'s
+        real-rollout usage, one step per render() the same way
+        _update_uncertainty_covariance treats one render() call as one
+        step), then re-seeds it from ground truth whenever the goal disc is
+        actually in frame this call -- this script has no semantic renderer
+        to source a live mask from, so BeliefGoalTracker.observe_body_point
+        (ground-truth body-frame point) stands in for observe(mask, depth).
+        Once seeded once, self.goal_acquired latches permanently -- render()
+        uses this to stop dispatching "exploration" VL calls for the rest of
+        the run (vl_direction/DESIGN.md's documented caller-side rule: "if
+        goal identified -> dormant")."""
+        if not self.goal_enabled:
+            return
+
+        if self._goal_belief_prev_pose is not None:
+            old_x, old_z, old_yaw = self._goal_belief_prev_pose
+            forward_x, forward_z = -math.sin(old_yaw), -math.cos(old_yaw)
+            right_x, right_z = math.cos(old_yaw), -math.sin(old_yaw)
+            dx, dz = self.x - old_x, self.z - old_z
+            forward_disp = dx * forward_x + dz * forward_z
+            right_disp = dx * right_x + dz * right_z
+            yaw_delta = self.yaw - old_yaw
+            action = Action(v_fwd=forward_disp, v_lat=right_disp, yaw_rate=yaw_delta)
+            self.goal_belief.propagate(action, dt=1.0)
+        self._goal_belief_prev_pose = (self.x, self.z, self.yaw)
+
+        if goal_visible:
+            forward, left = body_frame_forward_left(
+                self.goal_x, self.goal_z, self.x, self.z, self.yaw
+            )
+            self.goal_belief.observe_body_point(forward, left)
+            self.goal_acquired = True
+
     def _should_query_vl(self):
         """Gate on whichever cadence trigger fires first: every N frames
         (manually configured, default 3) or every VL_QUERY_EVERY_N_SECONDS
@@ -378,7 +570,9 @@ class VLTeleopApp:
             return True
         return False
 
-    def _dispatch_vl_query(self, annotated_rgb, ghost_frame, nearest_any, nearest_visible):
+    def _dispatch_vl_query(
+        self, annotated_rgb, ghost_frame, nearest_any, nearest_visible
+    ):
         """Builds the VL request and hands the actual model call to a
         background thread so render()/movement never blocks on inference
         latency -- the sim keeps stepping on whatever self.last_vl_line
@@ -476,7 +670,9 @@ class VLTeleopApp:
             except Exception:
                 pass  # window may have been torn down between the check and this call
 
-    def _maybe_query_ghost_mask(self, mode, ghost_frame, nearest_any, frame_idx_snapshot):
+    def _maybe_query_ghost_mask(
+        self, mode, ghost_frame, nearest_any, frame_idx_snapshot
+    ):
         """Second VLM call, gated on --ghost-mask-vlm and only while
         exploring (a lost-goal cue has no meaning mid-CBF-avoidance -- see
         next.md's cbf/exploration binary). Belief is handed to the model as
@@ -501,7 +697,11 @@ class VLTeleopApp:
         )
         try:
             ghost_result = vl_query(
-                "ghost_mask", [ghost_frame], ghost_context, EPISODE_ID, client=self.client
+                "ghost_mask",
+                [ghost_frame],
+                ghost_context,
+                EPISODE_ID,
+                client=self.client,
             )
         except Exception as e:
             return None, f"[{frame_idx_snapshot:05d}] ghost_mask -> ERROR -> {e}"
@@ -649,6 +849,19 @@ class VLTeleopApp:
         circles, nearest_any, nearest_visible = self._project_obstacles()
         obstacle_rgb = overlay_obstacles(rgb, circles)
 
+        # Real goal (--goal-x/--goal-z): ground-truth blue circle, drawn only
+        # while the extracted goal disc actually projects into frame -- same
+        # "in frame" bbox test also drives the belief snap in
+        # _update_goal_belief, so the marker and the snap always agree. Baked
+        # into obstacle_rgb (before ghost-mask logic below) so it's visible
+        # in both the on-screen frame and whatever's sent to the VLM.
+        goal_circle, goal_bbox = self._project_goal()
+        self._update_goal_belief(goal_visible=goal_bbox is not None)
+        if goal_circle is not None:
+            obstacle_rgb = overlay_obstacles(
+                obstacle_rgb, [goal_circle], color=GOAL_COLOR
+            )
+
         # Ghost mask: translucent green circle at a stand-in "lost goal" point
         # (nearest obstacle's body-frame position -- this script has no real
         # goal to track). When --ghost-mask-vlm is on (default) and a VLM
@@ -701,7 +914,21 @@ class VLTeleopApp:
         ):
             self._dispatch_uncertainty_request(retry=False)
 
-        if not self.halted_for_uncertainty and self._should_query_vl():
+        # Once the goal has been acquired (seen at least once), exploration
+        # calls latch off for the rest of the run -- vl_direction/DESIGN.md's
+        # documented caller-side rule ("if goal identified -> dormant").
+        # Obstacle avoidance is orthogonal, so a still-active CBF prompt
+        # keeps firing regardless of goal_acquired.
+        near_obstacle = (
+            nearest_any is not None
+            and nearest_any["edge_distance"] <= CBF_DISTANCE_THRESHOLD_M
+        )
+        exploration_dormant = self.goal_acquired and not near_obstacle
+        if (
+            not self.halted_for_uncertainty
+            and not exploration_dormant
+            and self._should_query_vl()
+        ):
             self._dispatch_vl_query(
                 annotated_rgb, obstacle_rgb, nearest_any, nearest_visible
             )
@@ -719,11 +946,27 @@ class VLTeleopApp:
         if self.halted_for_uncertainty:
             status += "  [HALTED: awaiting heading]"
 
-        draw.rectangle([0, 0, img.width, 97], fill=(0, 0, 0))
+        goal_status = ""
+        if self.goal_enabled:
+            bearing = self.goal_belief.bearing()
+            distance = self.goal_belief.distance()
+            if bearing is None:
+                goal_status = f"goal: searching ({self.goal_x:.1f},{self.goal_z:.1f}) r={self.goal_radius}m"
+            else:
+                goal_status = (
+                    f"goal: {'ACQUIRED' if self.goal_acquired else 'searching'} "
+                    f"bearing={math.degrees(bearing):.1f}deg dist={distance:.2f}m "
+                    f"unc={self.goal_belief.uncertainty_value():.2f}"
+                )
+
+        header_h = 119 if self.goal_enabled else 97
+        draw.rectangle([0, 0, img.width, header_h], fill=(0, 0, 0))
         draw.text((10, 8), status, fill=(255, 255, 255))
         draw.text((10, 30), self.last_vl_line, fill=(255, 255, 0))
         draw.text((10, 52), self.last_uncertainty_line, fill=(0, 255, 255))
         draw.text((10, 74), self.last_ghost_mask_line, fill=(0, 255, 0))
+        if self.goal_enabled:
+            draw.text((10, 96), goal_status, fill=(80, 160, 255))
 
         self.tk_img = ImageTk.PhotoImage(img)
         self.image_label.configure(image=self.tk_img)
@@ -841,9 +1084,35 @@ def _parse_args():
         help="revert to the deterministic bearing/uncertainty projection "
         "(sam_vla/core/ghost_mask.py), skipping the extra VLM call entirely",
     )
+    parser.add_argument(
+        "--goal-x",
+        type=float,
+        default=9,
+        help="world x of a real goal point to track (must be given with --goal-z); "
+        "extracts a terrain-patch OBJ around it, draws it in blue whenever it's in "
+        "frame, and snaps belief to it on first sighting, latching VL exploration "
+        "calls off for the rest of the run",
+    )
+    parser.add_argument(
+        "--goal-z",
+        type=float,
+        default=10,
+        help="world z of a real goal point to track (must be given with --goal-x)",
+    )
+    parser.add_argument(
+        "--goal-radius",
+        type=float,
+        default=DEFAULT_GOAL_RADIUS_M,
+        help=f"radius (m) of the terrain patch extracted/marked around the goal "
+        f"(default {DEFAULT_GOAL_RADIUS_M})",
+    )
     args = parser.parse_args()
     if args.qwery_n < 1:
         parser.error("--qwery-n must be >= 1")
+    if (args.goal_x is None) != (args.goal_z is None):
+        parser.error("--goal-x and --goal-z must be given together")
+    if args.goal_radius <= 0:
+        parser.error("--goal-radius must be > 0")
     return args
 
 
@@ -855,5 +1124,8 @@ if __name__ == "__main__":
         uncertainty_growth_per_step=args.cov_growth,
         uncertainty_growth_rate=args.cov_growth_rate,
         ghost_mask_use_vlm=args.ghost_mask_vlm,
+        goal_x=args.goal_x,
+        goal_z=args.goal_z,
+        goal_radius=args.goal_radius,
     )
     app.run()
