@@ -8,7 +8,8 @@ ever returns parse_ok=True when exactly one allowed direction is identifiable
 no match, per next.md's "don't guess" instruction.
 
 parse_ghost_mask_json() (ghost_mask mode): extracts and clamps a {u, v,
-radius_px} JSON object from free-form model output -- see its own docstring.
+radius_u_px, radius_v_px} JSON object from free-form model output -- see its
+own docstring.
 """
 
 import json
@@ -45,12 +46,12 @@ def parse_ghost_mask_json(
     min_radius_px: float,
     max_radius_px: float,
 ) -> tuple:
-    """Extracts {"u", "v", "radius_px"} from free-form model output (a 3B VLM
-    routinely wraps JSON in prose/code fences) and clamps into frame bounds /
-    the radius range, so a model that overshoots still yields a safe,
-    renderable mask rather than a rejected parse. Returns
+    """Extracts {"u", "v", "radius_u_px", "radius_v_px"} from free-form model
+    output (a 3B VLM routinely wraps JSON in prose/code fences) and clamps
+    into frame bounds / the radius range, so a model that overshoots still
+    yields a safe, renderable mask rather than a rejected parse. Returns
     (GhostMaskPayload_or_None, parse_ok) -- parse_ok is False only when no
-    JSON object with all three numeric fields could be found at all."""
+    JSON object with all four numeric fields could be found at all."""
     match = _JSON_OBJECT_RE.search(raw_text)
     if match is None:
         return None, False
@@ -59,15 +60,20 @@ def parse_ghost_mask_json(
         obj = json.loads(match.group(0))
         u = float(obj["u"])
         v = float(obj["v"])
-        radius_px = float(obj["radius_px"])
+        radius_u_px = float(obj["radius_u_px"])
+        radius_v_px = float(obj["radius_v_px"])
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None, False
 
     w, h = frame_wh
     u = float(np_clip(u, 0.0, float(w - 1)))
     v = float(np_clip(v, 0.0, float(h - 1)))
-    radius_px = float(np_clip(radius_px, float(min_radius_px), float(max_radius_px)))
-    return GhostMaskPayload(u=u, v=v, radius_px=radius_px), True
+    radius_u_px = float(np_clip(radius_u_px, float(min_radius_px), float(max_radius_px)))
+    radius_v_px = float(np_clip(radius_v_px, float(min_radius_px), float(max_radius_px)))
+    return (
+        GhostMaskPayload(u=u, v=v, radius_u_px=radius_u_px, radius_v_px=radius_v_px),
+        True,
+    )
 
 
 def np_clip(value: float, low: float, high: float) -> float:

@@ -75,7 +75,8 @@ def _ghost_mask_context(**overrides):
     defaults = dict(
         bearing_deg=15.0,
         distance_m=3.0,
-        uncertainty=0.5,
+        bearing_uncertainty_deg=8.0,
+        distance_uncertainty_m=0.5,
         frame_wh=(4, 4),
         min_radius_px=1.0,
         max_radius_px=4.0,
@@ -90,7 +91,9 @@ def test_ghost_mask_contract():
         [_FRAME],
         _ghost_mask_context(),
         _EPISODE_ID,
-        client=MockInternVLClient(canned_response='{"u": 2, "v": 2, "radius_px": 2}'),
+        client=MockInternVLClient(
+            canned_response='{"u": 2, "v": 2, "radius_u_px": 2, "radius_v_px": 3}'
+        ),
     )
     assert result.identity_token == IdentityToken.GHOST_MASK
     assert result.direction is None

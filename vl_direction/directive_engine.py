@@ -93,11 +93,12 @@ def _query_exploration(client, frames, context: ExplorationContext):
 
 
 def _query_ghost_mask(client, frames, context: GhostMaskContext):
-    """Hands the belief (bearing/distance/uncertainty) to the model as text
-    and asks it to place the ghost-mask circle itself, instead of caller-side
-    trigonometry deciding (u, v, radius_px). Free-form JSON output, so this
-    mirrors _generate_with_retry's shape but with a JSON parser + one
-    corrective reprompt in place of parse_direction."""
+    """Hands the belief (bearing/distance + independent bearing/distance
+    uncertainty) to the model as text and asks it to place the ghost-mask
+    ellipse itself, instead of caller-side trigonometry deciding (u, v,
+    radius_u_px, radius_v_px). Free-form JSON output, so this mirrors
+    _generate_with_retry's shape but with a JSON parser + one corrective
+    reprompt in place of parse_direction."""
     prompt = build_ghost_mask_prompt(context)
     reprompt = build_ghost_mask_reprompt(context)
     max_new_tokens = config.MAX_NEW_TOKENS["ghost_mask"]
@@ -243,12 +244,15 @@ if __name__ == "__main__":
         GhostMaskContext(
             bearing_deg=30.0,
             distance_m=4.5,
-            uncertainty=1.2,
+            bearing_uncertainty_deg=15.0,
+            distance_uncertainty_m=1.2,
             frame_wh=(64, 64),
             min_radius_px=3.0,
             max_radius_px=30.0,
         ),
         "demo-episode",
-        client=MockInternVLClient(canned_response='{"u": 40, "v": 32, "radius_px": 12}'),
+        client=MockInternVLClient(
+            canned_response='{"u": 40, "v": 32, "radius_u_px": 12, "radius_v_px": 9}'
+        ),
     )
     print("ghost_mask ->", ghost_mask_result)

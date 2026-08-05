@@ -1,7 +1,11 @@
+import math
+
 import numpy as np
 import pytest
 
 from sam_vla.core.ghost_mask import (
+    belief_to_bearing_range_uncertainty,
+    draw_ghost_ellipse,
     draw_ghost_mask,
     project_body_point_to_pixel,
     uncertainty_to_radius_px,
@@ -79,3 +83,75 @@ def test_draw_ghost_mask_translucent_not_opaque():
     center = annotated[10, 10]
     assert center[1] > 100  # green channel pulled up toward the overlay color
     assert center[0] < 100  # but not fully replaced -- background still shows through
+
+
+def test_draw_ghost_ellipse_matches_circle_when_radii_equal():
+    rgb = np.full((40, 40, 3), 100, dtype=np.uint8)
+    circle = draw_ghost_mask(rgb, u=20, v=20, radius_px=6, alpha=0.5)
+    ellipse = draw_ghost_ellipse(
+        rgb, u=20, v=20, radius_u_px=6, radius_v_px=6, alpha=0.5
+    )
+    assert np.array_equal(circle, ellipse)
+
+
+def test_draw_ghost_ellipse_is_non_destructive_copy():
+    rgb = np.full((20, 20, 3), 128, dtype=np.uint8)
+    original = rgb.copy()
+    annotated = draw_ghost_ellipse(rgb, u=10, v=10, radius_u_px=3, radius_v_px=8)
+    assert np.array_equal(rgb, original)
+    assert not np.array_equal(annotated, rgb)
+
+
+def test_draw_ghost_ellipse_stretches_along_larger_axis():
+    rgb = np.full((60, 60, 3), 100, dtype=np.uint8)
+    annotated = draw_ghost_ellipse(
+        rgb, u=30, v=30, radius_u_px=20, radius_v_px=4, alpha=1.0
+    )
+    # far along the wide (u) axis should be painted, far along the narrow (v) axis should not
+    assert tuple(annotated[30, 45]) == (0, 255, 0)
+    assert tuple(annotated[45, 30]) == (100, 100, 100)
+
+
+def test_belief_to_bearing_range_uncertainty_straight_ahead_isotropic():
+    mean = np.array([5.0, 0.0])
+    cov = np.eye(2) * (0.5**2)
+    bearing_deg, distance_m, bearing_unc_deg, distance_unc_m = (
+        belief_to_bearing_range_uncertainty(mean, cov)
+    )
+    assert bearing_deg == pytest.approx(0.0)
+    assert distance_m == pytest.approx(5.0)
+    # isotropic covariance -> radial and tangential sigma both 0.5, distance
+    # uncertainty is the radial component directly
+    assert distance_unc_m == pytest.approx(0.5)
+    # tangential sigma (0.5) at range 5 -> arctan-small-angle ~= 5.73 deg
+    assert bearing_unc_deg == pytest.approx(math.degrees(0.5 / 5.0))
+
+
+def test_belief_to_bearing_range_uncertainty_left_positive():
+    mean = np.array([5.0, 3.0])  # forward, left
+    cov = np.eye(2) * 0.01
+    bearing_deg, _, _, _ = belief_to_bearing_range_uncertainty(mean, cov)
+    assert bearing_deg > 0.0  # left is positive bearing, matches BeliefGoalTracker
+
+
+def test_belief_to_bearing_range_uncertainty_anisotropic_along_bearing():
+    # all variance along the forward axis (radial, since bearing is 0) -> should
+    # show up entirely as distance uncertainty, none as bearing uncertainty
+    mean = np.array([5.0, 0.0])
+    cov = np.array([[4.0, 0.0], [0.0, 0.0]])
+    bearing_deg, distance_m, bearing_unc_deg, distance_unc_m = (
+        belief_to_bearing_range_uncertainty(mean, cov)
+    )
+    assert distance_unc_m == pytest.approx(2.0)
+    assert bearing_unc_deg == pytest.approx(0.0)
+
+
+def test_belief_to_bearing_range_uncertainty_at_origin_falls_back_isotropic():
+    mean = np.array([0.0, 0.0])
+    cov = np.eye(2) * (1.0**2)
+    bearing_deg, distance_m, bearing_unc_deg, distance_unc_m = (
+        belief_to_bearing_range_uncertainty(mean, cov)
+    )
+    assert distance_m == pytest.approx(0.0)
+    assert bearing_unc_deg == pytest.approx(180.0)
+    assert distance_unc_m == pytest.approx(1.0)

@@ -78,11 +78,24 @@ class GhostMaskContext:
     caller-side geometry, decides where/how large the ghost mask should be.
     bearing_deg is body-frame, 0=straight ahead, positive=left, matching
     BeliefGoalTracker's [forward, left] convention; distance_m is the
-    straight-line body-frame range to the belief point."""
+    straight-line body-frame range to the belief point.
+
+    bearing_uncertainty_deg / distance_uncertainty_m are two independent
+    spread scalars, not one -- callers with a full Gaussian belief (mean +
+    2x2 covariance in robot [forward, left] frame) resolve the covariance
+    into the belief's own radial/tangential axes via
+    sam_vla.core.ghost_mask.belief_to_bearing_range_uncertainty rather than
+    handing the model raw matrix entries in a Cartesian frame it has no
+    spatial intuition for; callers with only a scalar uncertainty (no real
+    covariance tracked) pass it for both. This lets the model draw an
+    ellipse whose horizontal/vertical extent independently reflect
+    direction-confidence vs. distance-confidence instead of a uniform
+    circle."""
 
     bearing_deg: float
     distance_m: float
-    uncertainty: float
+    bearing_uncertainty_deg: float
+    distance_uncertainty_m: float
     frame_wh: tuple[int, int]
     min_radius_px: float
     max_radius_px: float
@@ -97,9 +110,15 @@ class GhostMaskContext:
             raise ValueError(
                 f"GhostMaskContext.distance_m must be >= 0, got {self.distance_m!r}"
             )
-        if self.uncertainty < 0:
+        if self.bearing_uncertainty_deg < 0:
             raise ValueError(
-                f"GhostMaskContext.uncertainty must be >= 0, got {self.uncertainty!r}"
+                "GhostMaskContext.bearing_uncertainty_deg must be >= 0, got "
+                f"{self.bearing_uncertainty_deg!r}"
+            )
+        if self.distance_uncertainty_m < 0:
+            raise ValueError(
+                "GhostMaskContext.distance_uncertainty_m must be >= 0, got "
+                f"{self.distance_uncertainty_m!r}"
             )
         if self.min_radius_px < 0 or self.max_radius_px < self.min_radius_px:
             raise ValueError(
@@ -110,14 +129,17 @@ class GhostMaskContext:
 
 @dataclass
 class GhostMaskPayload:
-    """The model's chosen ghost-mask placement -- pixel center + radius.
-    Always clamped into frame_wh / [min_radius_px, max_radius_px] by the
-    parser before this is constructed, so downstream rendering code never
-    needs to re-validate model output."""
+    """The model's chosen ghost-mask placement -- pixel center + an
+    axis-aligned ellipse's horizontal/vertical radii. Always clamped into
+    frame_wh / [min_radius_px, max_radius_px] by the parser before this is
+    constructed, so downstream rendering code never needs to re-validate
+    model output. radius_u_px == radius_v_px draws the same shape the old
+    single-radius circle did."""
 
     u: float
     v: float
-    radius_px: float
+    radius_u_px: float
+    radius_v_px: float
 
 
 @dataclass

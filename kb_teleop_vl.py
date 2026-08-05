@@ -101,6 +101,8 @@ import quaternion
 import kb_teleop as kb
 from sam_vla.core.belief_tracking import BeliefGoalTracker, uncertainty_growth_increment
 from sam_vla.core.ghost_mask import (
+    belief_to_bearing_range_uncertainty,
+    draw_ghost_ellipse,
     draw_ghost_mask,
     project_body_point_to_pixel,
     uncertainty_to_radius_px,
@@ -745,12 +747,25 @@ class VLTeleopApp:
             return None, None
 
         anchor_forward, anchor_left, anchor_uncertainty = ghost_anchor
-        bearing_deg = math.degrees(math.atan2(anchor_left, anchor_forward))
-        distance_m = math.hypot(anchor_forward, anchor_left)
+        # The model gets mu (body-frame mean) + Sigma (2x2 covariance), never
+        # raw world x/z -- a Cartesian coordinate pair means nothing to a
+        # VLM's spatial reasoning, whereas bearing/distance do. Neither
+        # BeliefGoalTracker nor the legacy nearest-obstacle stand-in tracks a
+        # real (possibly anisotropic) covariance today, only a scalar
+        # uncertainty, so Sigma is built isotropic from it here
+        # (sigma^2 * I) -- this is the single seam a real anisotropic
+        # covariance (e.g. from navdp's SubgoalBeliefBank) would plug into
+        # later without touching anything downstream of mu/Sigma.
+        mu = np.array([anchor_forward, anchor_left], dtype=np.float64)
+        sigma = (anchor_uncertainty**2) * np.eye(2, dtype=np.float64)
+        bearing_deg, distance_m, bearing_uncertainty_deg, distance_uncertainty_m = (
+            belief_to_bearing_range_uncertainty(mu, sigma)
+        )
         ghost_context = GhostMaskContext(
             bearing_deg=bearing_deg,
             distance_m=distance_m,
-            uncertainty=anchor_uncertainty,
+            bearing_uncertainty_deg=bearing_uncertainty_deg,
+            distance_uncertainty_m=distance_uncertainty_m,
             frame_wh=(_FRAME_W, _FRAME_H),
             min_radius_px=float(OVERLAY_MIN_PIXEL_RADIUS),
             max_radius_px=float(OVERLAY_MAX_PIXEL_RADIUS),
@@ -775,7 +790,8 @@ class VLTeleopApp:
         payload = ghost_result.ghost_mask_payload
         line = (
             f"[{frame_idx_snapshot:05d}] ghost_mask -> "
-            f"u={payload.u:.0f} v={payload.v:.0f} r={payload.radius_px:.0f} -> "
+            f"u={payload.u:.0f} v={payload.v:.0f} "
+            f"ru={payload.radius_u_px:.0f} rv={payload.radius_v_px:.0f} -> "
             f"{ghost_result.latency_ms:.1f}ms -> {ghost_result.raw_response!r}"
         )
         return payload, line
@@ -957,9 +973,15 @@ class VLTeleopApp:
             if self.ghost_mask_use_vlm and self.last_ghost_mask_payload is not None:
                 ghost_u = self.last_ghost_mask_payload.u
                 ghost_v = self.last_ghost_mask_payload.v
-                ghost_radius = self.last_ghost_mask_payload.radius_px
-                annotated_rgb = draw_ghost_mask(
-                    obstacle_rgb, ghost_u, ghost_v, ghost_radius, alpha=GHOST_ALPHA
+                ghost_radius_u = self.last_ghost_mask_payload.radius_u_px
+                ghost_radius_v = self.last_ghost_mask_payload.radius_v_px
+                annotated_rgb = draw_ghost_ellipse(
+                    obstacle_rgb,
+                    ghost_u,
+                    ghost_v,
+                    ghost_radius_u,
+                    ghost_radius_v,
+                    alpha=GHOST_ALPHA,
                 )
             else:
                 ghost_px = project_body_point_to_pixel(

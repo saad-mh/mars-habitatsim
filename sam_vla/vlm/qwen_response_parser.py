@@ -99,6 +99,35 @@ def parse_drive_action_response(raw_text: str) -> Action:
     return Action(v_fwd=v_fwd, v_lat=v_lat, yaw_rate=yaw_rate)
 
 
+def parse_ghost_mask_belief_response(
+    raw_text: str,
+    frame_w: int,
+    frame_h: int,
+    min_radius_px: float,
+    max_radius_px: float,
+) -> dict:
+    """Parse a build_ghost_mask_belief_prompt response: pixel center clamped
+    into the frame, both radii clamped into [min_radius_px, max_radius_px] --
+    same clamp-not-reject philosophy as parse_drive_action_response, so a
+    model response that's directionally right but numerically sloppy still
+    produces a usable placement instead of being thrown away."""
+    parsed = _load_json_object(raw_text)
+
+    for key in ("u", "v", "radius_u_px", "radius_v_px"):
+        value = parsed.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(
+                f"Missing or non-numeric '{key}' in response\nraw_text={raw_text!r}"
+            )
+
+    u = _clamp(float(parsed["u"]), 0.0, float(frame_w - 1))
+    v = _clamp(float(parsed["v"]), 0.0, float(frame_h - 1))
+    radius_u_px = _clamp(float(parsed["radius_u_px"]), min_radius_px, max_radius_px)
+    radius_v_px = _clamp(float(parsed["radius_v_px"]), min_radius_px, max_radius_px)
+
+    return {"u": u, "v": v, "radius_u_px": radius_u_px, "radius_v_px": radius_v_px}
+
+
 if __name__ == "__main__":
     well_formed = '{"v_fwd": 0.5, "v_lat": -0.2, "yaw_rate": 0.1}'
     fenced = """```json

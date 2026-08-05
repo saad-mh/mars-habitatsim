@@ -14,6 +14,7 @@ handed to a VLM/visualization, never onto anything a policy consumes.
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import numpy as np
@@ -73,3 +74,72 @@ def draw_ghost_mask(
         color, dtype=np.float32
     ) * alpha
     return annotated.astype(np.uint8)
+
+
+def draw_ghost_ellipse(
+    rgb: np.ndarray,
+    u: float,
+    v: float,
+    radius_u_px: float,
+    radius_v_px: float,
+    color: np.ndarray = GHOST_COLOR,
+    alpha: float = 0.45,
+) -> np.ndarray:
+    """Axis-aligned generalization of draw_ghost_mask: an anisotropic belief
+    (radius_u_px != radius_v_px) draws a translucent ellipse instead of a
+    circle, so a covariance that's more uncertain along one image axis than
+    the other actually looks that way. radius_u_px == radius_v_px reduces to
+    the same shape draw_ghost_mask produces. Non-destructive -- returns a
+    copy."""
+    rgb = np.asarray(rgb)
+    annotated = rgb.astype(np.float32)
+    ru = max(float(radius_u_px), 1e-6)
+    rv = max(float(radius_v_px), 1e-6)
+    yy, xx = np.mgrid[0 : rgb.shape[0], 0 : rgb.shape[1]]
+    mask = ((xx - u) / ru) ** 2 + ((yy - v) / rv) ** 2 <= 1.0
+    annotated[mask] = annotated[mask] * (1.0 - alpha) + np.asarray(
+        color, dtype=np.float32
+    ) * alpha
+    return annotated.astype(np.uint8)
+
+
+def belief_to_bearing_range_uncertainty(
+    mean_forward_left: np.ndarray, cov_forward_left: np.ndarray
+) -> Tuple[float, float, float, float]:
+    """Body-frame Gaussian belief [forward, left] mean + 2x2 covariance ->
+    (bearing_deg, distance_m, bearing_uncertainty_deg, distance_uncertainty_m).
+
+    The mean alone gives bearing/distance via atan2/hypot (same convention as
+    BeliefGoalTracker.bearing()/.distance()). The covariance doesn't have a
+    single natural image-space axis to project onto the way the mean does --
+    there is no fixed camera pose once the goal may be entirely out of frame
+    -- so instead of a Jacobian through the (undefined-when-behind-camera)
+    pixel projection, this resolves the covariance into the belief's own
+    radial/tangential frame: variance along the radial direction (toward/away
+    from the believed point) becomes range uncertainty directly; variance
+    along the tangential direction (perpendicular, at radius r) becomes an
+    angular spread via the small-angle arc/r relation. That gives two
+    physically meaningful scalars -- "how sure are we of the direction" and
+    "how sure are we of the distance" -- a VLM prompt can reason about and
+    use to size a ghost-mask ellipse, without needing the goal to actually be
+    projectable into the current frame.
+
+    At the origin (r ~ 0) radial/tangential are undefined; falls back to an
+    isotropic spread from the covariance trace and reports full (180 deg)
+    bearing uncertainty, since direction is meaningless with zero range.
+    """
+    fwd, left = float(mean_forward_left[0]), float(mean_forward_left[1])
+    r = math.hypot(fwd, left)
+    bearing_rad = math.atan2(left, fwd)
+    cov = np.asarray(cov_forward_left, dtype=np.float64)
+
+    if r < 1e-3:
+        sigma = math.sqrt(max(float(np.trace(cov)) / 2.0, 0.0))
+        return math.degrees(bearing_rad), r, 180.0, sigma
+
+    e_r = np.array([fwd, left]) / r
+    e_t = np.array([-left, fwd]) / r
+    sigma_r = math.sqrt(max(float(e_r @ cov @ e_r), 0.0))
+    sigma_t = math.sqrt(max(float(e_t @ cov @ e_t), 0.0))
+    bearing_unc_deg = math.degrees(sigma_t / r)
+    return math.degrees(bearing_rad), r, bearing_unc_deg, sigma_r

@@ -42,17 +42,22 @@ def test_binary_alphabet_rejects_front_back_only_text():
 
 def test_ghost_mask_parses_clean_json():
     payload, parse_ok = parse_ghost_mask_json(
-        '{"u": 320, "v": 240, "radius_px": 60}', (640, 480), 3.0, 260.0
+        '{"u": 320, "v": 240, "radius_u_px": 60, "radius_v_px": 90}',
+        (640, 480),
+        3.0,
+        260.0,
     )
     assert parse_ok is True
     assert payload.u == 320.0
     assert payload.v == 240.0
-    assert payload.radius_px == 60.0
+    assert payload.radius_u_px == 60.0
+    assert payload.radius_v_px == 90.0
 
 
 def test_ghost_mask_parses_json_wrapped_in_prose():
     payload, parse_ok = parse_ghost_mask_json(
-        'Sure, here it is: {"u": 100, "v": 50, "radius_px": 20} -- hope that helps!',
+        'Sure, here it is: {"u": 100, "v": 50, "radius_u_px": 20, "radius_v_px": 30} '
+        "-- hope that helps!",
         (640, 480),
         3.0,
         260.0,
@@ -63,25 +68,33 @@ def test_ghost_mask_parses_json_wrapped_in_prose():
 
 def test_ghost_mask_clamps_out_of_bounds_values():
     payload, parse_ok = parse_ghost_mask_json(
-        '{"u": -50, "v": 9999, "radius_px": 1}', (640, 480), 3.0, 260.0
+        '{"u": -50, "v": 9999, "radius_u_px": 1, "radius_v_px": 1}',
+        (640, 480),
+        3.0,
+        260.0,
     )
     assert parse_ok is True
     assert payload.u == 0.0
     assert payload.v == 479.0
-    assert payload.radius_px == 3.0
+    assert payload.radius_u_px == 3.0
+    assert payload.radius_v_px == 3.0
 
 
 def test_ghost_mask_clamps_oversized_radius():
     payload, parse_ok = parse_ghost_mask_json(
-        '{"u": 100, "v": 100, "radius_px": 99999}', (640, 480), 3.0, 260.0
+        '{"u": 100, "v": 100, "radius_u_px": 99999, "radius_v_px": 99999}',
+        (640, 480),
+        3.0,
+        260.0,
     )
     assert parse_ok is True
-    assert payload.radius_px == 260.0
+    assert payload.radius_u_px == 260.0
+    assert payload.radius_v_px == 260.0
 
 
 def test_ghost_mask_missing_fields_is_unparseable():
     payload, parse_ok = parse_ghost_mask_json(
-        '{"u": 100, "v": 100}', (640, 480), 3.0, 260.0
+        '{"u": 100, "v": 100, "radius_u_px": 5}', (640, 480), 3.0, 260.0
     )
     assert parse_ok is False
     assert payload is None
