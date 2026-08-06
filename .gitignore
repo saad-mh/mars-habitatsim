@@ -44,3 +44,5 @@ marsyard2022.glb
 marsyard2022_terrain.glb
 assets/marsyard2022n.glb
 rollout.npz
+
+navdp-cross-modal.ckpt

@@ -498,20 +498,75 @@ so `set_goal_body()` gets this step's fresh estimate rather than last step's; th
 `observe()` call still runs too (harmless repeat for this one backend). `policy.stop()` is called after the
 step loop, gated the same way.
 
-### Phase 4 — smoke test + comparison run — PARTLY DONE
+### Phase 4 — smoke test + comparison run — DONE
 
-- `if __name__ == "__main__":` smoke-test blocks exist in both
-  [`navdp_upstream_server_manager.py`](sam_vla/vlm/navdp_upstream_server_manager.py) and
-  [`navdp_upstream_policy.py`](sam_vla/policy/navdp_upstream_policy.py), mirroring `navdp_policy.py`'s own —
-  **not run against a real server**, since Phase 0 isn't done; they'll fail fast with `FileNotFoundError` from
-  `resolve_navdp_upstream_root` until a vendored checkout + checkpoint exist. All other testable logic (client
-  encoding, waypoint tracker, replan state machine, server-manager start/stop state machine, CLI validation)
-  is covered by the 17 new unit tests referenced above, run via
-  `/home/gpu/miniconda3/envs/habitat/bin/python -m pytest sam_vla/tests/test_navdp_upstream_*.py` (all passing,
-  plus the pre-existing 46 tests unaffected).
-- **Still needed, blocked on Phase 0**: one full `run_navdp_rollout.py --policy-backend navdp-upstream ...`
-  episode against `marsyard2022` with a real server + checkpoint, then a real side-by-side against
-  `--policy-backend navdp-s2dit` on the same seed/goal.
+Phase 0 got done by hand (2026-08-06): `navdp` conda env created, `InternRobotics/NavDP` vendored to
+`/home/gpu/Desktop/pineapple/navdp_upstream` (outside this repo's git history, per the "leaning outside-repo"
+open question above — commit `878740a`), checkpoint added at `navdp/navdp-cross-modal.ckpt`. Ran the real
+smoke test (`navdp_upstream_policy.py`'s `__main__` block) against all of that for real:
+
+- **Server spawn, checkpoint load, and `/navigator_reset` all work.** `NavdpUpstreamServerManager.start()`
+  came up in ~10.7s end to end (port open, checkpoint deserialized, `{"algo": "navdp"}` returned) — this
+  validates Phase 1's design, including the two-phase start() logic, against the real server for the first
+  time.
+- **Found and fixed a real bug while doing this**: `subprocess.Popen(...)` wasn't redirecting the spawned
+  `navdp_server.py`'s stdout/stderr, so it inherited whatever fd the caller's own stdout was connected to. The
+  first attempt at this smoke test was invoked through a shell pipe (`... | tail -80`); `timeout 280` killed
+  the *client* process on schedule, but the orphaned server subprocess kept running and kept the pipe's write
+  end open, so `tail` never saw EOF and the run looked hung for 3+ hours with zero output. Fixed by giving the
+  spawned subprocess its own dedicated log file (`self.log_path`, `/tmp/navdp_upstream_server_<port>.log`),
+  closed in `stop()` — decouples the child's lifetime from whatever the caller's stdout happens to be wired
+  to. All 17 unit tests still pass after this change.
+- **`/pointgoal_step` itself fails**, not from anything in this integration's code: the `navdp` env's installed
+  PyTorch (`2.5.1+cu124`, `torchvision 0.20.1` — someone bumped it up from upstream's pinned `torch==2.2.2`,
+  probably because 2.2.2 predates this GPU's driver) does not include compiled kernels for this machine's GPU,
+  an **NVIDIA RTX PRO 6000 Blackwell Max-Q** (`compute_cap 12.0`, i.e. `sm_120`). The forward pass dies with
+  `RuntimeError: CUDA error: no kernel image is available for execution on the device` inside
+  `policy_backbone.py`'s image preprocessing, the very first CUDA op the model runs. PyTorch only ships
+  `sm_120` kernels starting around the `cu128` wheel builds (this repo's `habitat`/`vl` envs already run
+  `torch 2.8.0+cu128`/`2.11+cu128` successfully on this same GPU, for comparison). `navdp_server.py` hardcodes
+  `device='cuda:0'` with no CPU fallback, and per this plan's own discipline the vendored checkout is never
+  patched, so working around this means upgrading `navdp`'s torch/torchvision to a `cu128`+ build — a real
+  environment change (compatibility with the rest of upstream's pinned stack, e.g. `diffusers==0.33.1`, isn't
+  verified) that's a call for a human, not something to do unprompted mid-integration.
+- **Resolved (2026-08-06)**: upgraded `navdp`'s env in place —
+  `pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128`,
+  matching the `vl` env's already-working combo on this same GPU (verified with a real `x @ x` CUDA matmul
+  first). `pip check` afterward showed no conflicts touching anything `navdp_server.py` actually imports
+  (Flask/diffusers/torchvision) — the only hits were unrelated pre-existing tools sharing the env
+  (`isaaclab`, `gradio`). Re-ran the smoke test: full round trip now works — server up in ~12.5s, a real
+  forward pass through the checkpoint, a real 24-waypoint trajectory back, converted into
+  `Action(v_fwd=1.0, v_lat=0.0, yaw_rate=1.0)` by the waypoint tracker, clean shutdown.
+- **Full comparison run, same start pose (`--start-x 0 --start-z 8 --start-yaw 0`), same scene, 40 steps,
+  `--cbf --zero-lateral`, `marsyard2022`**: both backends resolved the identical first-frame goal (same SAM
+  detection + Qwen prompt, deterministic given the same frame) and drove for the full episode with CBF wrapped
+  around each identically, no CBF triggers either way (no obstacle was near the shared spawn point in this
+  short run) — outputs at `phase4_upstream_test1/` and `phase4_s2dit_test1/` (`rollout.mp4`/`.npz`/
+  `manifest.json` each, `RolloutLogger`'s normal shape).
+
+  | | `navdp-upstream` | `navdp-s2dit` |
+  |---|---|---|
+  | path length (40 steps) | 2.16 m | 3.17 m |
+  | mean `v_fwd` | 0.553 | 0.818 |
+  | mean \|`yaw_rate`\| | 0.153 | 0.211 |
+
+  `navdp-s2dit` drove noticeably faster and turned more — expected, since its mask-conditioned S2DiT
+  architecture is a completely different model from upstream's point-goal diffusion+critic policy, not a
+  bug. One real caveat this run surfaced, **identical in both logs**, unrelated to the backend: `[WARN] goal
+  bbox had no valid depth; skipping goal mask` — the resolved goal's bbox didn't backproject to a valid
+  world point for this particular first frame, so `belief_tracker.belief_g` never left `None` for the whole
+  episode. For `navdp-s2dit` this doesn't matter (it conditions on the semantic mask directly, not
+  `belief_g`). For `navdp-upstream` it means `set_goal_body()` was never called, so the policy drove the
+  whole episode on its constructor default (`default_goal_forward=5.0, default_goal_left=0.0` — "go
+  straight") rather than a real target — the plumbing is confirmed correct (goal point *would* flow through
+  the instant `belief_tracker` gets a real sighting), but this specific run isn't evidence of upstream NavDP
+  actually pursuing this scene's goal. A pre-existing goal-backprojection quirk (see
+  `sam_vla/core/goal_geometry.py`), not something this integration introduced — worth a follow-up run with a
+  goal whose bbox does backproject before reading anything into the path-length/speed numbers above beyond
+  "both backends are wired correctly and drive the rover."
+- Both `navdp_server.py` and `qwen_server` subprocesses shut down cleanly after each run (confirmed via `ps`
+  — no orphans), i.e. `NavdpUpstreamPolicy.stop()`/`ServiceRegistry.stop_all()` both behaved correctly under
+  a real full rollout, not just the isolated unit tests.
 
 ## Non-goals
 

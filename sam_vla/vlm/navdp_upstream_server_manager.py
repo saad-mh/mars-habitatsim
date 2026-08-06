@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -104,7 +105,11 @@ def resolve_navdp_upstream_root(raw: Optional[str]) -> Path:
 
 
 def _reset_payload(
-    image_height: int, image_width: int, hfov_deg: float, stop_threshold: float, batch_size: int
+    image_height: int,
+    image_width: int,
+    hfov_deg: float,
+    stop_threshold: float,
+    batch_size: int,
 ) -> dict:
     """/navigator_reset's body: intrinsic is a 3x3 camera matrix (confirmed from
     policy_agent.py's NavDP_Agent -- indexed intrinsic[1][1]=fy, intrinsic[1][2]=cy,
@@ -150,10 +155,14 @@ class NavdpUpstreamServerManager:
         self.base_url = f"http://127.0.0.1:{self.port}"
         self._process: Optional[subprocess.Popen] = None
         self._owns_process = False
+        self._log_file = None
         # Study 1 (next.md) model_load_ms bucket -- see this module's docstring
         # for why this is charged to the one real /navigator_reset call rather
         # than to repeated health-check polling.
         self.load_ms: Optional[float] = None
+        self.log_path = os.path.join(
+            tempfile.gettempdir(), f"navdp_upstream_server_{self.port}.log"
+        )
 
     def _port_open(self, timeout: float = 1.0) -> bool:
         try:
@@ -190,8 +199,16 @@ class NavdpUpstreamServerManager:
         server_dir = self.navdp_upstream_root / "baselines" / "navdp"
         print(
             f"[NavdpUpstreamServerManager] no server on port {self.port}, "
-            f"spawning subprocess from {server_dir}"
+            f"spawning subprocess from {server_dir} (log: {self.log_path})"
         )
+        # Redirect rather than inherit stdout/stderr: an inherited fd ties this
+        # subprocess's lifetime to whatever the caller's own stdout happens to
+        # be connected to (e.g. a caller piped through `| tail`, which buffers
+        # until EOF) -- if the caller exits/is killed without this process also
+        # exiting, that pipe never closes and downstream readers hang forever
+        # waiting for output that already happened. Verified live: this is
+        # exactly what stranded an earlier smoke-test run for hours.
+        self._log_file = open(self.log_path, "ab")
         self._process = subprocess.Popen(
             [
                 _resolve_navdp_upstream_python(),
@@ -202,6 +219,9 @@ class NavdpUpstreamServerManager:
                 self.checkpoint_path,
             ],
             cwd=str(server_dir),
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
         )
         self._owns_process = True
 
@@ -213,13 +233,13 @@ class NavdpUpstreamServerManager:
                 raise RuntimeError(
                     f"navdp_server subprocess exited early with code "
                     f"{self._process.returncode} (checkpoint={self.checkpoint_path!r}) "
-                    "-- check its stderr above"
+                    f"-- check {self.log_path}"
                 )
             time.sleep(_PORT_POLL_INTERVAL)
         else:
             raise RuntimeError(
                 f"navdp_server's port {self.port} never opened within "
-                f"{self.start_timeout}s of spawning"
+                f"{self.start_timeout}s of spawning -- check {self.log_path}"
             )
 
         remaining = max(deadline - time.time(), _RESET_CALL_TIMEOUT)
@@ -227,7 +247,7 @@ class NavdpUpstreamServerManager:
             raise RuntimeError(
                 "navdp_server's port opened but /navigator_reset did not return "
                 f"{{'algo': 'navdp'}} within {remaining:.0f}s -- checkpoint load may "
-                f"have failed (checkpoint={self.checkpoint_path!r}); check its stderr above"
+                f"have failed (checkpoint={self.checkpoint_path!r}); check {self.log_path}"
             )
         self.load_ms = (time.monotonic() - t0) * 1000.0
         print(f"[NavdpUpstreamServerManager] server is up ({self.load_ms:.0f}ms)")
@@ -246,6 +266,9 @@ class NavdpUpstreamServerManager:
 
         self._process = None
         self._owns_process = False
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
 
 
 if __name__ == "__main__":
