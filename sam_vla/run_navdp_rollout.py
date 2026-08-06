@@ -1,16 +1,20 @@
-"""
-conda activate habitat
-python -m sam_vla.run_navdp_rollout \
-    --scene-path assets/marsyard2022.glb \
-    --heightmap-path marsyard2022_terrain_hm_1025.tif \
-    --ckpt navdp/ckpt_last.pt \
-    --navdp-root ./navdp \
-    --start-x -2 --start-z 8 --start-yaw 120 \
-    --base-station --dwell-seconds 3 --goal-success-radius 1.0 \
-    --lost-goal-forward 0.2 \
-    --max-steps 900 --cbf \
-    --out-dir outputs/base_station_smoke_test
+"""Modular NavDP-diffusion-policy rollout entry point (the sam_vla equivalent
+of the legacy scripts/vlm_nav_tests/rollout_navdp*.py): first-frame VLM goal
+detection, CBF cone-safety layer, and BeliefGoalTracker, with optional
+base-station out-and-back goal sequencing.
 
+Usage:
+    conda activate habitat
+    python -m sam_vla.run_navdp_rollout \
+        --scene-path assets/marsyard2022.glb \
+        --heightmap-path marsyard2022_terrain_hm_1025.tif \
+        --ckpt navdp/ckpt_last.pt \
+        --navdp-root ./navdp \
+        --start-x -2 --start-z 8 --start-yaw 120 \
+        --base-station --dwell-seconds 3 --goal-success-radius 1.0 \
+        --lost-goal-forward 0.2 \
+        --max-steps 900 --cbf \
+        --out-dir outputs/base_station_smoke_test
 """
 
 import argparse

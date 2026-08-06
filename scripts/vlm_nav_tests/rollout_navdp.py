@@ -1,13 +1,11 @@
-"""rollout_navdp_policy_mars.py - run a NavDP/S2DiT policy in the Mars HabitatSim scene.
+"""Legacy self-contained NavDP/S2DiT rollout adapter for the Mars scene, with
+the full CBF cone-safety layer (hard gate + deterministic escape-yaw +
+committed go-around side). Superseded by sam_vla/run_navdp_rollout.py; kept
+for reference and for flags not yet ported over. Imports the NavDP repo via
+--navdp-root.
 
-This is the Mars terrain adapter WITH the full cone-safety layer ported from
-rollout_habitat_policy.py: per-tick hard safety gate + deterministic escape-yaw +
-committed go-around side. Copy this over your Mars repo's rollout_navdp_policy.py
-(or run it from there); it imports the NavDP repo via --navdp-root.
-
-Typical usage:
-
-    python rollout_navdp_policy_mars.py \
+Usage:
+    python scripts/vlm_nav_tests/rollout_navdp.py \
       --navdp-root /path/to/navdp_sam \
       --ckpt /path/to/navdp_sam/runs/.../ckpt_last.pt \
       --scene marsyard2022_rocks.obj --terrain-obj marsyard2022.obj \

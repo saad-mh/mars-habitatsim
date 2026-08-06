@@ -1,93 +1,20 @@
-"""
-Keyboard teleop for marsyard2022 with vl_direction wired in live: every
-rendered frame is checked against a synthetic obstacle field (random
-ground-plane points, each a 0.5m-radius "rock" with no real geometry --
-there's no obstacle detector in this repo yet, so this stands in for one),
-overlaid in red directly on the RGB panel, and handed to
-vl_direction.directive_engine.query() so the console prints exactly what was
-asked for: prompt mode, raw model output / parsed direction, and per-call
-latency, once per rendered frame.
+"""Same kb_teleop.py UI (reused via import, not duplicated) with vl_direction
+wired in live against a synthetic obstacle field (random ground-plane
+"rocks", since there's no real obstacle detector here yet). Each rendered
+frame dispatches one of vl_direction's four modes on a background thread
+(movement never blocks on it): "cbf" go-around guidance when an obstacle is
+close and in view, "exploration" four-way prior otherwise, "uncertainty"
+heading-request halt when a synthetic covariance proxy drifts too high
+(numpad 1/2/3/4/6/7/8/9 to answer, U to force-trigger), and "ghost_mask" to
+place a translucent ellipse toward a tracked belief anchor once it's out of
+frame. An optional real ground-truth goal (--goal-x/--goal-z/--goal-radius)
+feeds BeliefGoalTracker directly and, once acquired, permanently silences
+the exploration direction prompt (CBF keeps firing) per vl_direction's
+"if goal identified -> dormant" rule. Console prints prompt/response/latency
+per VL call.
 
-Mode selection: "cbf" (go-around bbox prompt) when the nearest obstacle's
-edge is within CBF_DISTANCE_THRESHOLD_M and it actually projects into the
-current view; "exploration" (four-way prior) otherwise, including the
-fallback case where the nearest obstacle is behind the rover and has no
-pixel bbox to hand to CBFContext.
-
-Also drives vl_direction's third mode, "uncertainty", via UncertaintySession --
-this script has no real belief tracker, so a synthetic covariance proxy drifts
-up while no synthetic obstacle is close enough to act as a visual anchor and
-resets when one is. Crossing the threshold halts keyboard movement and normal
-cbf/exploration dispatch, asks Qwen for a sweep description, and waits for
-a human-supplied heading (numpad keys 1/2/3/4/6/7/8/9, or R to retry) before
-resuming -- press U at any time to force-trigger the halt for testing instead
-of waiting on/tuning the organic drift.
-
-Also drives vl_direction's fourth mode, "ghost_mask", whenever there's a
-belief anchor to visualize and the rover isn't actively dodging an obstacle
-(see _ghost_belief_anchor / _should_query_vl's mode != "cbf" check): the
-belief is packaged as mu (body-frame [forward, left] mean) + Sigma (2x2
-covariance, isotropic today since neither BeliefGoalTracker nor the legacy
-stand-in tracks a real anisotropic one -- see _maybe_query_ghost_mask), run
-through sam_vla.core.ghost_mask.belief_to_bearing_range_uncertainty to get
-bearing/distance plus two independent uncertainty scalars, and handed to the
-VLM as text alongside the obstacle-only frame -- never as raw world x/z,
-which means nothing to the model's spatial reasoning. The VLM answers with
-JSON pixel coordinates (u, v, radius_u_px, radius_v_px) for where the
-translucent ghost ellipse should be drawn -- placement is the model's
-spatial-reasoning call, not caller-side trigonometry (--no-ghost-mask-vlm
-reverts to the old deterministic circle projection for comparison). The
-prompt explicitly steers the model off dead center: since the ghost only
-ever fires while the goal/target is *out of view*, a center placement (==
-"straight ahead") would contradict its own premise, and a fixed dead-center
-worked example in the prompt was found to anchor a 3B model there regardless
-of the real bearing -- see vl_direction/prompts/ghost_mask_prompt.py's
-_worked_example. Advisory-only, same as exploration/cbf: the parsed result
-only ever changes what gets drawn/printed, never an Action. Because this is
-a second, throttled VLM call, the on-screen ellipse only updates on the
-existing VL query cadence and holds its last position between calls (falls
-back to the deterministic circle projection whenever no VLM placement has
-landed yet, or the model's JSON failed to parse).
-
-Optionally drives a fifth thing: a real, ground-truth goal via --goal-x/--goal-z
-(paired, plus --goal-radius, default 0.5m). On startup the terrain patch within
-that radius is extracted to its own OBJ (extract_disc_mesh/write_obj_mesh --
-same tight-clipping approach mesh_annotation_tool.py uses for its polygon hulls,
-just circular). Every frame it actually projects into, it's drawn as a solid
-blue circle (distinct from the red obstacles / green ghost) and, via the same
-"in frame" check, snaps sam_vla.core.belief_tracking.BeliefGoalTracker onto it
-(BeliefGoalTracker.observe_body_point, since this script has no semantic
-renderer to source a mask from); the tracker then dead-reckons it every
-subsequent frame regardless of whether the goal is in view. Once acquired,
-self.goal_acquired latches permanently and the exploration *direction* call
-(LEFT/RIGHT/FRONT/BACK) stops firing for the rest of the run (CBF calls keep
-firing regardless) -- vl_direction/DESIGN.md's documented caller-side rule,
-"if goal identified -> dormant". The ghost_mask call is a separate concern
-and does NOT go dormant: once the goal has ever been seen, its dead-reckoned
-belief keeps driving the ghost mask for as long as it's out of frame again,
-so the VLM has something to steer back toward it with -- see
-_ghost_belief_anchor and _dispatch_vl_query's "dormant" mode, which only
-mutes the direction prompt, not the ghost-mask one.
-
-Reuses kb_teleop.py's habitat_sim setup (make_sim, terrain height lookup,
-boundary clamping) via import rather than duplicating it -- this script only
-adds the obstacle field, projection/overlay, and the VL call.
-
-Run inside the "habitat" conda env from the repo root (so vl_direction is
-importable and QwenServerManager's subprocess cwd is correct):
-    conda activate habitat && python kb_teleop_vl.py [--vl-every-n-frames N]
-QwenServerManager spawns vl_direction/qwen_server.py in the "qwen_vlm" conda
-env on first use and loads Qwen2.5-VL-3B-Instruct (weights are already
-cached locally, so this is mostly GPU-load time); the window opens once that
-health check passes.
-
-VL queries are dispatched on a background thread and gated to run every
---vl-every-n-frames frames or every VL_QUERY_EVERY_N_SECONDS seconds,
-whichever comes first (see _should_query_vl). Movement/rendering never
-blocks on the VL call -- the rover keeps stepping and the frame keeps
-rendering on whatever the last-known VL directive was (or with none at all,
-before the first result lands), the same way a real rover has to keep
-running even when its perception stack hasn't produced an output yet.
+Usage:
+    conda activate habitat && python scripts/habitat_tests/kb_teleop_vl.py [--vl-every-n-frames N]
 """
 
 import argparse

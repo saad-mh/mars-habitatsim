@@ -1,21 +1,18 @@
-"""rollout_navdp_policy_mars.py - run a NavDP/S2DiT policy in the Mars HabitatSim scene.
+"""Legacy self-contained NavDP/S2DiT rollout adapter -- the most complete of
+the scripts/vlm_nav_tests/rollout_navdp*.py iterations: adds a trained
+--belief-adapter (replacing the plain P-controller) and an async background
+thread for logging so per-tick work never blocks on disk I/O. Superseded by
+sam_vla/run_navdp_rollout.py; kept for reference and for flags not yet
+ported over.
 
-This is the Mars terrain adapter WITH the full cone-safety layer ported from
-rollout_habitat_policy.py: per-tick hard safety gate + deterministic escape-yaw +
-committed go-around side. Copy this over your Mars repo's rollout_navdp_policy.py
-(or run it from there); it imports the NavDP repo via --navdp-root.
-
-Typical usage:
-
-    python rollout_navdp_policy_mars.py \
-      --navdp-root /path/to/navdp_sam \
-      --ckpt /path/to/navdp_sam/runs/.../ckpt_last.pt \
-      --scene marsyard2022_rocks.obj --terrain-obj marsyard2022.obj \
-      --goal-x 8 --goal-z -8 --ghost-obstacle-x 4 --ghost-obstacle-z 0 \
-      --cbf --cbf-mode cone --zero-lateral --action-smoothing none \
-      --cbf-radius-mode fixed --cbf-d-safe 1.2 --cbf-deadzone 0.8 \
-      --cbf-hard-gate --cbf-escape-yaw 0.6 --cbf-commit-side \
-      --out mars_rocks_rollout
+Usage:
+    python scripts/vlm_nav_tests/rollout_navdp_policy.py \
+      --navdp-root ./navdp --ckpt ./navdp/ckpt_last.pt \
+      --scene assets/marsyard2022.glb --terrain-obj assets/marsyard2022.obj \
+      --scene-height-flip-z --start-x 10 --start-z 12 \
+      --goal-mesh-uv 0.5,0.52 --obstacle-mesh-uv 0.5,0.80 \
+      --belief-adapter ./navdp/belief_adapter.pt \
+      --cbf --cbf-mode cone --cbf-hard-gate --save-video --out mars_belief_demo1
 """
 
 from __future__ import annotations

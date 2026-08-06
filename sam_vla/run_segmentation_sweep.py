@@ -4,6 +4,9 @@ mask + per-object metadata per pose via sam_vla.perception.segmentation_capture.
 Pose sourcing is a dedicated policy-independent sweep (sam_vla.env.pose_sweep),
 not a rover rollout -- this script only exists to build training data /
 validate the capture pipeline, not to drive the rover.
+
+Usage:
+    python -m sam_vla.run_segmentation_sweep --out-dir output/
 """
 
 from __future__ import annotations

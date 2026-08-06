@@ -1,10 +1,10 @@
-"""
-Standalone test for goal_pixel_ratio(): imports it directly from rollout_navdp.py
-and runs it against a mask image loaded from disk, printing goal_px/rest_px/
-frame_fraction/goal_to_rest_ratio so they can be sanity-checked against the mask
-by eye (e.g. mars_belief_demo1/frames/mask_0006.png).
+"""Standalone test for goal_pixel_ratio() (imported from
+scripts/vlm_nav_tests/rollout_navdp.py): runs it against a mask image loaded
+from disk and prints goal_px/rest_px/frame_fraction/goal_to_rest_ratio for
+eyeballing against the mask (e.g. mars_belief_demo1/frames/mask_0006.png).
 
-Usage: python test_goal_pixel_ratio.py [path/to/mask.png]
+Usage:
+    python scripts/habitat_tests/test_goal_pixel_ratio.py [path/to/mask.png]
 """
 
 import sys

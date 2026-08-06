@@ -1,42 +1,17 @@
-"""qwen_search_rollout_mars.py - manual left/right/straight/back search via ghost mask,
-auto-handoff to the REAL goal once it's visible.
+"""Legacy manual left/right/straight/back search rollout, no VLM in the loop:
+a direction typed into --command-file is rendered directly as a body-frame
+"ghost" goal mask (the same channel the policy trains on, so nothing is
+out-of-distribution) until the REAL goal (which may start --goal-out-of-view)
+becomes visible, at which point commands are ignored and the policy drives
+straight to it (SEARCHING -> FOUND -> SEARCHING again if lost).
 
-No VLM in the loop at all. You type a direction into --command-file (or --command); it is
-converted DIRECTLY into a body-frame ghost goal (recomputed every tick from the current pose,
-so "move left" reads as a continuous curving turn, not a one-time waypoint) and rendered
-through the SAME goal-mask channel the policy was trained on for normal navigation -- no
-language-adapter token, nothing out-of-distribution, nothing to fight (see
-rollout_navdp_policy_mars_langsearch.py's known limitation with the VLA adapter).
-
-The REAL goal can start OUT OF THE CAMERA FRUSTUM on purpose (--goal-out-of-view): it's a
-plain world point, so placing it doesn't require ever having seen it (unlike a rendered mesh
-goal, which needs valid depth at the seed pixel). The instant its mask is visible again
-(>= --lost-goal-min-px pixels), your commands are ignored and the policy just drives straight
-to it -- "once it sees something and then keeps moving towards it."
-
-State machine
--------------
-  SEARCHING  (goal_mask = body-frame ghost at your commanded bearing, every tick)
-     |  real goal's mask visible (>= --lost-goal-min-px)
-     v
-  FOUND  (goal_mask = REAL goal, rendered fresh every tick; your commands are ignored)
-     |  real goal's mask lost again (occluded, etc.)
-     v
-  SEARCHING
-
-  python qwen_search_rollout.py --navdp-root ../navdp --ckpt /media/nahar4/2e670039-b303-4e14-b517-49b4319b069d/navdp_sam/runs/mars_turn_no_obstacle_action3d1/ckpt_last.pt --scene marsyard2022_tri.glb --terrain-obj marsyard2022.obj --scene-height-flip-z --start-x 0 --start-z 8 --start-yaw-deg 0 --goal-out-of-view --goal-bearing-deg 180 --goal-range 8    --max-steps 400 --save-video --out mars_manual_search
-
-
-Usage
------
-    python scripts/qwen_search_rollout_mars.py \\
-      --navdp-root /path/to/navdp_sam \\
-      --ckpt /path/to/navdp_sam/runs/.../ckpt_last.pt \\
+Usage:
+    python scripts/vlm_nav_tests/qwen_search_rollout.py \\
+      --navdp-root /path/to/navdp_sam --ckpt /path/to/navdp_sam/runs/.../ckpt_last.pt \\
       --scene marsyard2022_tri.glb --terrain-obj marsyard2022.obj --scene-height-flip-z \\
       --start-x 0 --start-z 8 --start-yaw-deg 0 \\
       --goal-out-of-view --goal-bearing-deg 180 --goal-range 8 \\
-      --command-file command.txt \\
-      --max-steps 400 --save-video --out mars_manual_search
+      --command-file command.txt --max-steps 400 --save-video --out mars_manual_search
 
 Then edit command.txt with 'left', 'right', 'straight', 'back', or 'stop' while it runs.
 """

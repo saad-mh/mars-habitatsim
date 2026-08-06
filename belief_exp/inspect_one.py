@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""inspect_one.py -- run ONE belief-bank config over one or more episodes and print a
-step-by-step trace, for eyeballing behavior directly (mu tracking, Sigma growth on
-occlusion / reset on re-sighting, gate pauses) before committing to a full sweep.
+"""Runs ONE belief-bank config over one or more episodes and prints a
+step-by-step trace, for eyeballing behavior directly (mu tracking, Sigma
+growth on occlusion / reset on re-sighting, gate pauses) before committing to
+a full sweep.py run.
 
+Usage:
     conda run -n sam2 python belief_exp/inspect_one.py
     conda run -n sam2 python belief_exp/inspect_one.py --sigma-visible 1e-4 --env-obs-noise 0.3
 """

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""sweep.py -- paired random-search sweep over navdp.SubgoalBeliefBank's
-covariance/confidence parameters (+ RouteManager.success_radius, + the harness's
-sigma_ale scan-gate threshold), ranked by calibration + closed-loop task performance.
+"""Paired random-search sweep over navdp.SubgoalBeliefBank's covariance/
+confidence parameters (+ RouteManager.success_radius, + the scan-gate
+threshold), ranked by calibration + closed-loop task performance. "Paired"
+means the same seeded list of randomized scenarios is replayed against every
+sampled config, so leaderboard differences reflect the config, not which
+random episodes it happened to see.
 
-"Paired" design: the same list of randomized environment scenarios (seeded) is
-replayed against EVERY sampled config, so differences in the leaderboard reflect the
-config, not which random episodes it happened to see.
-
+Usage:
     conda run -n sam2 python belief_exp/sweep.py \\
         --configs-n 200 --episodes-per-config 60 --seed 0 \\
         --out belief_exp/results/sweep_001.csv
-
 """
 
 from __future__ import annotations

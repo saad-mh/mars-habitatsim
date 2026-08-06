@@ -1,3 +1,11 @@
+"""Minimal raw habitat_sim RGBD sensor smoke test: no rover/teleop scaffolding,
+just spawns RGB+depth sensors on the scene and saves one frame to check the
+sim/scene loads and sensors render.
+
+Usage:
+    python scripts/habitat_tests/rgbd_test.py
+"""
+
 import os
 import numpy as np
 from pathlib import Path

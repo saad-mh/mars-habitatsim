@@ -1,30 +1,9 @@
-"""Converts a segmentation-sweep run (sam_vla.run_segmentation_sweep's
-rgb/ + masks_instance/ + masks_category/ + segmentation_frames.jsonl) into
-standard training-annotation formats, per next.md Step 5 ("export in a
-standard format rather than a bespoke loader"). Reads only what's already on
-disk -- no habitat_sim/env dependency -- so it can run anywhere the run_dir
-is reachable.
-
-Object geometry: bbox/area/category come straight from segmentation_frames.jsonl
-(already computed by perception.segmentation_capture, per-mesh_id exact
-pixel_count). Per-object polygons (for COCO segmentation / YOLO-seg) are
-traced from masks_instance/<frame_id>.png (mesh_id == pixel value) via
-cv2.findContours, imported lazily so importing this module doesn't require
-cv2 unless a format that needs polygons is actually requested.
-
-Formats:
-  coco     -- one instances.json (images/annotations/categories), file_name
-              paths relative to run_dir so it can sit at
-              run_dir/annotations_export/coco/instances.json without
-              duplicating the rgb/ directory.
-  yolo     -- one labels/<frame_id>.txt per frame (bbox detection: "class
-              cx cy w h", normalized, 0-indexed class excluding background),
-              classes.txt, and a data.yaml. A relative symlink
-              annotations_export/yolo/images -> ../../rgb is created so
-              Ultralytics' images/->labels/ path-substitution convention
-              resolves without copying images.
-  yolo-seg -- like yolo, but each label line is a normalized polygon
-              ("class x1 y1 x2 y2 ..."), Ultralytics' YOLO-seg format.
+"""Converts a segmentation-sweep run (rgb/ + masks_instance/ + masks_category/
++ segmentation_frames.jsonl) into standard training-annotation formats --
+`coco` (one instances.json), `yolo` (bbox labels/data.yaml + an images/
+symlink to rgb/), and `yolo-seg` (like yolo but with polygon labels traced
+from masks_instance/ via cv2.findContours, imported lazily). Reads only
+what's already on disk -- no habitat_sim/env dependency.
 
 Usage:
     python -m sam_vla.perception.export_annotations --run-dir <run_dir> [--formats coco,yolo] [--out-dir <out_dir>]

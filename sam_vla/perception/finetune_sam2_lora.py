@@ -1,56 +1,14 @@
 """LoRA finetuning for the SAM2 segmentation model used by this pipeline.
 
-Recon conclusions (see module docstrings of the files cited below before
-changing any of this):
-
-* What "the SAM2 model" means in this repo. Nothing downstream
-  (sam_vla.perception.sam_segmenter / sam_weights_loader / sam2_custom_head)
-  uses SAM2's promptable path (SAM2ImagePredictor/SAM2VideoPredictor,
-  prompt encoder, mask decoder, IoU head). Instead
-  sam2_custom_head.SimpleSAM2Seg takes SAM2.1 Hiera-L's *image encoder*
-  as a bare feature backbone and feeds it into a small from-scratch conv
-  decoder (SimpleSegHead) that predicts dense per-pixel class logits
-  directly -- no points/boxes/masks prompts, ever. So "wrap the mask
-  decoder with LoRA" doesn't apply here: there is no mask decoder in this
-  pipeline's SAM2 usage. What LoRA *can* usefully adapt is the one
-  pretrained component actually in play -- the Hiera trunk's attention
-  projections (`attn.qkv`, `attn.proj` in
-  sam2/modeling/backbones/hieradet.py's MultiScaleAttention blocks).
-  SimpleSegHead is randomly initialized and task-specific; LoRA-adapting a
-  from-scratch head is meaningless; it is always trained in full.
-
-* Image encoder, not video predictor. run_segmentation_sweep samples
-  independent camera poses (sam_vla.env.pose_sweep) -- there is no
-  temporal sequence, memory bank, or object-tracking-across-frames
-  anywhere in this dataset or in SimpleSAM2Seg's forward pass. Finetuning
-  targets the single-frame image encoder, matching what's already
-  deployed.
-
-* Dataset source: NOT export_annotations' COCO/YOLO output by default.
-  export_annotations exists to feed box/polygon-style consumers (COCO
-  instance JSON, YOLO[-seg] labels). But run_segmentation_sweep already
-  writes the exact lossless training target this architecture needs --
-  masks_category/<frame_id>.png, a dense per-class-index PNG -- directly
-  into the run directory (sam_vla.perception.segmentation_capture
-  .write_segmentation_assets), before export_annotations ever runs. That
-  is what sam/train_sam2_simple_fast.py's MarsDataset already trains
-  against (image + dense mask pairs), so SegmentationRunDataset below
-  reads it the same lossless way instead of adding an avoidable detour
-  through polygon tracing (export) and back (rasterize). CocoPolygonDataset
-  is provided for the genuine "no run_dir, only a portable export" case,
-  since the task did ask for it -- it rasterizes export_coco's polygons
-  back into a dense mask with cv2.fillPoly. YOLO/YOLO-seg are NOT
-  supported: plain YOLO carries no mask, and YOLO-seg's polygons are the
-  same underlying contours as COCO's with a different file layout, so
-  supporting it would add a third parser for zero new capability.
-
-* Env: this module reads only files already on disk and needs
-  torch/peft/cv2 -- no habitat_sim. It's meant to run in the `sam2` conda
-  env (already used for SAM2 work in this repo, see sam2.yml), which is
-  already decoupled from the `habitat` env run_segmentation_sweep needs,
-  the same way run_dataset_pipeline.py shells out to a separate
-  interpreter for the sweep stage. No new env is needed; `peft` was the
-  only missing dependency (see sam/requirements.txt).
+This model has no mask decoder to LoRA-adapt: sam2_custom_head.SimpleSAM2Seg
+uses SAM2.1 Hiera-L's image encoder only as a feature backbone, feeding a
+from-scratch conv decoder (always trained in full) -- so LoRA here targets
+the Hiera trunk's attention projections (`attn.qkv`/`attn.proj`) instead.
+Trains directly on run_segmentation_sweep's masks_category/<frame_id>.png
+dense per-class PNGs (SegmentationRunDataset), not export_annotations' COCO/
+YOLO output -- CocoPolygonDataset (rasterizing COCO polygons back to a dense
+mask) is only for the case where no run_dir is available, only a portable
+export. Needs torch/peft/cv2, no habitat_sim; runs in the `sam2` conda env.
 
 Usage:
     python -m sam_vla.perception.finetune_sam2_lora \\

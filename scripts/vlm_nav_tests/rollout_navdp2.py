@@ -1,3 +1,16 @@
+"""Legacy self-contained NavDP/S2DiT rollout adapter, an iteration of
+rollout_navdp.py that adds loading a fixed procedural rock field
+(--rock-field, from generate_rock_env.py) into the scene before the
+goal/obstacle setup. Superseded by sam_vla/run_navdp_rollout.py; kept for
+reference and for flags not yet ported over.
+
+Usage:
+    python scripts/vlm_nav_tests/rollout_navdp2.py \
+      --navdp-root /path/to/navdp_sam --ckpt /path/to/ckpt_last.pt \
+      --rock-field rock_envs/run1/rock_field.json \
+      --cbf --cbf-mode cone --cbf-hard-gate --out mars_rocks_rollout
+"""
+
 from __future__ import annotations
 
 import argparse

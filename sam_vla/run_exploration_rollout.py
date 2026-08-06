@@ -1,48 +1,24 @@
-"""
-conda activate habitat
-python -m sam_vla.run_exploration_rollout \
-    --scene-path assets/marsyard2022.glb \
-    --heightmap-path marsyard2022_terrain_hm_1025.tif \
-    --command area --cbf --max-steps 300 \
-    --navdp-ckpt <ckpt.pt> \
-    --out-dir output/explore_smoke_test
+"""Two-phase rollout: drives ExplorationPolicy (LEFT/RIGHT/FRONT/BACK legs)
+until BeliefGoalTracker confirms the real, VLM-detected goal mesh has come
+into view, then hands off to NavdpPolicy to actually drive to it within
+`goal_arrival_radius_m` -- the sim never stops at the handoff. While driving,
+if the goal mesh drops out of the semantic render (occlusion/out of FOV),
+inject_ghost_goal_mask() paints a filled goal-colored circle at the tracker's
+projected pixel so NavdpPolicy (which only ever "sees" goal-colored pixels,
+never a language instruction) still has something to steer toward -- unlike
+kb_teleop_vl.py's ghost mask, this one is policy-facing, not just advisory.
+Needs two separate Qwen server managers (different ports): one for the
+one-shot first-frame goal/obstacle detection, one for ExplorationPolicy's
+per-leg direction queries.
 
-Drives sam_vla.policy.exploration_policy.ExplorationPolicy until the goal is
-confirmed, then hands off to NavdpPolicy to actually drive to it -- the sim is
-never stopped at confirmation. Real first-frame VLM goal/obstacle detection
-(first_frame_resolver, same as run_navdp_rollout.py's default single-goal
-path) registers actual MESH_GOAL_ID / MESH_OBST_ID meshes so CBF has real
-obstacles to see (unlike kb_teleop_vl.py's synthetic, undetectable obstacle
-field). A BeliefGoalTracker confirms when the goal has actually come into view
-(GOAL_CONFIRM_STEPS consecutive sightings), which switches `phase` from
-"explore" to "drive" and swaps the active policy from ExplorationPolicy to
-NavdpPolicy; the episode then ends when the rover reaches within
-`goal_arrival_radius_m` of the goal (or max_steps runs out). Per-step
-composition (policy.act_verbose -> safety_filter -> CbfObstacleAvoidance.apply
--> integrate_mars -> env.step) exactly mirrors run_navdp_rollout.py:666-716.
-
-NavdpPolicy drives off a rendered goal *mask* (MESH_GOAL_ID pixels in the
-semantic frame it's handed), not a language instruction -- it has no notion of
-"go toward this point" other than "this is where the goal-colored pixels are".
-Once driving, the real goal mesh can still drop out of the semantic render
-(occlusion, motion blur out of FOV) exactly like it did during exploration; so
-while it's unseen, inject_ghost_goal_mask() paints a filled MESH_GOAL_ID circle
-into a *copy* of the semantic frame at BeliefGoalTracker's projected pixel
-(sam_vla.core.ghost_mask.project_or_clamp_body_point_to_pixel), sized from its
-growing uncertainty (uncertainty_to_radius_px) -- that circle IS the screen
-point NavdpPolicy drives toward when the real mask is gone, standing in for it
-rather than only decorating a human-facing frame (contrast with next.md's
-kb_teleop_vl.py ghost, which is deliberately policy-blind/advisory-only; this
-one is intentionally not, per this script's explicit design).
-
-Two separate Qwen server managers are needed (different ports, see their
-respective configs): sam_vla.vlm.qwen_server_manager for first_frame_resolver's
-one-shot goal/obstacle detection, and vl_direction.qwen_server_manager for
-ExplorationPolicy's per-leg direction queries. register_goal_obstacle_masks
-below is a direct copy of run_navdp_rollout.py's helper of the same name rather
-than an import from it, since that module imports NavdpPolicy (and therefore
-torch) at module scope -- this script instead imports NavdpPolicy lazily, at
-the point the goal is confirmed and driving actually begins.
+Usage:
+    conda activate habitat
+    python -m sam_vla.run_exploration_rollout \
+        --scene-path assets/marsyard2022.glb \
+        --heightmap-path marsyard2022_terrain_hm_1025.tif \
+        --command area --cbf --max-steps 300 \
+        --navdp-ckpt <ckpt.pt> \
+        --out-dir output/explore_smoke_test
 """
 
 import argparse

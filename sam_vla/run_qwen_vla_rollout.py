@@ -1,3 +1,15 @@
+"""Rollout entry point driven by QwenDiscreteDirectionPolicy (LEFT/RIGHT/
+FRONT/BACK discrete VLM guidance) instead of NavDP diffusion actions --
+first-frame VLM goal/obstacle detection registers real mesh masks, then the
+Qwen policy steps toward the goal each frame with the same safety_filter
+CBF pipeline as run_navdp_rollout.py.
+
+Usage:
+    python -m sam_vla.run_qwen_vla_rollout \\
+        --scene-path assets/marsyard2022.glb --heightmap-path marsyard2022_terrain_hm.png \\
+        --out-dir vla_rollout1 --max-steps 250 --save-video
+"""
+
 import argparse
 import math
 import time, datetime

@@ -1,3 +1,12 @@
+"""Raw habitat_sim smoke test: drives a fixed forward-move sequence while
+holding the camera at CAMERA_CLEARANCE above the heightmap-sampled terrain
+height, saving RGBD frames per step -- checks terrain-following math without
+any teleop/policy scaffolding.
+
+Usage:
+    python scripts/habitat_tests/rgbd_drive.py
+"""
+
 import os
 import numpy as np
 from pathlib import Path

@@ -1,3 +1,10 @@
+"""CLI client for ht_vel_server.py: sends velocity/record/save/stop commands
+over UDP.
+
+Usage:
+    python scripts/habitat_tests/ht_vel_client.py vel <linear_x> <angular_y> [--rate hz] [--duration s]
+"""
+
 import argparse
 import socket
 import time

@@ -1,3 +1,12 @@
+"""UDP velocity-command server variant of kb_teleop.py: renders the same
+teleop window but drives the rover from (linear_x, angular_y) commands
+received over UDP instead of keyboard input, so another process (e.g.
+ht_vel_client.py) can drive it.
+
+Usage:
+    python scripts/habitat_tests/ht_vel_server.py    # listens on 127.0.0.1:5055
+"""
+
 import os
 import shutil
 import socket
