@@ -4,17 +4,36 @@ python -m sam_vla.run_exploration_rollout \
     --scene-path assets/marsyard2022.glb \
     --heightmap-path marsyard2022_terrain_hm_1025.tif \
     --command area --cbf --max-steps 300 \
+    --navdp-ckpt <ckpt.pt> \
     --out-dir output/explore_smoke_test
 
-Drives sam_vla.policy.exploration_policy.ExplorationPolicy end to end: real
-first-frame VLM goal/obstacle detection (first_frame_resolver, same as
-run_navdp_rollout.py's default single-goal path) registers actual MESH_GOAL_ID /
-MESH_OBST_ID meshes so CBF has real obstacles to see (unlike kb_teleop_vl.py's
-synthetic, undetectable obstacle field), a BeliefGoalTracker confirms when the
-goal has actually come into view (GOAL_CONFIRM_STEPS consecutive sightings) to
-stop the episode, and per-step composition (policy.act_verbose -> safety_filter
--> CbfObstacleAvoidance.apply -> integrate_mars -> env.step) exactly mirrors
-run_navdp_rollout.py:666-716 with NavdpPolicy swapped for ExplorationPolicy.
+Drives sam_vla.policy.exploration_policy.ExplorationPolicy until the goal is
+confirmed, then hands off to NavdpPolicy to actually drive to it -- the sim is
+never stopped at confirmation. Real first-frame VLM goal/obstacle detection
+(first_frame_resolver, same as run_navdp_rollout.py's default single-goal
+path) registers actual MESH_GOAL_ID / MESH_OBST_ID meshes so CBF has real
+obstacles to see (unlike kb_teleop_vl.py's synthetic, undetectable obstacle
+field). A BeliefGoalTracker confirms when the goal has actually come into view
+(GOAL_CONFIRM_STEPS consecutive sightings), which switches `phase` from
+"explore" to "drive" and swaps the active policy from ExplorationPolicy to
+NavdpPolicy; the episode then ends when the rover reaches within
+`goal_arrival_radius_m` of the goal (or max_steps runs out). Per-step
+composition (policy.act_verbose -> safety_filter -> CbfObstacleAvoidance.apply
+-> integrate_mars -> env.step) exactly mirrors run_navdp_rollout.py:666-716.
+
+NavdpPolicy drives off a rendered goal *mask* (MESH_GOAL_ID pixels in the
+semantic frame it's handed), not a language instruction -- it has no notion of
+"go toward this point" other than "this is where the goal-colored pixels are".
+Once driving, the real goal mesh can still drop out of the semantic render
+(occlusion, motion blur out of FOV) exactly like it did during exploration; so
+while it's unseen, inject_ghost_goal_mask() paints a filled MESH_GOAL_ID circle
+into a *copy* of the semantic frame at BeliefGoalTracker's projected pixel
+(sam_vla.core.ghost_mask.project_or_clamp_body_point_to_pixel), sized from its
+growing uncertainty (uncertainty_to_radius_px) -- that circle IS the screen
+point NavdpPolicy drives toward when the real mask is gone, standing in for it
+rather than only decorating a human-facing frame (contrast with next.md's
+kb_teleop_vl.py ghost, which is deliberately policy-blind/advisory-only; this
+one is intentionally not, per this script's explicit design).
 
 Two separate Qwen server managers are needed (different ports, see their
 respective configs): sam_vla.vlm.qwen_server_manager for first_frame_resolver's
@@ -22,8 +41,8 @@ one-shot goal/obstacle detection, and vl_direction.qwen_server_manager for
 ExplorationPolicy's per-leg direction queries. register_goal_obstacle_masks
 below is a direct copy of run_navdp_rollout.py's helper of the same name rather
 than an import from it, since that module imports NavdpPolicy (and therefore
-torch) at module scope -- this script has no diffusion-policy dependency and
-shouldn't need torch installed to run without --cbf.
+torch) at module scope -- this script instead imports NavdpPolicy lazily, at
+the point the goal is confirmed and driving actually begins.
 """
 
 import argparse
@@ -32,7 +51,13 @@ import math
 import time
 from pathlib import Path
 
+import numpy as np
+
 from sam_vla.core.belief_tracking import BeliefGoalTracker
+from sam_vla.core.ghost_mask import (
+    project_or_clamp_body_point_to_pixel,
+    uncertainty_to_radius_px,
+)
 from sam_vla.core.goal_geometry import (
     MESH_GOAL_ID,
     MESH_OBST_ID,
@@ -82,6 +107,50 @@ def register_goal_obstacle_masks(
         )
 
 
+def inject_ghost_goal_mask(
+    semantic,
+    obstacle_mask,
+    belief_tracker: BeliefGoalTracker,
+    hfov_deg: float,
+    min_px: float,
+    max_px: float,
+    radius_scale: float,
+):
+    """When the goal mesh isn't in this frame's semantic render, paint a filled
+    MESH_GOAL_ID circle into a *copy* of `semantic` at BeliefGoalTracker's
+    projected pixel, radius grown from its uncertainty -- this is the actual
+    pixel NavdpPolicy will drive toward (via its own `sem == MESH_GOAL_ID`
+    read), not just a human-facing overlay. Never overwrites obstacle-tagged
+    pixels, so CBF's obstacle mask stays intact under the ghost. Returns
+    (semantic_or_copy, ghost_info) where ghost_info is safe to merge straight
+    into a step's logged vla_result."""
+    bearing = belief_tracker.bearing()
+    distance = belief_tracker.distance()
+    if bearing is None or distance is None:
+        return semantic, {"ghost_active": False}
+
+    forward = distance * math.cos(bearing)
+    left = distance * math.sin(bearing)
+    height, width = semantic.shape[:2]
+    u, v = project_or_clamp_body_point_to_pixel(forward, left, hfov_deg, height, width)
+    radius_px = uncertainty_to_radius_px(
+        belief_tracker.uncertainty_value(), min_px, max_px, radius_scale
+    )
+
+    yy, xx = np.mgrid[0:height, 0:width]
+    ghost_pixels = (xx - u) ** 2 + (yy - v) ** 2 <= radius_px**2
+    ghost_pixels &= np.asarray(obstacle_mask) == 0
+
+    ghosted = semantic.copy()
+    ghosted[ghost_pixels] = MESH_GOAL_ID
+    return ghosted, {
+        "ghost_active": True,
+        "ghost_u": round(float(u), 1),
+        "ghost_v": round(float(v), 1),
+        "ghost_radius_px": round(float(radius_px), 1),
+    }
+
+
 def run(
     scene_path: str,
     heightmap_path: str,
@@ -116,6 +185,8 @@ def run(
     zero_lateral: bool = True,
     belief_goal_range: float = 8.0,
     lost_goal_min_px: int = 10,
+    belief_odom_noise: float = 0.01,
+    belief_odom_noise_growth_rate: float = 0.0,
     leg_length_m: float = 3.0,
     leg_length_jitter_m: float = 1.0,
     cruise_speed: float = 1.0,
@@ -126,7 +197,23 @@ def run(
     stall_distance_m: float = 0.5,
     backtrack_distance_m: float = 2.0,
     seed: int = None,
+    navdp_ckpt: str = None,
+    navdp_device: str = "cuda",
+    navdp_image_size: int = None,
+    navdp_sample_steps: int = 20,
+    navdp_replan_every: int = 1,
+    navdp_max_forward_speed: float = 1.0,
+    navdp_max_lateral_speed: float = 1.0,
+    goal_arrival_radius_m: float = 1.0,
+    ghost_min_px: float = 3.0,
+    ghost_max_px: float = 100.0,
+    ghost_uncertainty_saturation: float = 0.15,
 ) -> None:
+    if navdp_ckpt is None:
+        raise ValueError(
+            "--navdp-ckpt is required: after the goal is confirmed this script "
+            "drives to it with NavdpPolicy, it doesn't just stop"
+        )
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     sam_qwen_manager = SamQwenServerManager()
@@ -179,8 +266,15 @@ def run(
         policy.set_command(command)
 
         belief_tracker = BeliefGoalTracker(
-            hfov_deg=HFOV_DEG, goal_range=belief_goal_range, min_px=lost_goal_min_px
+            hfov_deg=HFOV_DEG,
+            goal_range=belief_goal_range,
+            min_px=lost_goal_min_px,
+            odom_noise=belief_odom_noise,
+            odom_noise_growth_rate=belief_odom_noise_growth_rate,
         )
+        # Ghost radius saturates to ghost_max_px right as uncertainty reaches
+        # ghost_uncertainty_saturation -- same scale formula kb_teleop_vl.py uses.
+        ghost_radius_scale = ghost_max_px / max(ghost_uncertainty_saturation, 1e-6)
 
         avoidance = None
         if cbf:
@@ -189,7 +283,10 @@ def run(
             # NavdpPolicy's constructor (see its module docstring), but this script
             # has no NavdpPolicy, so do it directly with the same helpers
             # run_navdp_rollout.py uses.
-            from sam_vla.policy.navdp_policy import _add_navdp_to_path, _resolve_navdp_root
+            from sam_vla.policy.navdp_policy import (
+                _add_navdp_to_path,
+                _resolve_navdp_root,
+            )
             from sam_vla.safety.cbf_avoidance import CbfObstacleAvoidance
 
             _add_navdp_to_path(_resolve_navdp_root(navdp_root))
@@ -212,18 +309,34 @@ def run(
         cbf_active_steps = 0
         hard_gate_fired_steps = 0
         goal_seen_steps = 0
+        phase = "explore"  # -> "drive" once the goal is confirmed; see module docstring
 
         for step in range(max_steps):
             obs = env.get_observation(frame_idx=step)
             semantic = env.get_semantic_frame()
 
-            raw_action, vla_result = policy.act_verbose(obs, semantic, goal_spec, step)
-            action = safety_filter_fn(raw_action, obs)
-
             goal_mask = (semantic == MESH_GOAL_ID).astype("uint8") * 255
             obstacle_mask = (semantic == MESH_OBST_ID).astype("uint8") * 255
             goal_visible = belief_tracker.observe(goal_mask, obs.depth)
             goal_bearing = belief_tracker.bearing()
+
+            policy_semantic = semantic
+            ghost_info = {}
+            if phase == "drive" and not goal_visible:
+                policy_semantic, ghost_info = inject_ghost_goal_mask(
+                    semantic,
+                    obstacle_mask,
+                    belief_tracker,
+                    HFOV_DEG,
+                    ghost_min_px,
+                    ghost_max_px,
+                    ghost_radius_scale,
+                )
+
+            raw_action, vla_result = policy.act_verbose(
+                obs, policy_semantic, goal_spec, step
+            )
+            action = safety_filter_fn(raw_action, obs)
 
             obstacle_point = None
             if avoidance is not None:
@@ -254,33 +367,74 @@ def run(
                 else None
             )
             dist_txt = f"{dist:.2f}m" if dist is not None else "n/a"
-            overlay_text = (
-                f"t={step} dist={dist_txt} v=[{action.v_fwd:.2f},{action.v_lat:.2f}] "
-                f"yaw_rate={action.yaw_rate:.2f} {vla_result['command']}/{vla_result['leg_kind']}"
+            if phase == "explore":
+                overlay_text = (
+                    f"t={step} phase={phase} dist={dist_txt} "
+                    f"v=[{action.v_fwd:.2f},{action.v_lat:.2f}] yaw_rate={action.yaw_rate:.2f} "
+                    f"{vla_result['command']}/{vla_result['leg_kind']}"
+                )
+            else:
+                overlay_text = (
+                    f"t={step} phase={phase} dist={dist_txt} "
+                    f"v=[{action.v_fwd:.2f},{action.v_lat:.2f}] yaw_rate={action.yaw_rate:.2f} "
+                    f"ghost={ghost_info.get('ghost_active', False)}"
+                )
+            vis_rgb = overlay_semantic_masks(
+                obs.rgb, policy_semantic, text=overlay_text
             )
-            vis_rgb = overlay_semantic_masks(obs.rgb, semantic, text=overlay_text)
 
-            vla_result = {**vla_result, "goal_visible": goal_visible, **cbf_info}
+            vla_result = {
+                **vla_result,
+                "phase": phase,
+                "goal_visible": goal_visible,
+                **ghost_info,
+                **cbf_info,
+            }
             logger.log_step(
                 obs, action, new_pose, vla_result=vla_result, vis_rgb=vis_rgb
             )
 
             if step % 10 == 0:
                 print(
-                    f"[traj] step={step} | distance_to_goal={dist} | action={action} | "
-                    f"{vla_result}"
+                    f"[traj] step={step} | phase={phase} | distance_to_goal={dist} | "
+                    f"action={action} | {vla_result}"
                 )
 
-            if goal_visible:
-                goal_seen_steps += 1
-                if goal_seen_steps >= GOAL_CONFIRM_STEPS:
+            if phase == "explore":
+                if goal_visible:
+                    goal_seen_steps += 1
+                    if goal_seen_steps >= GOAL_CONFIRM_STEPS:
+                        print(
+                            f"[explore] goal confirmed visible at step={step}, "
+                            "switching to drive phase",
+                            flush=True,
+                        )
+                        from sam_vla.policy.navdp_policy import NavdpPolicy
+
+                        policy = NavdpPolicy(
+                            ckpt_path=navdp_ckpt,
+                            navdp_root=navdp_root,
+                            device=navdp_device,
+                            image_size=navdp_image_size,
+                            sample_steps=navdp_sample_steps,
+                            hfov_deg=HFOV_DEG,
+                            replan_every=navdp_replan_every,
+                            max_forward_speed=navdp_max_forward_speed,
+                            max_lateral_speed=navdp_max_lateral_speed,
+                            max_yaw_rate=max_yaw_rate,
+                        )
+                        phase = "drive"
+                else:
+                    goal_seen_steps = 0
+            else:  # phase == "drive"
+                drive_dist = dist if dist is not None else belief_tracker.distance()
+                if drive_dist is not None and drive_dist <= goal_arrival_radius_m:
                     print(
-                        f"[explore] goal confirmed visible at step={step}, stopping",
+                        f"[drive] reached goal at step={step} dist={drive_dist:.2f}m, "
+                        "stopping",
                         flush=True,
                     )
                     break
-            else:
-                goal_seen_steps = 0
 
         if avoidance is not None:
             print(
@@ -306,7 +460,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--task-str",
-        default="explore the terrain",
+        default="explore around and find the goal",
         help="high-level task string passed to vl_direction's exploration prompt",
     )
     parser.add_argument(
@@ -329,8 +483,33 @@ if __name__ == "__main__":
     parser.add_argument("--cbf", action="store_true")
     parser.add_argument(
         "--navdp-root",
+        default="./navdp",
+        help=(
+            "Path to the navdp repo, needed by --cbf and always by the drive phase "
+            "(default: ./navdp or $NAVDP_ROOT)"
+        ),
+    )
+    parser.add_argument(
+        "--navdp-ckpt",
+        required=True,
+        help="NavDP checkpoint used to drive to the goal once it's confirmed",
+    )
+    parser.add_argument("--navdp-device", default="cuda")
+    parser.add_argument(
+        "--navdp-image-size",
+        type=int,
         default=None,
-        help="Path to the navdp repo, needed by --cbf (default: ./navdp or $NAVDP_ROOT)",
+        help="default: read from the checkpoint's train_args",
+    )
+    parser.add_argument("--navdp-sample-steps", type=int, default=20)
+    parser.add_argument("--navdp-replan-every", type=int, default=1)
+    parser.add_argument("--navdp-max-forward-speed", type=float, default=1.0)
+    parser.add_argument("--navdp-max-lateral-speed", type=float, default=1.0)
+    parser.add_argument(
+        "--goal-arrival-radius-m",
+        type=float,
+        default=1.0,
+        help="drive phase stops once within this planar distance of the goal",
     )
     parser.add_argument("--cbf-d-safe", type=float, default=0.75)
     parser.add_argument("--cbf-gamma", type=float, default=0.3)
@@ -354,7 +533,37 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--belief-goal-range", type=float, default=8.0)
-    parser.add_argument("--lost-goal-min-px", type=int, default=10)
+    parser.add_argument("--lost-goal-min-px", type=int, default=20)
+    parser.add_argument(
+        "--belief-odom-noise",
+        type=float,
+        default=0.001,
+        help="per-step uncertainty growth while the goal is unseen (drives ghost radius)",
+    )
+    parser.add_argument(
+        "--belief-odom-noise-growth-rate",
+        type=float,
+        default=0.0,
+        help="accelerating-drift term on top of --belief-odom-noise the longer the goal stays unseen",
+    )
+    parser.add_argument(
+        "--ghost-min-px",
+        type=float,
+        default=3.0,
+        help="min ghost circle radius, in pixels",
+    )
+    parser.add_argument(
+        "--ghost-max-px",
+        type=float,
+        default=100.0,
+        help="max ghost circle radius, in pixels",
+    )
+    parser.add_argument(
+        "--ghost-uncertainty-saturation",
+        type=float,
+        default=0.15,
+        help="uncertainty value at which the ghost radius saturates to --ghost-max-px",
+    )
 
     parser.add_argument("--leg-length-m", type=float, default=3.0)
     parser.add_argument("--leg-length-jitter-m", type=float, default=1.0)
