@@ -1,7 +1,11 @@
-"""
-Standalone test for resolve_vlm_selection(): imports it directly (no Tk, no labelme, no InteractiveCapture) and runs it against an already-captured frame + annotation pair, printing the goal/obstacle selection and resolved 3D positions so they can be diffed against a full interactive-flow run on the same frame (e.g. vlm_nav_out/rgb_0000_mission.json).
+"""Standalone test for resolve_vlm_selection() (imported directly, no Tk/
+labelme/InteractiveCapture): runs it against an already-captured frame +
+annotation pair and prints the goal/obstacle selection + resolved 3D
+positions, to diff against a full interactive-flow run on the same frame
+(e.g. vlm_nav_out/rgb_0000_mission.json).
 
-Usage: python test_resolve_vlm_selection.py [frame_idx]
+Usage:
+    python scripts/vlm_nav_tests/test_resolve_vlm_selection.py [frame_idx]
 """
 
 import json

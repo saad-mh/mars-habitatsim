@@ -1,11 +1,8 @@
-"""
-Client for the persistent Qwen VLM server (qwen_vlm_server.py).
-
-Stdlib-only, so it can be imported from the main process's conda env
-(e.g. habitat) which lacks torch/transformers. Sends repeated low-latency
-inference requests to the resident model process over a local TCP
-socket. This is a separate calling path from query_vlm/resolve_vlm_selection
-in vlm_nav_interactive.py, which stays on its one-shot subprocess flow.
+"""Stdlib-only TCP client for the persistent Qwen VLM server
+(qwen_vlm_server.py) -- importable from torch-less envs (e.g. `habitat`) to
+send low-latency inference requests to the resident model process. A
+separate calling path from vlm_nav_interactive.py's one-shot subprocess flow.
+Not run directly; imported by rollout_navdp*.py / qwen_search_*.py.
 """
 
 import json

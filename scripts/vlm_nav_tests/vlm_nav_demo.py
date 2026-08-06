@@ -1,11 +1,11 @@
-"""
-SAM Interactive Visualizer for the Mars rover scene in Habitat-Sim.
+"""SAM interactive visualizer for the Mars rover scene: fly a free camera
+(WASD + turn), press SPACE to capture the current frame and run it through
+the trained SAM2 segmentation model (sam/sam/inference.py); the detected
+segmentation (class overlay + bedrock/big_rock boxes) opens in a second
+window with an option to save.
 
-Fly a free camera around the scene (WASD + turn), then press SPACE to
-capture the current frame and run it through the trained SAM2
-segmentation model (sam/sam/inference.py). The detected segmentation
-(class overlay + bedrock/big_rock boxes) opens in a second window with
-an option to save.
+Usage:
+    python scripts/vlm_nav_tests/vlm_nav_demo.py
 """
 
 import os

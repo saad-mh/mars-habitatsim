@@ -5,7 +5,8 @@ hint routing (explore left/right, "this area's explored", blocked-direction afte
 backtrack), and stall-triggered backtracking -- all exercised with
 vl_direction.client.MockInternVLClient, no Habitat-Sim / live model needed.
 
-Usage: python test_exploration_policy.py
+Usage:
+    python scripts/vlm_nav_tests/test_exploration_policy.py
 """
 
 import math

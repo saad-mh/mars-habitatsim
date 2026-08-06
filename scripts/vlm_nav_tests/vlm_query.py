@@ -9,6 +9,10 @@ qwen_vlm_smoke_test.py.
 Feeds the raw RGB frame, its annotated overlay image, and a text summary of
 the labelme annotation JSON (object ids, labels, boxes) to the model and
 writes the generated response to --out.
+
+Usage:
+    conda run -n qwen_vlm python scripts/vlm_nav_tests/vlm_query.py \\
+        --rgb rgb_0000.png --annotation rgb_0000.json --prompt "..." --out response.txt
 """
 
 import argparse

@@ -1,9 +1,10 @@
-"""
-smoke test for Qwen2.5-VL-3B-Instruct in the `qwen_vlm` conda env.
+"""One-shot smoke test for Qwen2.5-VL-3B-Instruct: loads the model, feeds one
+image + a text prompt, and prints the generated text -- confirms env/model
+load/inference work end-to-end. Not wired into the sim/capture/labelme
+pipeline.
 
-Loads the model and processor, feeds one image + a simple text prompt, and
-prints the generated text. Confirms env/model load/inference work end-to-end.
-Not wired into the sim/capture/labelme pipeline.
+Usage:
+    conda run -n qwen_vlm python scripts/vlm_nav_tests/qwen_vlm_smoke_test.py
 """
 
 import torch

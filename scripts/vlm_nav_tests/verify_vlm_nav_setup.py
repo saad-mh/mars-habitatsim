@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""
-Verification script for vlm_nav_interactive.py setup.
+"""Checks the prerequisites for vlm_nav_interactive.py before running it:
+required files exist (scene, heightmap, labels.txt), the labelme binary is
+available in the `annotate` conda env, key Python packages import, and
+output directories can be created.
 
-Checks:
-- All required files exist (scene, heightmap, labels.txt)
-- Labelme binary is available in annotate environment
-- Key Python packages are importable
-- Output directories can be created
+Usage:
+    python scripts/vlm_nav_tests/verify_vlm_nav_setup.py
 """
 
 import os

@@ -1,9 +1,10 @@
-"""
-Interactive frame capture + labelme annotation handoff for VLM navigation.
+"""Interactive frame capture + labelme annotation handoff for VLM navigation:
+loads the marsyard2022 scene from vlm_nav_demo.py's config, captures a frame
+on spacebar, hands it to labelme for annotation, and validates the resulting
+annotation JSON for structural correctness.
 
-Loads the marsyard2022 scene from vlm_nav_demo.py configuration.
-Allows manual frame capture via spacebar and immediate annotation via labelme.
-Validates annotation JSON output for structural correctness.
+Usage:
+    python scripts/vlm_nav_tests/vlm_nav_interactive.py
 """
 
 import os

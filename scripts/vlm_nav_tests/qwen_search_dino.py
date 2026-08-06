@@ -1,54 +1,17 @@
-"""qwen_search_rollout_mars_dino.py - manual left/right/straight/back search via ghost mask,
-auto-handoff to the REAL goal once GroundingDINO visually confirms it.
+"""Same manual search-and-handoff as qwen_search_rollout.py, but `found` only
+flips True once GroundingDINO visually confirms a "flag"-labeled box near the
+geometrically-projected goal pixel -- the policy then centers on what DINO
+actually saw, not the privileged world-point projection. Also supports
+--belief-adapter (ported from rollout_navdp_policy.py): once DINO has ever
+confirmed the goal, a body-frame belief estimate is seeded on confirmation
+ticks and dead-reckoned every tick after, so the policy steers back toward
+the last confirmed sighting instead of falling back to manual search whenever
+DINO loses it. Without --belief-adapter, behavior is identical to
+qwen_search_rollout.py whenever DINO hasn't confirmed.
 
-DIFFERENCE FROM qwen_search_rollout_mars.py:
-    That script's `found` flag is computed purely from known-world-point geometry
-    (project_goal_mask against the true flag position -- frustum + occlusion by
-    depth, but no actual pixel recognition). This script adds a GroundingDINO
-    confirmation step: the geometric check still runs first (it's free and tells
-    you frustum/range/occlusion), but `found` only flips True once GroundingDINO
-    ALSO detects a "flag"-labeled box in the RGB frame whose centroid lands near
-    the geometrically-projected pixel. On a confirmed hit, the rendered goal mask
-    is centered on DINO's box centroid (what was actually SEEN) rather than the
-    geometric projection (what is KNOWN) -- the policy is conditioned on
-    perception, not privileged coordinates.
-
-BELIEF-ADAPTER INTEGRATION (NEW):
-    Ported from rollout_navdp_policy_mars.py's --belief-adapter path. A body-frame
-    belief_g=[forward,left] estimate of the goal is:
-      - seeded/re-seeded ONLY on ticks where DINO actually confirms the flag this
-        tick (found=True, dino_ran=True, dino_u/v are real, not a held frame) via
-        pixel_to_body(dino_u, dino_v, depth, ...).
-      - propagated every tick via propagate_body_point(belief_g, action_3d, dt, ...)
-        once it exists, regardless of found/not-found, so it stays current.
-    Control-mode selection each tick:
-      - found=True                         -> FOUND behavior (unchanged): empty
-                                               goal-mask channel, drive toward the
-                                               confirmed goal via the policy as before.
-      - found=False AND belief_g is None   -> UNCHANGED manual/Qwen ghost-mask
-                                               search (goal has never been confirmed
-                                               yet; no belief to fall back on).
-      - found=False AND belief_g is not None -> BELIEF-RETURN: manual/Qwen commands
-                                               are IGNORED. The goal-mask channel is
-                                               blank (same as FOUND) and
-                                               belief_adapter(belief_feat(belief_g))
-                                               is passed as extra_cond_tokens to
-                                               model.sample, so the POLICY itself
-                                               steers back toward the last confirmed
-                                               sighting. This state persists for as
-                                               long as DINO stays unconfirmed -- no
-                                               timeout back to manual search, since
-                                               once real evidence exists we trust
-                                               dead-reckoning over blind search.
-    If --belief-adapter is not passed, belief_g is never created and behavior for
-    "found=False" is 100% identical to the pre-belief script (manual/Qwen search
-    for the entire run whenever DINO hasn't confirmed).
-
-Usage
------
-    python scripts/qwen_search_rollout_mars_dino.py \\
-      --navdp-root /path/to/navdp_sam \\
-      --ckpt /path/to/navdp_sam/runs/.../ckpt_last.pt \\
+Usage:
+    python scripts/vlm_nav_tests/qwen_search_dino.py \\
+      --navdp-root /path/to/navdp_sam --ckpt /path/to/navdp_sam/runs/.../ckpt_last.pt \\
       --scene marsyard2022_tri.glb --terrain-obj marsyard2022.obj --scene-height-flip-z \\
       --start-x 0 --start-z 8 --start-yaw-deg 0 \\
       --goal-out-of-view --goal-bearing-deg 180 --goal-range 8 \\

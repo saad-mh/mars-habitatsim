@@ -3,9 +3,9 @@ Measures per-call latency of the persistent Qwen VLM server.
 
 Usage:
   1. Start the server (in the qwen_vlm env):
-       conda activate qwen_vlm && python qwen_vlm_server.py
+       conda activate qwen_vlm && python scripts/vlm_nav_tests/qwen_vlm_server.py
   2. Run this script (stdlib only, any env):
-       python test_qwen_vlm_persistent.py --rgb vlm_nav_out/rgb_0000.png
+       python scripts/vlm_nav_tests/test_qwen_vlm_persistent.py --rgb vlm_nav_out/rgb_0000.png
 """
 
 import argparse

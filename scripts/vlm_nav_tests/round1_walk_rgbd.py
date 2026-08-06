@@ -1,3 +1,11 @@
+"""Earliest raw-habitat_sim walk/RGBD scratch script: registers built-in
+move/turn ActionSpecs and steps through a fixed action sequence, saving RGBD
+frames. Superseded by rgbd_test.py/rgbd_drive.py; kept for reference only.
+
+Usage:
+    python scripts/vlm_nav_tests/round1_walk_rgbd.py
+"""
+
 import os
 import numpy as np
 from pathlib import Path

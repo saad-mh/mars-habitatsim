@@ -14,6 +14,9 @@ Request:  {"cmd": "ping"}
        or {"cmd": "infer", "rgb": "<path>", "prompt": "<text>"}
 Response: {"ok": true, "text": "...", "latency_s": ...}
        or {"ok": false, "error": "..."}
+
+Usage:
+    conda run -n qwen_vlm python scripts/vlm_nav_tests/qwen_vlm_server.py [--host 127.0.0.1] [--port <port>]
 """
 
 import argparse
