@@ -14,72 +14,9 @@ python rollout_navdp_policy.py \
   --clearance 0.9 --pose-terrain-radius 1.2 \
   --max-steps 400 --stop-dist 1.2 --save-video --out mars_full_system
 
-  goal matlab?
-
-  we want to reach the goal? 
-  but our current model needs image mask for it to reach, whem i used ghost it was more like (earlier) i couldnt steer my policy using DP but now i commandbut the overall agenda is SEE-> GO 
-  MISS -> REMEMBER -> GO
-  BUT SEE FIRST FRAME
-  When it sees first frame, then it remembers ok its here then maybe at frame n because of obstacle avoidance it will go beyond the fov then i will have a 
-  "belief" that it was there then my policy will resteer it back
-
-
 
 numbers: generated 2304 images in 2m 21.7s 
 
-[input] classes: ['background', 'small_rock', 'big_rock', 'bedrock', 'hole_in_ground'] (5)
-[input] train: 2074 frames, val: 230 frames
-[config] encoder_mode=lora, trainable params: 2,291,869 / 214,995,149 (1.07%)
-/home/gpu/Desktop/pineapple/mars-habitatsim/sam_vla/perception/finetune_sam2_lora.py:693: RuntimeWarning: Mean of empty slice
-  np.nanmean(per_class_arr, axis=0).tolist()
-[15:38:12]][ninni tem] epoch 1/20 train_loss=1.6225 val_loss=0.9769 val_mIoU=0.5000
-[15:38:12]][ninni tem] saved new best (val_mIoU=0.5000) -> sam_lora_runs/exp4/best
-[15:40:47]][ninni tem] epoch 2/20 train_loss=0.8604 val_loss=0.8305 val_mIoU=0.5000
-[15:43:22]][ninni tem] epoch 3/20 train_loss=0.8206 val_loss=0.8155 val_mIoU=0.5000
-[15:45:57]][ninni tem] epoch 4/20 train_loss=0.8126 val_loss=0.8104 val_mIoU=0.5000
-[15:48:32]][ninni tem] epoch 5/20 train_loss=0.8088 val_loss=0.8077 val_mIoU=0.5000
-[15:51:07]][ninni tem] epoch 6/20 train_loss=0.8068 val_loss=0.8060 val_mIoU=0.5000
-[15:53:42]][ninni tem] epoch 7/20 train_loss=0.8054 val_loss=0.8050 val_mIoU=0.5000
-[15:56:18]][ninni tem] epoch 8/20 train_loss=0.8045 val_loss=0.8040 val_mIoU=0.5000
-[15:58:53]][ninni tem] epoch 9/20 train_loss=0.8037 val_loss=0.8034 val_mIoU=0.5000
-[16:01:28]][ninni tem] epoch 10/20 train_loss=0.8030 val_loss=0.8027 val_mIoU=0.5000
-[16:04:03]][ninni tem] epoch 11/20 train_loss=0.8024 val_loss=0.8022 val_mIoU=0.5000
-[16:06:39]][ninni tem] epoch 12/20 train_loss=0.8019 val_loss=0.8016 val_mIoU=0.5000
-[16:09:14]][ninni tem] epoch 13/20 train_loss=0.8013 val_loss=0.8010 val_mIoU=0.5044
-[16:09:15]][ninni tem] saved new best (val_mIoU=0.5044) -> sam_lora_runs/exp4/best
-[16:11:49]][ninni tem] epoch 14/20 train_loss=0.8006 val_loss=0.8004 val_mIoU=0.5184
-[16:11:50]][ninni tem] saved new best (val_mIoU=0.5184) -> sam_lora_runs/exp4/best
-[16:14:25]][ninni tem] epoch 15/20 train_loss=0.7998 val_loss=0.7993 val_mIoU=0.5260
-[16:14:26]][ninni tem] saved new best (val_mIoU=0.5260) -> sam_lora_runs/exp4/best
-[16:17:01]][ninni tem] epoch 16/20 train_loss=0.7983 val_loss=0.7975 val_mIoU=0.5231
-[16:19:36]][ninni tem] epoch 17/20 train_loss=0.7952 val_loss=0.7942 val_mIoU=0.5239
-[16:22:11]][ninni tem] epoch 18/20 train_loss=0.7903 val_loss=0.7904 val_mIoU=0.5254
-[16:24:47]][ninni tem] epoch 19/20 train_loss=0.7831 val_loss=0.7859 val_mIoU=0.5264
-[16:24:48]][ninni tem] saved new best (val_mIoU=0.5264) -> sam_lora_runs/exp4/best
-[16:27:23]][ninni tem] epoch 20/20 train_loss=0.7769 val_loss=0.7861 val_mIoU=0.5234
-[16:27:24]][wakeup tem] done. best val_mIoU=0.5264, final checkpoint -> sam_lora_runs/exp4/final
-training took 3116.78 seconds
-
-[eval] confusion matrix on validation set (230 frames):
-                  background  small_rock    big_rock     bedrock  hole_in_gr
-background       241,147,668           0      10,926           0           0
-small_rock                 0           0           0           0           0
-big_rock              12,615           0       1,271           0           0
-bedrock                    0           0           0           0           0
-hole_in_ground             0           0           0           0           0
-[eval] overall pixel accuracy (val set): 0.9999
-
-[eval] pixel accuracy on 10 random image(s) from the dataset:
-    idx=   550  accuracy=0.9998
-    idx=   258  accuracy=1.0000
-    idx=  1044  accuracy=1.0000
-    idx=   482  accuracy=1.0000
-    idx=  2029  accuracy=1.0000
-    idx=  1841  accuracy=1.0000
-    idx=  1934  accuracy=1.0000
-    idx=  1554  accuracy=1.0000
-    idx=   859  accuracy=1.0000
-    idx=   384  accuracy=0.9998
 [eval] mean accuracy over 10 random image(s): 0.9999
 
 
