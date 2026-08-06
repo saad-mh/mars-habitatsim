@@ -166,20 +166,60 @@ specific to this entry point:
 change — only unit/orchestration tests above): a real `--uncertainty-condition human` rollout still needs
 a live `qwen_vlm` server, a display for the Tk popup, and a real `--ckpt`/`--scene-path` to actually try.
 
-### Phase 3 — Condition B (autonomous baseline) + paired runs
+### Phase 3 — Condition B (autonomous baseline) + paired runs — DONE
 
-- Same trigger, but the handler is a no-op besides logging `uncertainty_trigger` (per "what Condition B
-  means" above) — policy keeps acting on its own belief-conditioned state uninterrupted.
-- Run both conditions over the same seed/episode set (same start pose, same goal, same scene) so trigger
-  instances line up 1:1 for the subtraction described above.
+- Condition B's "no-op besides logging" behavior needed no new code: it's exactly what Phase 0/2 already
+  built for `--uncertainty-condition autonomous` (the default) — `human_handoff_enabled` is `False`, so
+  `_run_uncertainty_handoff` is never called and the `uncertainty_trigger` event is logged with
+  `attempt=0`, `resolved=None`, every timing bucket `None` ([run_navdp_rollout.py:1005-1063](sam_vla/run_navdp_rollout.py:1005)).
+  What was actually missing was the paired-run harness.
+- New [`sam_vla/study1_paired_runs.py`](sam_vla/study1_paired_runs.py): given a JSON list of episodes
+  (`{"id", "start_x", "start_z", "start_yaw"}`), runs `sam_vla.run_navdp_rollout` as a subprocess once per
+  `(episode, condition)` pair — same shape as
+  [`sam_vla/perception/run_dataset_pipeline.py`](sam_vla/perception/run_dataset_pipeline.py)'s
+  subprocess-per-stage pattern, and the same thing a human would do by hand running the CLI twice (as the
+  Integration project's own Phase 4 comparison run literally did). Everything after `--` is forwarded
+  verbatim to both conditions of every episode (scene/heightmap/ckpt/CBF/`--uncertainty-threshold`/etc);
+  the driver itself owns `--start-x`/`--start-z`/`--start-yaw`/`--uncertainty-condition`/`--out-dir` per
+  pair and raises if the forwarded args try to also set any of those (ambiguous, not silently overridden).
+  Writes `pairs_manifest.json` (episode → `{condition: {out_dir, cmd, returncode}}`) incrementally after
+  each pair, so a partial/interrupted batch is still analyzable. `--keep-going` continues past a failed
+  pair instead of stopping; `--dry-run` prints commands without running them. Unit-tested (command
+  construction, forwarded-arg validation, manifest bookkeeping, stop-on-failure vs `--keep-going`,
+  `--dry-run`) against a mocked `subprocess.run` in
+  [`sam_vla/tests/test_study1_paired_runs.py`](sam_vla/tests/test_study1_paired_runs.py) — no real
+  rollout, sim, or subprocess.
+- **Not yet exercised end-to-end against the real sim** (same caveat as Phase 2): no GPU/display batch run
+  performed as part of this change, only the mocked orchestration tests above.
 
-### Phase 4 — analysis
+### Phase 4 — analysis — DONE
 
-- Per-episode: `time_to_goal`, `success`, `n_uncertainty_triggers`, `sum(human_decision_ms)`,
-  `sum(drive_ms)`, `model_load_ms`, derived `vlm_and_driving_only_time`.
-- Compare Condition A's derived time and success rate against Condition B's raw time and success rate —
-  this is the actual ablation result (does human intervention win once its own decision latency is
-  factored out, or does it still lose because rotate+ask+drive is fundamentally slower per trigger?).
+New [`sam_vla/study1_analysis.py`](sam_vla/study1_analysis.py), consuming `pairs_manifest.json` from
+Phase 3:
+
+- Per `(episode, condition)` leg: `total_episode_time_s` (first logged step's timestamp to the last —
+  deliberately *not* `manifest["start_time"]`, which is set before scene/policy loading; that setup cost
+  is common to both conditions and isn't one of the four Phase 0 buckets, so including it would just add
+  a shared offset to both sides without changing the comparison), `success` (not logged anywhere today,
+  since the single-goal loop has no goal-reached break — derived here as "`distance_to_goal` in
+  `rollout.npz` came within `--success-radius` at some point"), `n_uncertainty_triggers`, and
+  `sum(vlm_inference_ms)`/`sum(human_decision_ms)`/`sum(drive_ms)`/`model_load_ms` aggregated across that
+  episode's `uncertainty_event` log entries.
+- `vlm_and_driving_only_time_s = total_episode_time_s - sum(human_decision_ms)/1000 - model_load_ms/1000`,
+  computed for the `human` leg only (exactly the arithmetic this section originally specified) — `None`
+  for the `autonomous` leg, which is already directly comparable as-is.
+- `summarize()` pairs episodes that have both legs present (skipping any episode missing one side, e.g.
+  from a failed run) and reports Condition A's mean derived time / success rate against Condition B's mean
+  raw time / success rate, plus a per-episode A-faster-than-B count — the actual ablation result. `--out-csv`
+  writes the full per-leg table (default `<pairs_manifest's dir>/analysis.csv`).
+- Unit-tested (timing extraction, success derivation incl. the all-NaN-distance edge case, event
+  aggregation, the derived-time arithmetic, skip-on-failed/missing leg, paired summarization, CSV
+  round-trip) against synthetic `manifest.json`/`rollout.npz` fixtures in
+  [`sam_vla/tests/test_study1_analysis.py`](sam_vla/tests/test_study1_analysis.py) — no real rollout data
+  needed.
+- **Not yet run against real data**: no paired batch has actually been executed against the sim yet (Phase
+  3's own caveat), so this hasn't been validated against a real `pairs_manifest.json`, only synthetic
+  fixtures shaped like one.
 
 ## Non-goals
 
