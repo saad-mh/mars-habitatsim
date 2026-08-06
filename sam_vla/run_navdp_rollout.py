@@ -29,6 +29,7 @@ from sam_vla.env.sim_utils import distance_to_goal
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
 from sam_vla.goal_resolution import first_frame_resolver
 from sam_vla.policy.navdp_policy import NavdpPolicy
+from sam_vla.policy.navdp_upstream_policy import NavdpUpstreamPolicy
 from sam_vla.safety.safety_filter import filter as safety_filter_fn
 from sam_vla.safety.cbf_avoidance import CbfObstacleAvoidance
 from sam_vla.core.belief_tracking import (
@@ -447,12 +448,36 @@ def run(
     uncertainty_sweep_steps: int = 8,
     uncertainty_drive_v_fwd: float = 0.5,
     uncertainty_mock_client: bool = False,
+    policy_backend: str = "navdp-s2dit",
+    navdp_upstream_ckpt: str = None,
+    navdp_upstream_root: str = None,
+    navdp_upstream_port: int = None,
+    navdp_upstream_stop_threshold: float = 0.0,
+    navdp_upstream_lookahead: int = 3,
+    navdp_upstream_replan_every: int = 1,
+    navdp_upstream_max_forward_speed: float = 1.0,
+    navdp_upstream_turn_kp: float = 1.4,
+    navdp_upstream_request_timeout: float = 30.0,
 ) -> None:
     if base_station and multi_goal:
         raise ValueError(
             "--base-station and --multi-goal are mutually exclusive -- they solve "
             "different problems, see next.md §1"
         )
+    if policy_backend not in ("navdp-s2dit", "navdp-upstream"):
+        raise ValueError(
+            f"--policy-backend must be 'navdp-s2dit' or 'navdp-upstream', got {policy_backend!r}"
+        )
+    if policy_backend == "navdp-upstream":
+        if not navdp_upstream_ckpt:
+            raise ValueError("--navdp-upstream-ckpt is required with --policy-backend navdp-upstream")
+        if multi_goal or base_station:
+            raise ValueError(
+                "--policy-backend navdp-upstream only supports the single-goal path today "
+                "-- see next.md's Integration project non-goals"
+            )
+    elif not ckpt_path:
+        raise ValueError("--ckpt is required with --policy-backend navdp-s2dit")
     # Both --multi-goal and --base-station need `from navdp.extensions import ...`
     # before NavdpPolicy is constructed below (that's normally what puts navdp_root
     # on sys.path, via its own _add_navdp_to_path call) -- do it here first so those
@@ -660,15 +685,34 @@ def run(
                 env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir
             )
 
-        # <-- policy plugged in here: NavdpPolicy replaces QwenDiscreteDirectionPolicy.
-        # Same act_verbose(..., goal_spec, step) -> (Action, dict) shape as the VLA
-        # policy it swaps out; see the loop below for the call site.
-        policy = NavdpPolicy(
-            ckpt_path=ckpt_path,
-            navdp_root=navdp_root,
-            device=device,
-            sample_steps=sample_steps,
-        )
+        # <-- policy plugged in here. --policy-backend selects between NavdpPolicy
+        # (this repo's own S2DiT/VL3-DP model, default, unchanged behavior) and
+        # NavdpUpstreamPolicy (the real published NavDP via its HTTP server, see
+        # next.md's "Integration project" section) -- both share the same
+        # act_verbose(obs, semantic, goal_spec, step) -> (Action, dict) shape, so
+        # the loop below needs no branching beyond this construction.
+        if policy_backend == "navdp-upstream":
+            policy = NavdpUpstreamPolicy(
+                checkpoint_path=navdp_upstream_ckpt,
+                navdp_upstream_root=navdp_upstream_root,
+                port=navdp_upstream_port,
+                stop_threshold=navdp_upstream_stop_threshold,
+                image_hw=obs0.rgb.shape[:2],
+                hfov_deg=HFOV_DEG,
+                lookahead=navdp_upstream_lookahead,
+                replan_every=navdp_upstream_replan_every,
+                max_forward_speed=navdp_upstream_max_forward_speed,
+                turn_kp=navdp_upstream_turn_kp,
+                max_yaw_rate=max_yaw_rate,
+                request_timeout=navdp_upstream_request_timeout,
+            )
+        else:
+            policy = NavdpPolicy(
+                ckpt_path=ckpt_path,
+                navdp_root=navdp_root,
+                device=device,
+                sample_steps=sample_steps,
+            )
 
         # Belief-goal tracking: re-seed a body-frame [forward, left] estimate of the
         # goal from the live rendered mask whenever it's visible, dead-reckon it by
@@ -844,6 +888,19 @@ def run(
             else:
                 semantic_render = semantic
                 goal_spec_for_policy = goal_spec
+                if policy_backend == "navdp-upstream":
+                    # NavdpUpstreamPolicy needs this step's body-frame goal point
+                    # *before* act_verbose() (it's the request payload, not
+                    # something derived after the fact like NavdpPolicy's mask
+                    # conditioning is) -- prime belief_tracker from this step's
+                    # fresh mask now; the unconditional belief_tracker.observe()
+                    # call below (after act_verbose) re-runs on the same
+                    # mask/depth and is a harmless no-op repeat for this backend.
+                    pregoal_mask = (semantic == MESH_GOAL_ID).astype("uint8") * 255
+                    belief_tracker.observe(pregoal_mask, obs.depth)
+                    if belief_tracker.belief_g is not None:
+                        goal_forward, goal_left = belief_tracker.belief_g
+                        policy.set_goal_body(goal_forward, goal_left)
 
             if base_station and phase == "DWELL" and not just_entered_dwell:
                 # Hold position -- skip the policy/CBF call entirely (next.md §4) but
@@ -1119,6 +1176,8 @@ def run(
                 f"[CBF diag] blocked_steps={cbf_active_steps} hard_gate_fired={hard_gate_fired_steps}",
                 flush=True,
             )
+        if policy_backend == "navdp-upstream":
+            policy.stop()
         logger.flush(out_dir)
         if save_frames:
             logger.save_frames(out_dir)
@@ -1133,7 +1192,9 @@ if __name__ == "__main__":
     parser.add_argument("--scene-path", required=True)
     parser.add_argument("--heightmap-path", required=True)
     parser.add_argument(
-        "--ckpt", required=True, help="Path to trained NavDP/S2DiT checkpoint"
+        "--ckpt",
+        default=None,
+        help="Path to trained NavDP/S2DiT checkpoint (required unless --policy-backend navdp-upstream)",
     )
     parser.add_argument(
         "--navdp-root",
@@ -1142,6 +1203,36 @@ if __name__ == "__main__":
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--sample-steps", type=int, default=20)
+    parser.add_argument(
+        "--policy-backend",
+        choices=["navdp-s2dit", "navdp-upstream"],
+        default="navdp-s2dit",
+        help=(
+            "navdp-s2dit (default): this repo's own in-house S2DiT/VL3-DP model "
+            "via NavdpPolicy, unchanged. navdp-upstream: the real published NavDP "
+            "(Cai et al., arXiv 2505.08712) via its HTTP server -- see next.md's "
+            "'Integration project' section. Requires a vendored InternRobotics/NavDP "
+            "checkout and a gated checkpoint (Google Form on their repo); only "
+            "supports the single-goal path (no --multi-goal/--base-station)."
+        ),
+    )
+    parser.add_argument(
+        "--navdp-upstream-ckpt",
+        default=None,
+        help="Path to the upstream NavDP .ckpt (required with --policy-backend navdp-upstream)",
+    )
+    parser.add_argument(
+        "--navdp-upstream-root",
+        default=None,
+        help="Path to the vendored InternRobotics/NavDP checkout (default: $NAVDP_UPSTREAM_ROOT)",
+    )
+    parser.add_argument("--navdp-upstream-port", type=int, default=None)
+    parser.add_argument("--navdp-upstream-stop-threshold", type=float, default=0.0)
+    parser.add_argument("--navdp-upstream-lookahead", type=int, default=3)
+    parser.add_argument("--navdp-upstream-replan-every", type=int, default=1)
+    parser.add_argument("--navdp-upstream-max-forward-speed", type=float, default=1.0)
+    parser.add_argument("--navdp-upstream-turn-kp", type=float, default=1.4)
+    parser.add_argument("--navdp-upstream-request-timeout", type=float, default=30.0)
     parser.add_argument(
         "--out-dir",
         default=f"navdp_rollout{datetime.datetime.now().strftime('%d%m%y%H%M')}",
@@ -1492,4 +1583,14 @@ if __name__ == "__main__":
         uncertainty_sweep_steps=args.uncertainty_sweep_steps,
         uncertainty_drive_v_fwd=args.uncertainty_drive_v_fwd,
         uncertainty_mock_client=args.uncertainty_mock_client,
+        policy_backend=args.policy_backend,
+        navdp_upstream_ckpt=args.navdp_upstream_ckpt,
+        navdp_upstream_root=args.navdp_upstream_root,
+        navdp_upstream_port=args.navdp_upstream_port,
+        navdp_upstream_stop_threshold=args.navdp_upstream_stop_threshold,
+        navdp_upstream_lookahead=args.navdp_upstream_lookahead,
+        navdp_upstream_replan_every=args.navdp_upstream_replan_every,
+        navdp_upstream_max_forward_speed=args.navdp_upstream_max_forward_speed,
+        navdp_upstream_turn_kp=args.navdp_upstream_turn_kp,
+        navdp_upstream_request_timeout=args.navdp_upstream_request_timeout,
     )

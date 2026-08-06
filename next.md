@@ -405,74 +405,113 @@ under this repo's `navdp/`.
 
 ## Phased plan
 
-### Phase 0 — checkpoint + environment (manual, blocking, do first)
+### Phase 0 — checkpoint + environment (manual, blocking, do first) — NOT DONE (needs a human)
 
-- A human fills out the upstream repo's Google Form and downloads a `.ckpt`; store it outside git (this
-  repo has no LFS/checkpoint-storage convention today — follow whatever the existing `--ckpt`/`sam_lora_runs`
-  precedent implies, i.e. a path passed via flag, never committed).
-- `conda create -n navdp python=3.10 && pip install -r requirements.txt` from the upstream repo, added as a
-  new row in this project's env table (CLAUDE.md) once it's confirmed working — don't skip verifying the
-  server actually boots and answers `/navigator_reset` before moving to Phase 1.
-- Vendor (git-clone, not copy-paste) `InternRobotics/NavDP` alongside this repo's own `navdp/` — e.g.
-  `navdp_upstream/` at the repo root — keeping the same "external, read-from dependency, never modified"
-  discipline this repo already applies to `navdp/` per `belief_exp/README.md`'s convention. Pin the commit
-  SHA in whatever notes/README this integration ends up documented in.
+Still blocking, and cannot be done by an agent: the checkpoint download is gated behind a Google Form, and
+`conda create -n navdp ...` + vendoring the upstream checkout are real environment/network side effects that
+weren't taken as part of writing Phases 1-3's code below. Phases 1-3 are implemented and unit-tested against
+mocks (no live server, no real checkpoint) so they're ready to run as soon as a human does this:
 
-### Phase 1 — server manager
+- Fill out the upstream repo's Google Form and download a `.ckpt`; pass it via `--navdp-upstream-ckpt`
+  (never committed — same convention as `--ckpt`/`sam_lora_runs`).
+- `conda create -n navdp python=3.10 && pip install -r requirements.txt` from the vendored checkout (see
+  below); add a row to CLAUDE.md's env table once confirmed working.
+- `git clone https://github.com/InternRobotics/NavDP` (default branch `master`) somewhere outside this
+  repo's git history, and either pass its path via `--navdp-upstream-root` or set `$NAVDP_UPSTREAM_ROOT`.
+  Confirmed via the actual source (fetched 2026-08-06, `baselines/navdp/navdp_server.py` +
+  `policy_agent.py` + `policy_network.py`) that nothing under `baselines/navdp/` needs patching to be
+  spawned as a subprocess this way.
 
-New `sam_vla/vlm/navdp_upstream_server_manager.py` (naming to match `qwen_server_manager.py`'s convention,
-even though it lives in `vlm/` for historical reasons — or a new `sam_vla/policy/navdp_upstream/` subpackage
-if that grouping reads better once written), modeled on `QwenServerManager`:
-- Resolve the `navdp` conda env's python, spawn `navdp_server.py --port <p> --checkpoint <path>` as a
-  subprocess (`cwd` pointed at the vendored `navdp_upstream/baselines/navdp/` — the server imports
-  `policy_agent`/`policy_network` by bare module name, so it needs to run from that directory or have it on
-  `PYTHONPATH`).
-- Health-check loop calling `/navigator_reset` with a real `intrinsic`/`stop_threshold`/`batch_size=1`
-  payload (there's no cheaper ping route upstream) until it returns `{"algo": "navdp"}`; capture
-  `model_load_ms` the same way Study 1's Phase 0 already does for the other two server managers, for
-  consistency if these ever get compared.
-- `stop()`/process cleanup mirroring `QwenServerManager`'s.
+### Phase 1 — server manager — DONE
 
-### Phase 2 — HTTP client + waypoint-to-velocity conversion
+[`sam_vla/vlm/navdp_upstream_server_manager.py`](sam_vla/vlm/navdp_upstream_server_manager.py)'s
+`NavdpUpstreamServerManager`, modeled on `QwenServerManager`'s spawn/poll/`load_ms` shape (`start()`/`stop()`,
+registerable with `ServiceRegistry`). Two deviations from the original plan, both discovered by actually
+reading `navdp_server.py` rather than guessing:
 
-New pure-ish module (no torch import, so it can run in `habitat`) alongside `sam_vla/policy/navdp_policy.py`
-— e.g. `sam_vla/policy/navdp_upstream_client.py`:
-- `pointgoal_step(base_url, rgb, depth_m, goal_forward, goal_left) -> (trajectory_xy, all_values)` — port
-  `client_utils.py:pointgoal_step`'s exact encoding (JPEG RGB, `depth_m*10000` clipped uint16 PNG,
-  `goal_data` JSON) via `requests`, called with `belief_tracker.belief_g` unpacked as `(goal_forward,
-  goal_left)`.
-- A waypoint tracker converting the returned `[predict_size, 2]` body-frame xy chunk into one `Action` per
-  call to `act_verbose` (matching every other policy's per-step-one-action contract): pick a lookahead point
-  N waypoints ahead (small N, tune empirically — this is exactly the same "steer toward a point" problem
-  `sam_vla/core/uncertainty_motion.py`'s `yaw_rate_toward_heading` already solves for Study 1's Phase 1, so
-  reuse it: `target_yaw = atan2(waypoint_left, waypoint_forward)` relative to current heading, steer with
-  `yaw_rate_toward_heading`, set `v_fwd` from distance-to-waypoint clamped to `max_forward_speed`). Re-plan
-  (new server call) either every step or every `replan_every` steps, mirroring `NavdpPolicy`'s own
-  `replan_every`/`_last_pred_chunk` caching so the two policies are comparably chatty with their model.
+- **`start()` is two-phase**, not a single poll loop against `/navigator_reset`: Flask's dev server here has
+  no `threaded=True`, so it handles one request at a time, and the first `/navigator_reset` after boot also
+  lazily loads the checkpoint onto the GPU (slow). Repeatedly firing short-timeout reset calls to "poll"
+  would strand several of them queued behind the one that's actually loading the model, each needlessly
+  reopening the server's per-reset mp4 debug writer. Instead: poll a raw TCP connect (cheap, confirms Flask
+  itself is up) in a loop, then make exactly **one** real `/navigator_reset` call with a long timeout once
+  the port is open — that call doubles as both the health check and the episode's real reset (a fresh
+  manager is constructed per rollout episode), so nothing calls reset twice.
+- **`intrinsic` must be a 3×3 matrix** (`[[fx,0,cx],[0,fy,cy],[0,0,1]]`), not a 4-element list —
+  confirmed from `policy_agent.py`'s `NavDP_Agent`, which indexes it `intrinsic[1][1]`/`[1][2]`/`[0][0]`/
+  `[0][2]`. Also reconfirmed here directly from source: it's used only by `project_trajectory`'s debug-video
+  overlay, never by the policy/critic networks, matching this plan's original open question's answer.
 
-### Phase 3 — policy class + wiring
+Default port `8766` (distinct from `QWEN_SERVER_PORT=8765`). `NAVDP_UPSTREAM_PYTHON`/`NAVDP_UPSTREAM_ROOT`
+env vars mirror the `QWEN_VLM_PYTHON`/`NAVDP_ROOT` overrides elsewhere. Unit-tested against mocked
+`subprocess.Popen`/socket/HTTP calls in
+[`sam_vla/tests/test_navdp_upstream_server_manager.py`](sam_vla/tests/test_navdp_upstream_server_manager.py)
+— no real subprocess, checkpoint, or vendored checkout needed for these to pass.
 
-New `NavdpUpstreamPolicy` in `sam_vla/policy/navdp_upstream_policy.py`, implementing the same
-`act_verbose(obs, semantic, goal_spec, step) -> (Action, dict)` shape as `NavdpPolicy`
-([navdp_policy.py:169](sam_vla/policy/navdp_policy.py:169)), internally owning a
-`NavdpUpstreamServerManager` (started once, e.g. lazily on first `act_verbose` call or explicitly before the
-rollout loop starts) and calling the Phase 2 client each step.
+### Phase 2 — HTTP client + waypoint-to-velocity conversion — DONE
 
-Wire it into `run_navdp_rollout.py` as an **additive** choice, not a replacement — add a
-`--policy-backend {navdp-s2dit,navdp-upstream}` flag (default `navdp-s2dit`, preserving today's behavior
-exactly) selecting which policy class gets constructed at the existing `run_navdp_rollout.py:454` call site.
-Do not remove or rename `NavdpPolicy` — both should be selectable so they can be compared.
+[`sam_vla/policy/navdp_upstream_client.py`](sam_vla/policy/navdp_upstream_client.py), pure module (no torch,
+runs in `habitat`). The wire format was read directly from upstream source rather than ported from a
+`client_utils.py` (that file doesn't exist in the current checkout — the plan's reference to it was wrong;
+`navdp_server.py`'s Flask routes are the actual and only spec):
 
-### Phase 4 — smoke test + comparison run
+- `pointgoal_step(base_url, rgb, depth_m, goal_forward, goal_left) -> (trajectory_xy, all_values)` — multipart
+  POST: `image` (JPEG), `depth` (16-bit PNG, `depth_m * 10000` clipped to `[0, 65535]` — confirmed exact),
+  `goal_data` as a JSON-encoded **form field** (not a file), `{"goal_x": [...], "goal_y": [...]}`.
+  `goal_forward` clamped to `[0, 10]`, `goal_left` to `[-10, 10]` (matches `process_pointgoal`).
+- **Correction to the original plan**: the response `trajectory` is **not** `[predict_size, 2]` deltas — it's
+  `[predict_size, 3]`, and confirmed from `policy_network.py`'s `predict_pointgoal_action`
+  (`all_trajectory = torch.cumsum(naction / 4.0, dim=1)`) that each waypoint is a **cumulative** body-frame
+  position at request time (column 2 unused here), not a per-step delta. `pointgoal_step` drops the trajectory
+  down to the `[predict_size, 2]` `(forward, left)` columns before returning.
+- `select_action_from_trajectory(trajectory_xy, waypoint_index, ...) -> Action` is the waypoint tracker: picks
+  `trajectory_xy[waypoint_index]`, steers via `yaw_rate_toward_heading(0.0, atan2(left, forward), ...)`
+  (reusing Study 1's Phase 1 primitive exactly as planned, with `current_yaw=0` since the target is already
+  body-frame), `v_fwd` = distance to that waypoint clamped to `max_forward_speed`. `waypoint_index` is clamped
+  into range so callers can pass an ever-growing `steps_since_replan + lookahead` without bounds-checking.
+  Unit-tested (encoding round-trips, request/response shape, steering sign, index/speed clamping) in
+  [`sam_vla/tests/test_navdp_upstream_client.py`](sam_vla/tests/test_navdp_upstream_client.py).
 
-- A `sam_vla/policy/navdp_upstream_policy.py`-level `if __name__ == "__main__":` smoke test mirroring
-  `navdp_policy.py`'s own (load a checkpoint, run one `act_verbose` call against a synthetic/first-real-frame
-  observation, print the action) before trusting it inside a full rollout — this repo's "Known issues"
-  section exists precisely because untested pipeline changes have burned GPU-hours before.
-- One full `run_navdp_rollout.py --policy-backend navdp-upstream ...` episode against `marsyard2022`,
-  logged the same way as any other rollout (`RolloutLogger`), then a real side-by-side against
-  `--policy-backend navdp-s2dit` (or whatever the current default invocation in `usage` is) on the same
-  seed/goal for a first qualitative read before any larger sweep.
+### Phase 3 — policy class + wiring — DONE
+
+`NavdpUpstreamPolicy` in
+[`sam_vla/policy/navdp_upstream_policy.py`](sam_vla/policy/navdp_upstream_policy.py), same
+`act_verbose(obs, semantic, goal_spec, step) -> (Action, dict)` shape as `NavdpPolicy` — `semantic`/`goal_spec`
+accepted but unused. One deviation from the plan, necessary because that shared signature has no room for a
+per-step body-frame goal point: callers call `policy.set_goal_body(forward, left)` immediately before each
+`act_verbose()`, rather than changing the protocol itself. `replan_every`/lookahead caching mirrors
+`NavdpPolicy`'s own `replan_every` default (1). `start()` is idempotent and lazily called from the first
+`act_verbose()` if a caller didn't call it explicitly first. Unit-tested (replan cadence, lookahead indexing,
+goal-body forwarding, idempotent start, missing-depth error) in
+[`sam_vla/tests/test_navdp_upstream_policy.py`](sam_vla/tests/test_navdp_upstream_policy.py).
+
+Wired into `run_navdp_rollout.py` as an **additive** choice via `--policy-backend {navdp-s2dit,navdp-upstream}`
+(default `navdp-s2dit`, today's behavior unchanged byte-for-byte) plus `--navdp-upstream-*` flags for the
+checkpoint/root/port/lookahead/replan/speed/turn-kp/timeout. `NavdpPolicy` is untouched and still the default.
+`--ckpt` is no longer `required=True` at the CLI level (relaxed to optional + validated inside `run()`, since
+it's meaningless for the upstream backend); `run()` raises `ValueError` up front for: unknown
+`--policy-backend`, missing `--navdp-upstream-ckpt` when that backend is selected, missing `--ckpt` when it
+isn't, and `--policy-backend navdp-upstream` combined with `--multi-goal`/`--base-station` (out of scope for
+this first cut, per this plan's non-goals). In the single-goal loop, `belief_tracker.observe()` is called once
+extra, *before* `act_verbose()`, only when the upstream backend is active (`NavdpPolicy`'s path is untouched)
+so `set_goal_body()` gets this step's fresh estimate rather than last step's; the existing post-`act_verbose()`
+`observe()` call still runs too (harmless repeat for this one backend). `policy.stop()` is called after the
+step loop, gated the same way.
+
+### Phase 4 — smoke test + comparison run — PARTLY DONE
+
+- `if __name__ == "__main__":` smoke-test blocks exist in both
+  [`navdp_upstream_server_manager.py`](sam_vla/vlm/navdp_upstream_server_manager.py) and
+  [`navdp_upstream_policy.py`](sam_vla/policy/navdp_upstream_policy.py), mirroring `navdp_policy.py`'s own —
+  **not run against a real server**, since Phase 0 isn't done; they'll fail fast with `FileNotFoundError` from
+  `resolve_navdp_upstream_root` until a vendored checkout + checkpoint exist. All other testable logic (client
+  encoding, waypoint tracker, replan state machine, server-manager start/stop state machine, CLI validation)
+  is covered by the 17 new unit tests referenced above, run via
+  `/home/gpu/miniconda3/envs/habitat/bin/python -m pytest sam_vla/tests/test_navdp_upstream_*.py` (all passing,
+  plus the pre-existing 46 tests unaffected).
+- **Still needed, blocked on Phase 0**: one full `run_navdp_rollout.py --policy-backend navdp-upstream ...`
+  episode against `marsyard2022` with a real server + checkpoint, then a real side-by-side against
+  `--policy-backend navdp-s2dit` on the same seed/goal.
 
 ## Non-goals
 
