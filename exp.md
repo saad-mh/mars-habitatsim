@@ -1,5 +1,7 @@
 The Belief System in navdp/
-"Belief" here means a persistent, probabilistic estimate of where a navigation goal is, expressed in the robot's local body frame, that survives even when the goal is not currently visible. It's a classic Bayesian filter (mean + covariance) wrapped in machine-learning infrastructure so a diffusion policy can consume it as conditioning. Everything else in this system — occupancy forecasting, safety CBFs, route management, semantic priors, VLM grounding — is built to feed into or read out of this one belief representation.
+3. "This area is explored": in which case the agent should mark the area as explored and not return to it. The agent should move forward n+-variable units, turn left/right randomly, and repeat until the goal is found. The agent should also be able to backtrack if it hits a dead end or obstacle.
+
+During the previous steps, it is clear there is an underlying pattern the agent follows to explore the environment. In that case, keep the underlying exploration pattern as a function and repeat the exploration pattern until the goal is found. The agent should also be able to backtrack if it hits a dead end or obstacle. Based on the given prompt, let the VLM decide the exploration pattern and the agent should follow the exploration pattern until the goal is found. Give it functions to explore the environment, explore left/right, and mark areas as explored. The agent should be able to backtrack if it hits a dead end or obstacle. The exploration pattern should be determined by the VLM based on the current state of the environment and the goal location. navigation goal is, expressed in the robot's local body frame, that survives even when the goal is not currently visible. It's a classic Bayesian filter (mean + covariance) wrapped in machine-learning infrastructure so a diffusion policy can consume it as conditioning. Everything else in this system — occupancy forecasting, safety CBFs, route management, semantic priors, VLM grounding — is built to feed into or read out of this one belief representation.
 
 I'll go layer by layer: state → refinement → encoding → policy integration → runtime control → data/training.
 
@@ -721,3 +723,16 @@ Run it yourself with:
 conda run -n sam2 python belief_exp/inspect_one.py
 conda run -n sam2 python belief_exp/sweep.py --configs-n 200 --episodes-per-config 60
 (needs a torch-enabled env — sam2/sam3 — because navdp.extensions transitively imports torch; plain python3 won't have it. Details and full param/metric glossary are in belief_exp/README.md.)
+
+
+The exploration commands can be of X primary types:
+1. "Explore the area": in which case the agent should move around the environment to find the goal, or a suitable goal(as per the task requirements or passed in args). The agent should move forward n+-variable units, turn left/right randomly, and repeat until the goal is found. The agent should also be able to backtrack if it hits a dead end.
+2. "Explore the left/right": in which case the agent should turn left or right and explore that direction. The agent should move forward n+-variable units, turn left/right randomly, and repeat until the goal is found. The agent should also be able to backtrack if it hits a dead end.
+3. "This area is explored": the agent should stop at that point, not proceed further in the front direction, decide to turn left/right randomly and continue forward n+-variable units, and repeat until the goal is found. 
+
+During the previous steps, it is clear there is an underlying pattern the agent follows to explore the environment. In that case, keep the underlying exploration pattern as a function and repeat the exploration pattern until the goal is found. The agent should also be able to backtrack if it hits a dead end or obstacle. Based on the given prompt, let the VLM decide the exploration pattern and the agent should follow the exploration pattern until the goal is found. Give it functions to explore the environment, explore left/right, and mark areas as explored. The agent should be able to backtrack if it hits a dead end. The exploration pattern should be determined by the VLM based on the current state of the environment and the goal location. If an obstacle is found, cbf would be active.
+
+Apply the ghost mask implementation to show the direction to follow when cbf is active. In this case VLM outputs only left/right, so draw the mask using the following rules:
+1. If goal belief is exactly on the front/the goal is visible and exactly in the front, but the VLM CBF output is left, then draw the ghost mask on the extreme left side of the screen.
+2. If goal belief is exactly on the front/the goal is visible and exactly in the front, but the VLM CBF output is right, then draw the ghost mask on the extreme right side of the screen.
+3. If the goal belief is on either sides but the obstacle does not show on the screen, it means the obstacle is out of path, hence smoothly transition the goal mask to move to the side where the belief is. 
