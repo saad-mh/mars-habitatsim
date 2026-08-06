@@ -1,204 +1,274 @@
-# Belief-driven ghost mask (VLM exploration cue)
+# Two studies: human-in-the-loop uncertainty handoff, and real-world sensor-noise injection
 
-## Original ask (verbatim intent, for reference)
+## Status of the previous plan this file held
 
-1. Don't plug belief into NavDP/any policy directly. Instead plug it into a VLM/LM/Model,
-   which draws a translucent "ghost mask" — a circular patch, radius optionally proportional
-   to uncertainty — on the frame, given the belief, when the task is to explore. Non-destructive
-   to the underlying render; semi-transparent green.
-2. The policy stays belief-blind; belief only ever reaches it indirectly, through the VLM.
-   Clear separation of concerns between policy and belief-visualization.
-3. The ghost mask updates in real time as belief changes (grows/shrinks/moves as the agent
-   gathers more information).
-4. The policy keeps operating on its own internal state/decisions, taking the ghost mask as a
-   directional/visual cue — i.e. it's supposed to influence driving, eventually.
+This file previously documented the belief-driven ghost-mask feature. That plan's Phase 0 (belief
+growth + `sam_vla/core/ghost_mask.py`), Phase 1 (interactive verification in `kb_teleop_vl.py`), and
+the ghost-mask-mode addendum (VLM-placed circle, `vl_direction`'s fourth mode) are all implemented and
+merged. **Phase 2 (wiring the ghost mask into `sam_vla/run_navdp_rollout.py`'s real rollout loop) was
+never done** — `grep -n "ghost_mask" sam_vla/run_navdp_rollout.py` currently returns nothing. If that's
+still wanted, re-derive it from `git log -p -- next.md` (the plan text is intact in history) rather than
+from memory — don't re-plan it from scratch. This file now tracks two new, unrelated studies.
 
-## What "ghost mask" and "belief" resolve to in this codebase
+---
 
-Two readings were possible for "belief when the task is to explore." Given what already exists
-(below), the coherent one is: **this is the existing "lost-goal" ghost** — the goal is known but
-currently out of view, dead-reckoned by [`BeliefGoalTracker`](sam_vla/core/belief_tracking.py),
-and "explore" means "normal driving, not currently doing CBF obstacle-avoidance" (`vl_direction`
-already models exactly this binary: `"cbf"` vs `"exploration"` mode, see
-[kb_teleop_vl.py:328-333](kb_teleop_vl.py:328)). It is *not* a frontier/unknown-space belief —
-there's no such representation anywhere in this repo.
+# Study 1 — human-in-the-loop uncertainty handoff vs. autonomous driving (timing ablation)
 
-## Confirmed decisions (from planning discussion)
+## Research question
 
-- **Target surface, phased**: build the belief-growth + ghost-drawing logic as one shared,
-  policy-agnostic piece first; verify it interactively in
-  [kb_teleop_vl.py](kb_teleop_vl.py); then wire the same piece into the real rollout loop in
-  [sam_vla/run_navdp_rollout.py](sam_vla/run_navdp_rollout.py) as a follow-up phase. Do not
-  attempt both surfaces in one pass.
-- **Uncertainty source**: extend [`BeliefGoalTracker`](sam_vla/core/belief_tracking.py) with a
-  scalar `uncertainty` state, numpy-only (no `navdp.extensions`/torch dependency — keeps it
-  runnable in the `habitat` conda env that `kb_teleop_vl.py` and the sam_vla rollout scripts
-  already use). Growth is driven by **two configurable flags**, not a hardcoded constant:
-  - `odom_noise` — already an existing constructor param (currently only perturbs the
-    dead-reckoned point in `propagate_body_point`); reuse it as the per-step base growth of
-    `uncertainty` while the goal is unseen.
-  - a new `odom_noise_growth_rate` — how much faster `uncertainty` accumulates the longer the
-    goal stays unseen (an accelerating-drift term, e.g. `increment = odom_noise * (1 +
-    odom_noise_growth_rate * time_since_seen)` — exact formula is an implementation-time choice,
-    see Open Questions).
-  - On a fresh sighting (`observe()` returns `True`), reset `uncertainty` to a small floor
-    (mirrors `SubgoalBeliefBank`'s `sigma_visible` semantics in
-    [navdp/navdp/extensions/belief_bank.py](navdp/navdp/extensions/belief_bank.py) conceptually,
-    without importing it).
-  - The real `navdp.extensions.SubgoalBeliefBank` (real Kalman `Sigma`) stays available as a
-    heavier alternative later if the numpy approximation proves insufficient, but is explicitly
-    out of scope for this pass — it only runs in the `sam2`/`sam3` conda envs, not `habitat`.
-- **Action coupling**: **advisory-only**. The VLM's returned `Direction` (LEFT/RIGHT/FRONT/BACK)
-  is rendered on-screen and logged, exactly like `kb_teleop_vl.py` already does for its
-  cbf/exploration calls today (`_vl_worker` only ever prints `result.direction`, never touches
-  an `Action`). No `Action`, `NavigationPolicy`, or `CbfObstacleAvoidance` code changes in this
-  pass. Point 4's "influence driving" is deferred to a later, separately-scoped change once the
-  visualization itself is validated.
+When the rover's goal-belief uncertainty crosses a threshold, does handing control to a human (stop,
+rotate, let the human pick a heading, drive N units, repeat if still lost) reach the goal faster/more
+reliably than letting the VLM/policy keep driving through the uncertainty on its own belief (mu +
+covariance)? The ablation must isolate **pure driving/inference time** from **human decision time** and
+**one-time model-load time**, so the two conditions are compared on a like-for-like clock.
 
-## Existing building blocks to reuse (verified in this session)
+## Existing building blocks (verified in this session)
 
-| Piece | Where | What it gives us | What's missing for this feature |
+| Piece | Where | What it gives us | What's missing |
 |---|---|---|---|
-| Ghost-circle projection math | [navdp/navdp/extensions/ghost_geometry.py](navdp/navdp/extensions/ghost_geometry.py) (`gc_intrinsics`, `gc_body_point`, `gc_project`, `gc_make_mask`) | Pure numpy: body-frame bearing/range → world point → pixel (u,v) → filled-circle boolean mask. No torch dependency. | Lives under `navdp/`, which is treated as read-only/external (per CLAUDE.md); radius is a fixed constant, not uncertainty-driven. **Port the math pattern into `sam_vla/`, don't import from `navdp/`.** |
-| Translucent alpha-blend | [sam_vla/perception/semantic_overlay.py:17-52](sam_vla/perception/semantic_overlay.py) `overlay_semantic_masks()` | Established green=goal / red=obstacle convention, `alpha=0.45` default, already used to prep frames for a VLM call (`qwen_discrete_direction_policy.py`, `run_navdp_rollout.py`). | Operates on a semantic-id frame + fixed `goal_id`, not a freestanding circle mask. |
-| Circular translucent overlay (closest template) | [kb_teleop_vl.py:141-155](kb_teleop_vl.py:141) `overlay_obstacles()` | Vectorized `(x-cx)^2+(y-cy)^2<=r^2` mask + alpha blend, already circular, already non-destructive (returns a copy). Same file we're wiring Phase 1 into. | Hardcoded red; radius list comes from known obstacle geometry, not belief uncertainty. |
-| Existing per-step belief tracker | [sam_vla/core/belief_tracking.py](sam_vla/core/belief_tracking.py) `BeliefGoalTracker` | `.observe(goal_mask, depth)`, `.propagate(action, dt)`, `.bearing()`, `.distance()` — already the "lost-goal" belief used in the real rollout loop. | No uncertainty/covariance field at all today — this is the actual gap to fill. |
-| VLM exploration dispatch | [vl_direction/directive_engine.py](vl_direction/directive_engine.py) `query("exploration", frames, ExplorationContext(...), episode_id)` | Already takes `list[np.ndarray]` frames and returns a parsed `Direction`; contract is stable and shouldn't change. | Nothing — reuse as-is. Ghost mask is drawn *before* this call, into the frame(s) passed in. |
-| Real rollout call sites (Phase 2 target) | [sam_vla/run_navdp_rollout.py:457-465](sam_vla/run_navdp_rollout.py:457) (`belief_tracker = BeliefGoalTracker(...)`, single-goal mode only), `:668-710` (`.observe`/`.bearing`/`.propagate` per step), `:679-685` (`blocked = avoidance.is_blocked(...)`, `lost_goal_ghost` gating), `:728-730` (`vis_rgb = overlay_semantic_masks(obs.rgb, semantic_render, text=...)`) | A live `belief_tracker` instance already exists per-step with bearing/distance available, plus an existing "not blocked" gate and an existing `vis_rgb` overlay call site that is *already* visualization-only (never fed back into the policy). | Nothing structural — Phase 2 is additive at these exact lines. |
+| Uncertainty request/submit/retry protocol | [`vl_direction/uncertainty_session.py`](vl_direction/uncertainty_session.py) `UncertaintySession` | `request_human_heading()` → VLM sweep description (`NEEDS_HUMAN_INPUT`); `submit_heading(angle_deg\|angle_range_deg)` → `HEADING_DIRECTIVE` with `max_units`, no VLM call; `retry()` increments attempt and re-requests. | Purely a request/response object — nothing drives the rover along the returned heading, and nothing watches a real covariance to trigger it. |
+| Real scalar uncertainty, already computed every step | [`sam_vla/core/belief_tracking.py`](sam_vla/core/belief_tracking.py) `BeliefGoalTracker.uncertainty_value()` | A real (not synthetic) per-step uncertainty state, grown via `uncertainty_growth_increment` while the goal is unseen, reset to `sigma_visible` on a fresh sighting — this **is** the "mu + uncertainty" state the VLM's autonomous condition should be conditioned on. Already live in `run_navdp_rollout.py`'s single-goal mode. | Nothing reads it against a threshold to trigger the uncertainty flow — `kb_teleop_vl.py` uses a separate synthetic proxy (`_update_uncertainty_covariance`), not this real tracker. |
+| Session-mode flag | [`vl_direction/intervention/mode_flag.py`](vl_direction/intervention/mode_flag.py) `SessionMode.AUTONOMOUS`/`HUMAN_INTERVENED`, [`teleop_bridge.py`](vl_direction/intervention/teleop_bridge.py) | A ready-made tag for "this segment was human-driven" vs. "VLM-driven", read into every `VLDirectiveResult.session_mode`. | Not wired into the uncertainty flow anywhere — `kb_teleop_vl.py`'s halt never flips it, so today every uncertainty halt is still tagged `AUTONOMOUS`. |
+| Aggregation shape | [`vl_direction/logging/hci_metrics.py`](vl_direction/logging/hci_metrics.py) `success_rate_by_mode`, `steps_to_goal_by_mode`, `uncertainty_trigger_stats` | Template for episode-level by-mode comparison. | Caller-supplied inputs only; no per-segment timing decomposition exists to feed it (see below). |
+| One live reference integration | [`kb_teleop_vl.py`](kb_teleop_vl.py) `halted_for_uncertainty` flag, `_dispatch_uncertainty_request`/`_uncertainty_worker`/`_handle_halted_key` (background-thread VLM call + `root.after` marshal back to Tk, numpad heading keys) | Working halt/resume UI pattern to model a rollout-loop version on. | It's a **manual demo**: after `submit_heading`, the human just resumes WASD control for the announced `max_units` — there is no autonomous "drive N units along heading" code anywhere in the repo, and no timestamp brackets the halt at all. |
+| Per-call VLM latency | [`vl_direction/directive_engine.py`](vl_direction/directive_engine.py) `query()` (`t0`/`latency_ms`, L184/196) | Already isolates one VLM call's wall time into `VLDirectiveResult.latency_ms` — this is directly usable as the "VLM inference time" bucket for the request-phase call. `submit_heading` makes no VLM call (near-zero, packaging only). | Not threaded into any per-step log — neither `run_navdp_rollout.py` nor `run_qwen_vla_rollout.py` call `directive_engine.query` at all today (only `exploration_policy.py` does). |
+| Model load/startup | [`sam_vla/vlm/qwen_server_manager.py`](sam_vla/vlm/qwen_server_manager.py) `QwenServerManager.start()`, `vl_direction/internvl_server_manager.py` `InternVLServerManager.start()` | Both already block on a health-check poll loop until the subprocess model server is up. | The elapsed duration is never captured — `start()` has no `t0`/`t1` at all, just a deadline to give up by. |
+| Motion primitive | [`sam_vla/core/pose_integrator.py`](sam_vla/core/pose_integrator.py) `integrate_mars(pose, action, dt)`, called at [`run_navdp_rollout.py:713-714`](sam_vla/run_navdp_rollout.py:713) | Exact kinematic step used for every real rollout action — the same primitive an autonomous "drive toward heading_deg" loop would call repeatedly with `v_fwd` fixed and `yaw_rate` steering toward the target heading. | No existing helper turns "heading_deg + max_units" into a sequence of such calls; would need a small new loop. |
+| Goal-visibility predicate | Already used at the (unimplemented) ghost-mask Phase 2 call site, `not goal_visible` | The exact condition for "goal still not spotted after N units, retry" | N/A — just reuse it. |
 
-## Explicit non-goals / anti-patterns to avoid
+## What "the VLM keeps driving" (control condition) means here
 
-- **Do not** modify anything under `navdp/` (belief_exp's existing rule — "never copies or
-  reimplements" — extends here too: port the *pattern*, not the import).
-- **Do not** repeat `navdp/scripts/rollout_habitat_policy.py:983-1004`'s existing ghost pattern,
-  which overwrites the policy's `goal_channel` input directly with the ghost circle. That's
-  belief reaching the policy *directly* — exactly what point 2 of the original ask rules out.
-  This plan's ghost mask only ever touches a `vis_rgb`/frame-for-VLM copy, never the tensor the
-  policy consumes.
-- **Do not** change `sam_vla/policy/base_policy.py`'s `NavigationPolicy` protocol, `Action`, or
-  `sam_vla/safety/cbf_avoidance.py`'s `apply()` in this pass (advisory-only decision above).
-- **Do not** change `vl_direction`'s public contract (`query()`, `schemas.py`,
-  `ExplorationContext`) — it already accepts arbitrary annotated frames; reuse it unmodified.
+Re-reading the ask: Condition B is not "give the VLM an autonomous heading-picking flow instead of the
+human" — it's simpler and needs no new heading-selection logic: **the normal rollout loop (NavDP/Qwen
+policy + CBF) just keeps running unmodified**, conditioned on `BeliefGoalTracker`'s own mu/uncertainty
+as it already is today, and the uncertainty-crossing event is only *logged*, never acted on. Condition A
+is the same rollout loop with the stop-rotate-ask-drive-retry cycle spliced in at the same trigger
+points. This keeps the two conditions paired on identical trigger instances (same seed/episode/step),
+which is what makes the timing subtraction meaningful.
+
+## Timing decomposition (the actual deliverable of this ablation)
+
+Four buckets, each needing an explicit timer added at a specific site — none of these exist today:
+
+1. **`model_load_ms`** — one-time per process. Add `t0 = time.monotonic()` before, `t1` after, in
+   `QwenServerManager.start()` / `InternVLServerManager.start()`; log once per episode (or once per
+   process if the server is reused across episodes — note which in the log so it isn't double-counted).
+2. **`vlm_inference_ms`** — already exists as `VLDirectiveResult.latency_ms` on the `request_human_heading()`
+   call; just needs to be threaded through to the per-event log record instead of discarded.
+3. **`human_decision_ms`** — new. Timestamp when the sweep description / frame is presented to the human
+   (start of the blocking/async wait for input) to when their heading choice is received (right before
+   `submit_heading()` is called). This is the field that gets *deducted* from Condition A's total time to
+   recover "VLM/driving-only" time for a fair comparison against Condition B.
+4. **`drive_ms`** — new. Wall time of the autonomous "drive up to `max_units` along `heading_deg`" loop
+   (Phase 1 below), timestamped independently of steps spent in normal policy-driven navigation.
+
+Per-episode ablation arithmetic: `total_episode_time - sum(human_decision_ms) - model_load_ms` gives
+Condition A's VLM-and-driving-only time, directly comparable to Condition B's total time (which has no
+human-decision or extra model-load component beyond the one shared model already running).
 
 ## Phased plan
 
-### Phase 0 — shared belief-growth + ghost-drawing module
+### Phase 0 — real trigger + logging scaffolding (no behavior change yet)
 
-New/modified files:
-- **Modify** [sam_vla/core/belief_tracking.py](sam_vla/core/belief_tracking.py):
-  add `uncertainty: float` state to `BeliefGoalTracker`, a `sigma_visible` floor constant, the
-  new `odom_noise_growth_rate` constructor param, growth logic in `propagate()`, reset logic in
-  `observe()`, and an accessor (`.uncertainty_value()` or similar).
-- **New** `sam_vla/core/ghost_mask.py` (name tentative): pure-numpy, mirrors
-  `ghost_geometry.py`'s shape but built against `sam_vla.core.goal_geometry.intrinsics_from_hfov`
-  (already imported by `belief_tracking.py`) and the body-frame `[forward, left]` convention
-  `BeliefGoalTracker` already uses, so it composes directly with `.bearing()`/`.distance()`
-  instead of needing a separate world-frame projection step:
-  - `uncertainty_to_radius_px(uncertainty, min_px, max_px, scale)` — clamped mapping, same
-    clamp pattern `kb_teleop_vl.py` already uses for obstacles
-    (`OVERLAY_MIN_PIXEL_RADIUS`/`OVERLAY_MAX_PIXEL_RADIUS`).
-  - `project_body_point_to_pixel(forward, left, hfov_deg, h, w)` — body-frame point → (u, v) or
-    `None` if behind/out of frame.
-  - `draw_ghost_mask(rgb, u, v, radius_px, color=GREEN, alpha=...) -> np.ndarray` — translucent
-    circular blend, non-destructive (returns a copy), modeled on `overlay_obstacles()`.
-- Unit tests for the two pure-math pieces above (radius mapping, projection) — no sim/GPU
-  needed, straightforward pytest, e.g. under a new `sam_vla/core/tests/` or alongside
-  `vl_direction/tests/`'s style.
+- Wire `BeliefGoalTracker.uncertainty_value()` against a new `--uncertainty-threshold` CLI flag in
+  `sam_vla/run_navdp_rollout.py` (single-goal mode only, mirroring the existing `belief_tracker is not
+  None` gate). On crossing, log an `uncertainty_trigger` event (step, uncertainty value, mu/bearing/distance)
+  in **both** conditions — Condition B just logs and continues; nothing else changes yet.
+- Add the four timer hooks above as inert instrumentation (`model_load_ms` around both server managers'
+  `start()`; a `latency_ms`-passthrough field on any future logged VLM call) so Phase 1+ has somewhere to
+  write into. Extend `RolloutLogger.log_step`/`EpisodeLogger.log_frame` (whichever logger the chosen
+  rollout script uses — `run_navdp_rollout.py`/`run_qwen_vla_rollout.py` currently use `RolloutLogger`,
+  which has no timing fields at all today) with an optional `uncertainty_event: Optional[dict]` payload
+  carrying the four buckets plus `attempt`, `condition` (`"human"`/`"autonomous"`), `resolved` (goal found
+  before/after `max_units`).
 
-### Phase 1 — interactive verification in `kb_teleop_vl.py`
+### Phase 1 — autonomous motion primitives (shared by both conditions' plumbing)
 
-- Generalize the existing synthetic `_update_uncertainty_covariance` growth in
-  [kb_teleop_vl.py:404-418](kb_teleop_vl.py:404) to call the Phase 0 growth logic (so the same
-  formula is exercised here and in Phase 2, not two divergent implementations).
-- After `annotated_rgb = overlay_obstacles(rgb, circles)` in `render()`
-  ([kb_teleop_vl.py:507](kb_teleop_vl.py:507)), call `draw_ghost_mask(...)` using the current
-  synthetic uncertainty value and a projected target point (reuse the nearest-obstacle point as
-  a stand-in "goal" for this demo only — no new goal-tracking subsystem needed here, since this
-  script has no real goal object). Feed the result into both the VLM dispatch
-  ([kb_teleop_vl.py:519](kb_teleop_vl.py:519)) and the on-screen image
-  ([kb_teleop_vl.py:526](kb_teleop_vl.py:526)) — same "one overlay, seen by both" pattern the
-  file already uses for obstacles.
-- No change to `_vl_worker`/`_apply_vl_line` — the direction is already advisory-only (printed +
-  shown in the status line), matching the confirmed decision.
-- Manual verification: run the script, confirm the green circle grows while the stand-in target
-  is unseen/far and shrinks/resets when it's grounded again, stays translucent (background still
-  visible through it), and the printed exploration-mode line keeps updating on the existing
-  cadence.
+- New `rotate_sweep(env, pose, degrees_per_step, n_steps) -> list[(pose, rgb)]` — in-place rotation
+  sequence via `integrate_mars(pose, Action(0, 0, yaw_rate), dt)` + `env.step`, capturing a frame per
+  step, for feeding into `request_human_heading(frame)`/`retry(new_frame)`.
+- New `drive_toward_heading(env, pose, heading_deg, max_units, goal_visible_fn) -> (final_pose, units_covered, found)`
+  — repeatedly calls `integrate_mars`/`env.step` with `v_fwd` fixed and `yaw_rate` steering toward
+  `heading_deg`, stopping early if `goal_visible_fn()` becomes true or `max_units` is covered. This is the
+  piece that doesn't exist anywhere in the repo today (confirmed: `kb_teleop_vl.py` only ever resumes
+  manual WASD after `submit_heading`).
+- Both are pure/sim-facing helpers, candidates for `sam_vla/core/` (e.g. `sam_vla/core/uncertainty_motion.py`)
+  so they're reusable from whichever rollout script hosts Study 1.
 
-### Phase 2 — wire into the real rollout loop (`sam_vla/run_navdp_rollout.py`)
+### Phase 2 — Condition A (human-in-the-loop) wiring
 
-- Pass `odom_noise_growth_rate` through as a new CLI flag alongside the existing
-  `--belief-odom-noise` (wherever that's currently threaded to
-  [run_navdp_rollout.py:457-465](sam_vla/run_navdp_rollout.py:457)).
-- At [run_navdp_rollout.py:728-730](sam_vla/run_navdp_rollout.py:728), where `vis_rgb` is already
-  built purely for visualization/logging, additionally draw the ghost mask when: single-goal mode
-  (`belief_tracker is not None` — already `None` in `multi_goal`/`base_station` modes, so this
-  naturally excludes the base-station DWELL/RETURN phases, which skip the policy/CBF call
-  entirely at [:621-658](sam_vla/run_navdp_rollout.py:621) anyway), not currently `blocked`
-  (reuse the existing `blocked` bool from [:679-685](sam_vla/run_navdp_rollout.py:679) — this is
-  the "cbf vs exploration" gate), and the goal is currently unseen (`not goal_visible`).
-- Dispatch `vl_direction.directive_engine.query("exploration", [vis_rgb_with_ghost],
-  ExplorationContext(task_str=...), episode_id)` at a throttled cadence (mirror
-  `kb_teleop_vl.py`'s every-N-frames-or-M-seconds pattern; a full VLM call every rollout step
-  would be far too slow). Log the returned `Direction` into `vla_result`/`logger.log_step` next
-  to the existing belief/CBF diagnostics — advisory-only, matching Phase 1.
-- No change to `action`, `policy.act_verbose(...)`, or `avoidance.apply(...)` call sites.
+- On trigger: pause normal policy stepping, run `rotate_sweep`, call
+  `uncertainty_session.request_human_heading(frame)`, record `vlm_inference_ms` from the result.
+- Present the sweep result to a human and collect a heading — since the target rollout scripts are
+  headless (no Tkinter), use a simple blocking terminal prompt (`input()`) showing the VLM's sweep
+  description and the available heading choices, timestamped start-to-input for `human_decision_ms`. (A
+  Tk popup mirroring `kb_teleop_vl.py`'s numpad-heading UI is a fine alternative if a visual view of the
+  sweep frames matters more than running headless — flag as an open question, not blocking.)
+- Call `submit_heading(angle_deg=chosen)`, run `drive_toward_heading` for the returned `max_units`,
+  timing it into `drive_ms`. If not found, call `retry()` and repeat (Phase 1's `rotate_sweep` again),
+  capping attempts via a new `--uncertainty-max-retries` flag.
+- Flip `SessionMode` to `HUMAN_INTERVENED` for the duration of the halt (currently unused by any call
+  site — this is the first real consumer) so `hci_metrics.py`'s by-mode aggregates work unmodified.
 
-## Open questions to settle during implementation (not blocking this plan)
+### Phase 3 — Condition B (autonomous baseline) + paired runs
 
-- Exact `uncertainty` growth formula (linear vs. compounding via `time_since_seen`) — pick
-  empirically once Phase 0's unit tests make it cheap to compare shapes; not worth debating in
-  the abstract.
-- Ghost-mask pixel-radius clamp bounds for Phase 2 (reuse `kb_teleop_vl.py`'s
-  `OVERLAY_MIN_PIXEL_RADIUS=3` / `OVERLAY_MAX_PIXEL_RADIUS=260` as the starting point, or derive
-  from `image_size` if rollouts use a different resolution).
-- Whether a later phase graduates from advisory-only to actually influencing `Action`
-  (proportional nudge à la `lost_goal_heading_assist`, vs. a harder override à la
-  `qwen_discrete_direction_policy.direction_to_action`) — intentionally deferred; revisit only
-  after Phase 1/2 visualization is validated as correct and useful on its own.
+- Same trigger, but the handler is a no-op besides logging `uncertainty_trigger` (per "what Condition B
+  means" above) — policy keeps acting on its own belief-conditioned state uninterrupted.
+- Run both conditions over the same seed/episode set (same start pose, same goal, same scene) so trigger
+  instances line up 1:1 for the subtraction described above.
 
-## Verification plan
+### Phase 4 — analysis
 
-- **Phase 0**: pytest on `uncertainty_to_radius_px` and `project_body_point_to_pixel` — pure
-  functions, no sim dependency.
-- **Phase 1**: manual visual check in the live Tkinter window (see Phase 1 bullet above).
-- **Phase 2**: spot-check a handful of saved `vis_rgb` frames/video from a real rollout before
-  trusting it at scale — same discipline CLAUDE.md already prescribes for segmentation-sweep
-  overlays ("Sanity-check any new sweep by overlaying masks on rgb for a few frames").
+- Per-episode: `time_to_goal`, `success`, `n_uncertainty_triggers`, `sum(human_decision_ms)`,
+  `sum(drive_ms)`, `model_load_ms`, derived `vlm_and_driving_only_time`.
+- Compare Condition A's derived time and success rate against Condition B's raw time and success rate —
+  this is the actual ablation result (does human intervention win once its own decision latency is
+  factored out, or does it still lose because rotate+ask+drive is fundamentally slower per trigger?).
 
-## Addendum: VLM-placed ghost mask (`ghost_mask` mode)
+## Non-goals
 
-Follow-up ask (mentor-directed): try actually letting the VLM decide the mask, per the *original*
-ask's point 1 ("plug belief into a VLM/LM/Model, which draws a translucent ghost mask") — Phase 1
-above instead kept placement 100% deterministic and only let the VLM *see* the result. This
-addendum does the belief-to-VLM handoff for real, scoped to `kb_teleop_vl.py` only (Phase 2
-rollout-loop wiring is not part of this pass, and point 4 — the policy actually acting on the mask
-— is still out of scope, unchanged from the "Action coupling: advisory-only" decision above).
+- Don't change `vl_direction`'s public contract (`UncertaintySession`, `query()`, schemas) — extend the
+  *callers*, not the module (same discipline the ghost-mask plan used for `vl_direction`).
+- Don't touch `sam_vla/policy/base_policy.py`'s `NavigationPolicy` protocol or `CbfObstacleAvoidance.apply()`
+  — the uncertainty handoff sits *around* a policy step, not inside one.
+- Don't conflate this with the ghost-mask feature — that's a passive visualization cue; this is an active
+  control handoff. Keep them separate even though both key off the same `BeliefGoalTracker` uncertainty
+  state.
 
-Qwen2.5-VL-3B-Instruct (the client already wired into `kb_teleop_vl.py`) is a vision-*understanding*
-model, not an image generator — it cannot literally emit pixels. "The VLM draws the mask" resolves
-to: the model receives the belief (`bearing_deg`/`distance_m`/`uncertainty`) as text plus the
-obstacle-only frame, and answers with free-form JSON pixel coordinates `{"u", "v", "radius_px"}`;
-code (`draw_ghost_mask`, unchanged) still does the actual alpha-blend. This is a new fourth
-`vl_direction` mode, `ghost_mask`:
+## Open questions
 
-| Piece | Where |
-|---|---|
-| `GhostMaskContext` / `GhostMaskPayload` schemas | `vl_direction/schemas.py` |
-| Prompt (explains bearing/distance/uncertainty, asks for the JSON schema) | `vl_direction/prompts/ghost_mask_prompt.py` |
-| `parse_ghost_mask_json()` — extracts a `{...}` object from free-form text, clamps `u`/`v` into `frame_wh` and `radius_px` into `[min_radius_px, max_radius_px]` | `vl_direction/parser.py` |
-| `_query_ghost_mask()` handler, registered in `_HANDLERS` | `vl_direction/directive_engine.py` |
-| Dispatch: a second VLM call issued alongside the existing exploration-direction call, only when `mode == "exploration"` (ghost mask has no meaning mid-CBF, same binary Phase 1 already established) and `--ghost-mask-vlm` is on (default true; `--no-ghost-mask-vlm` reverts to Phase 1's pure geometry) | `kb_teleop_vl.py`'s `_maybe_query_ghost_mask()` |
+- Terminal prompt vs. a small Tk popup for the human-input surface in Phase 2 — terminal is simpler and
+  keeps the rollout scripts headless-capable, but loses the visual sweep frames a human would actually
+  want to see before choosing. Decide at implementation time based on whether these runs need to happen
+  unattended/batched (favors terminal + pre-recorded frame save) or supervised (favors Tk).
+- Exact uncertainty threshold and `max_units` per attempt — reuse whatever the ghost-mask work's pixel/
+  uncertainty clamp constants suggest as a starting point, tune empirically.
+- Whether `model_load_ms` should be amortized across all episodes in a batch run (server started once,
+  reused) or charged once per episode (server restarted per episode for clean isolation) — affects how
+  directly Condition A/B totals are comparable if run in the same process vs. separate processes.
 
-Known tradeoff: because this is a second, throttled VLM call (same cadence as the direction query,
-not every frame), the model's `(u, v)` is a **fixed screen position** that holds between calls —
-unlike the deterministic path, it does not re-project to track rover motion frame-to-frame. A
-parse failure keeps the previous VLM placement (not the deterministic fallback) so a single bad
-JSON response doesn't visibly snap the circle; the deterministic projection is only used before any
-VLM placement has landed yet, or when `--no-ghost-mask-vlm` is passed. All 4 additions
-(`schemas.py`, `parser.py`, `directive_engine.py`, the new prompt module) are covered by
-`vl_direction/tests/` (`test_ghost_mask_prompt.py`, ghost-mask cases in `test_parser_fallback.py`
-and `test_directive_engine_contract.py`); the `kb_teleop_vl.py` wiring itself has no pytest
-coverage (same as the rest of that file) — verify visually per the Phase 1 verification plan
-above, or exercise `VLTeleopApp._maybe_query_ghost_mask` directly with a fake `self` +
-`MockInternVLClient` for a quick non-visual smoke check.
+---
+
+# Study 2 — real-world sensor/actuator noise injected into driving deltas
+
+## Research question
+
+`belief_exp` established (offline, numpy-only) which odometry-noise magnitudes the belief system stays
+well-calibrated under. This study applies that same noise magnitude to the **actual** driving deltas in
+a real Habitat-Sim rollout — not a numpy approximation — and observes what really happens to task
+performance (success rate, time/steps to goal, CBF-trigger rate) and to the belief tracker's own
+uncertainty trajectory when real noise, not zero, drives the rover.
+
+## Important caveat: `belief_exp/results/` is currently empty on disk
+
+`ls belief_exp/results/` returns nothing in the working tree — the CSVs were deliberately deleted in
+commit `63d7869` ("Delete obsolete sigma_min_summary CSV files"). The numbers below were recovered via
+`git show 63d7869^:belief_exp/results/<file>`, from `belief_exp/sigma_min_sweep.py`'s
+`21_max_confidence_summary.csv` (the widest sweep, 200 episodes/config):
+
+| `env_odom_noise_std` | min viable `sigma_visible` | min viable `odom_noise` (bank) | viable? |
+|---|---|---|---|
+| 0.0 | 0.0089 | 0.0001 (grid floor) | yes |
+| 0.041 | 0.0139 | 0.0001 | yes |
+| 0.068 | 0.0217 | 0.0001 | yes |
+| 0.109 | 0.0217 | 0.0001 | yes |
+| 0.15 (grid max) | 0.0340 | 0.0001 | yes |
+
+An earlier, stricter run (`07_strict_viability_summary.csv`) went fully non-viable above
+`env_odom_noise_std ≈ 0.075`. **Before trusting any specific number for this study, either re-run
+`belief_exp/sigma_min_sweep.py`/`sweep.py` fresh, or pull the exact historical file via `git show`** —
+don't treat the table above as a standing artifact, only as a recovered snapshot.
+
+Two different things are called "sigma" in `belief_exp` and it matters which one this study injects:
+- **`env_odom_noise_std`** (scenario-side): the actual/ground-truth noise magnitude applied to real
+  motion deltas inside `belief_exp/scenario.py` — this is the one that's the analog of real-world
+  sensor/actuator noise, and the one this study should port into the real rollout's driving deltas.
+- **`sigma_visible`/`odom_noise` (bank-side)**: `SubgoalBeliefBank`'s own *belief* about how noisy things
+  are — a calibration/tuning parameter, not a source of physical noise. Leave these alone; they're
+  already exposed via the existing `--belief-odom-noise` flag and only affect the belief tracker's
+  internal dead-reckoning, not real motion (confirmed: `sam_vla/core/belief_tracking.py`'s
+  `propagate_body_point` perturbs a local copy used only for `belief_g`, never the `action` object
+  actually passed to `integrate_mars`).
+
+So: **sweep `env_odom_noise_std` over the range `belief_exp` already tested (0.0 to ~0.15, extending to
+the ~0.075 non-viable boundary as a stress point) and inject it into real driving deltas**, using the
+`min_sigma_visible`/bank-config table above only as *context* for what the belief tracker's calibration
+would need to look like to stay honest at each noise level — not as the thing being injected.
+
+## Exact noise formula to port (from `belief_exp/scenario.py:144-151`)
+
+```python
+odom_noise_xy = env_odom_noise_std
+odom_noise_th = env_odom_noise_std * 0.5
+noisy_dx    = true_dx    + rng.normal(0.0, odom_noise_xy)
+noisy_dy    = true_dy    + rng.normal(0.0, odom_noise_xy)
+noisy_dtheta = true_dtheta + rng.normal(0.0, odom_noise_th)
+```
+Full-scale Gaussian noise on translational deltas, half-scale on the heading delta. Per the existing
+`belief_exp`/`navdp` convention ("never copies or reimplements the real classes"), and the equivalent
+precedent from the ghost-mask plan ("port the *pattern*, not the import" — `ghost_mask.py` vs.
+`navdp/navdp/extensions/ghost_geometry.py`), **port this formula into a new `sam_vla/` module rather than
+importing `belief_exp/scenario.py`** — `belief_exp` stays a read-only offline harness, untouched.
+
+## Injection point
+
+Confirmed exact site: [`sam_vla/run_navdp_rollout.py:713-714`](sam_vla/run_navdp_rollout.py:713):
+```python
+new_pose = integrate_mars(obs.pose, action, dt)
+env.step(new_pose)
+```
+`integrate_mars` ([`sam_vla/core/pose_integrator.py:18-27`](sam_vla/core/pose_integrator.py:18)) is pure
+SE(2) kinematics; `MarsHabitatEnv.step()` just teleports to the given absolute pose — no noise anywhere
+in this path today. Perturb `action.v_fwd`/`action.v_lat`/`action.yaw_rate` (equivalently, perturb the
+`dx`/`dz`/`dtheta` `integrate_mars` computes internally) with the ported formula immediately before this
+call.
+
+## New building block: `sam_vla/core/sensor_noise.py`
+
+- `apply_odom_noise(action: Action, odom_noise_std: float, rng: np.random.Generator) -> Action` — pure
+  function, returns a new `Action` with the scenario.py formula applied (full-scale on `v_fwd`/`v_lat`,
+  half-scale on `yaw_rate`, matching the dx/dy/dtheta split since these are the same physical quantities
+  pre-integration). Unit-testable with no sim dependency, same style as Phase 0's `ghost_mask.py` pure
+  functions.
+- Called at `run_navdp_rollout.py:713`, gated by a new `--drive-odom-noise-std` CLI flag (distinct name
+  from the existing `--belief-odom-noise`, to keep "real motion noise" and "belief's own noise-belief"
+  unambiguous in logs and flag help text).
+
+## Sweep design (this time actually running the simulation)
+
+- Reuse an existing checkpoint/scene/goal config (whatever the current default rollout invocation in
+  `usage` uses) so this is a controlled variable, not a confound.
+- For each `env_odom_noise_std` in the recovered/re-derived range (e.g. `{0.0, 0.041, 0.068, 0.109, 0.15,
+  ~0.075-stress-point}`), run N real episodes (N chosen for statistical power — `belief_exp`'s own sweeps
+  used 60-200 episodes/config as a reference point, though real Habitat rollouts are far more expensive
+  per-episode so N will likely be much smaller; decide based on available compute).
+- Per episode, log (via `RolloutLogger`/`EpisodeLogger`, extending as needed): success, steps/time to
+  goal, final distance to goal, CBF-trigger count (existing `distances_to_obstacles`/`cbf_active` fields
+  already support this), and the belief tracker's own `uncertainty_value()` trajectory for direct
+  comparison against `belief_exp`'s offline `calibration_nll`/`coverage_1sigma`/`coverage_2sigma` at the
+  same nominal noise level — this is the actual "does the offline numpy approximation hold up in the real
+  sim" validity check the study is going after.
+
+## Non-goals
+
+- Don't modify anything under `navdp/` or `belief_exp/` — this study is a new consumer of `belief_exp`'s
+  *findings* (the noise range), not a modification of how those findings were produced.
+- Don't feed this noise into `BeliefGoalTracker.odom_noise`/`propagate_body_point` — that parameter
+  already exists and is deliberately orthogonal (belief's internal noise-belief vs. real physical noise);
+  conflating them would break the exact distinction `belief_exp` was built to study.
+- Don't change `NavdpPolicy`/`QwenDiscreteDirectionPolicy` — noise is injected after the policy decides
+  an action, not into the policy's inputs.
+
+## Open questions
+
+- Exact episode count per noise level, given real Habitat rollouts are much more expensive than
+  `belief_exp`'s numpy episodes — depends on available compute/time budget, not resolvable in the
+  abstract.
+- Whether to re-run `belief_exp/sigma_min_sweep.py` fresh (to get results actually present on disk and
+  reproducible going forward) before starting Study 2, vs. just citing the recovered historical numbers
+  above with a note — recommend re-running, since the table above is explicitly flagged as
+  git-history-only and not a standing artifact.
+- Whether `--drive-odom-noise-std` should also perturb the *initial* `env.step()` teleport target
+  directly (pose-space noise) instead of/in addition to the pre-integration action-space noise above —
+  the scenario.py formula is action/delta-space, so action-space is the faithful port, but worth
+  confirming there's no meaningful difference given `integrate_mars` is a simple linear transform.
