@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""
-Stage 2: Build an exact terrain mesh from a DEM heightmap and export as GLB.
+"""DEM .tif -> Habitat-loadable .glb terrain mesh, direct from a Blender grid
+build (one vertex per DEM pixel) rather than subsurf/displace modifiers, so
+the mesh exactly matches the upsampled height field.
 
-One vertex is created per DEM pixel (direct grid construction -- no reliance
-on Blender subsurf/displace modifiers guessing at topology), so the output
-mesh is a faithful, exact representation of the upsampled height field.
-
-Run headless with Blender's own Python:
-    blender --background --python dem_to_glb.py -- \
+Usage:
+    blender --background --python scripts/utils/dem2glb.py -- \
         --input marsyard2022_terrain_hm_1025.tif \
         --output marsyard2022_terrain.glb \
         --size-x 50 --size-y 50 --size-z 4.820803273566 \

@@ -4,7 +4,7 @@ Stage 1: Upsample the marsyard2022 DEM heightmap from 257x257 to 1025x1025
 using bicubic interpolation, for a smooth (non-blocky) result.
 
 Usage:
-    python3 upsample_dem.py <input.tif> <output.tif> [target_res]
+    python scripts/utils/upscale_dem.py <input.tif> <output.tif> [target_res]
 """
 
 import sys

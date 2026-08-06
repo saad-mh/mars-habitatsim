@@ -1,42 +1,13 @@
-"""
-Adapter: SAM single-frame inference -> resolve_vlm_selection's annotation
-JSON contract.
+"""Adapter: runs SAM (sam/sam/inference.py) on a single already-captured frame
+and converts its per-class boxes into the labelme-style annotation JSON that
+vlm_nav_interactive.py's resolve_vlm_selection() expects. Maps SAM's `bigrock`
+class to the pipeline's "rock" label (the only obstacle/goal candidate the VLM
+prompt understands) and drops `bedrock` entirely (background surface, not a
+discrete object). vlm_nav_interactive imports are done lazily so this stays
+importable without habitat_sim/quaternion/a real scene on disk.
 
-resolve_vlm_selection() (vlm_nav_interactive.py) expects a labelme-style
-annotation JSON with a "shapes" list, each shape needing "label", "points"
-(>=2 [x, y] pairs), and an "id" assigned the same way assign_object_ids()
-does (sequential ints starting at 0). This module runs SAM
-(sam/sam/inference.py's run_inference_on_frame) on a single image and
-converts its per-class box output into that shape.
-
-Label mapping (SAM classes -> pipeline vocabulary):
-  bigrock -> "rock"  SAM's discrete rock-instance class. The pipeline's
-                      labels.txt vocabulary is ["sand", "rock"] and
-                      VLM_PROMPT hardcodes "Every obstacle's label must be
-                      'rock'", so bigrock is the only sensible match for
-                      an obstacle the rover drives around.
-  bedrock             Terrain/background surface segmentation, not a
-                      discrete object (its contours can span most of the
-                      frame). The mission is defined as picking one goal
-                      and one obstacle from two actual rocks, so bedrock
-                      is dropped entirely rather than surfaced as a
-                      candidate shape - otherwise the VLM has no real
-                      rock to pick from and either selects a bedrock
-                      region as the goal or mislabels one as "rock" to
-                      satisfy the obstacle schema.
-
-The vlm_nav_interactive imports (assign_object_ids, validate_annotation_json,
-run_vlm_on_frame) are done lazily inside sam_frame_to_annotation() /
-run_sam_vlm_on_frame() rather than at module load time, so this adapter
-stays importable/testable without habitat_sim, quaternion, or a real
-scene/heightmap on disk - only those two functions need that module.
-
-run_sam_vlm_on_frame(source_frame_idx, target_frame_idx) is the full
-routing entry point: it runs SAM on a copy of an already-captured frame,
-writes the annotation to ANNOTATIONS_DIR/rgb_{target_frame_idx:04d}.json -
-where resolve_vlm_selection() already looks for it - then calls
-vlm_nav_interactive.run_vlm_on_frame(target_frame_idx) unmodified. CLI:
-`python sam_annotation_adapter.py --full <source_frame_idx> <target_frame_idx>`.
+Usage:
+    python scripts/utils/sam_annotation_adapter.py --full <source_frame_idx> <target_frame_idx>
 """
 
 import sys

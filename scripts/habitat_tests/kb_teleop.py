@@ -1,3 +1,11 @@
+"""Base Tkinter WASD teleop UI for driving the rover around marsyard2022 and
+recording frames (Space=record, P=snapshot, Q/E=camera clearance). Runs in
+the `habitat` conda env.
+
+Usage:
+    python scripts/habitat_tests/kb_teleop.py
+"""
+
 import os
 import time
 import shutil

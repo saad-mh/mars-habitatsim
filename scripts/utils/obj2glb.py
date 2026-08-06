@@ -1,3 +1,11 @@
+"""Blender-run converter: .obj terrain mesh -> Habitat-loadable .glb. Must pass
+export_yup=False (see CLAUDE.md "Known issues") or Habitat's implicit Z-up
+stage rotation double-flips the mesh, producing black-void renders.
+
+Usage:
+    blender --background --python scripts/utils/obj2glb.py -- input.obj output.glb
+"""
+
 import bpy
 import os
 import sys

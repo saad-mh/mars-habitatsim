@@ -1,3 +1,12 @@
+"""Runs SAM2's automatic (unprompted) mask generator over a folder of
+kb_teleop.py-style rgb_*.png frames, writing per-frame mask/overlay images.
+Standalone: uses the sibling `sam2` package install (SAM2_ROOT), not this
+repo's `sam_vla`/`sam` LoRA pipeline.
+
+Usage:
+    python scripts/utils/sam2_auto_masks_folder.py --input mars_teleop_out --output sam2_out [--max-frames 20]
+"""
+
 import argparse
 import json
 import os

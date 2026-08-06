@@ -1,3 +1,11 @@
+"""Converts a heightmap PNG + texture PNG into a textured .obj terrain mesh
+(first step of the DEM/heightmap -> Habitat-loadable GLB pipeline).
+
+Usage:
+    python scripts/utils/hm2obj.py --heightmap <hm.png> --texture <tex.png> \\
+        --size-x <m> --size-y <m> --size-z <m> [--out out.obj] [--stride 4]
+"""
+
 import argparse
 import os
 import shutil

@@ -2,10 +2,10 @@
 """Parse rollout log directories under logs/ into summary tables.
 
 Single-episode mode:
-    python log_reader.py --log-dir logs/2026-07-12_230309_vlm-goal_nudge_obs100_seed0 --k 5
+    python scripts/utils/log_reader.py --log-dir logs/2026-07-12_230309_vlm-goal_nudge_obs100_seed0 --k 5
 
 Batch mode (walks every episode dir under a root):
-    python log_reader.py --root-dir logs --k 5 --format csv --output out.csv
+    python scripts/utils/log_reader.py --root-dir logs --k 5 --format csv --output out.csv
 """
 
 import argparse

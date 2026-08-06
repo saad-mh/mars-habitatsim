@@ -1,39 +1,14 @@
-"""
-Interactive mesh segmentation tool (next.md, Pipeline Step 1).
-
-Picking happens entirely on the full-resolution terrain *texture* image (a
-top-down photo reference) -- there is no 3D view. Enable "Pick points" and
-click around the outline of an object (e.g. one rock or one crater) in
-order, hit "Finish object", and the tool:
-
-  1. Connects ALL of the marked points (in click order) into a closed
-     polygon in the xz (top-down) plane -- this is the object's "tight
-     boundary", not a convex hull, so it can trace concave/irregular
-     outlines instead of collapsing to the outermost points.
-  2. Builds the object's mesh from the *actual terrain* clipped to that
-     polygon: every mesh vertex's height comes from sampling the real
-     heightmap at that (x, z), so the mesh always sits exactly on the
-     ground it's annotating -- it can never dip below or float above the
-     terrain the way a convex hull of a handful of 3D points can on
-     anything but flat ground.
-
-A dialog then asks for the category + a name, a persistent mesh_id is
-assigned, and the mesh is written out as its own OBJ alongside a
-mesh_id -> category JSON registry.
-
-A legacy `--mesh-mode convex_hull` is kept for comparison/back-compat: it
-builds a 3D convex hull of the marked points instead, which is the old
-(discouraged) behavior.
-
-Work is autosaved after every finished/deleted object (including any
-in-progress, unfinished points) to <out-dir>/session.json, and is resumed
-automatically the next time the tool is pointed at the same --out-dir.
+"""Interactive tkinter tool (next.md Pipeline Step 1) for tracing object
+outlines on the top-down terrain texture: click around a rock/crater's
+boundary, "Finish object" builds a mesh from the real terrain clipped to that
+polygon (each vertex sampled from the actual heightmap, so it always sits on
+the ground -- unlike the legacy `--mesh-mode convex_hull` fallback). Writes
+each object as its own OBJ plus a mesh_id -> category JSON registry, and
+autosaves in-progress work to <out-dir>/session.json.
 
 Usage:
-    python mesh_annotation_tool.py --out-dir annotations/mesh_segmentation
-
-Run with the `habitat` conda env's python (has tkinter + scipy):
-    /home/gpu/miniconda3/envs/habitat/bin/python mesh_annotation_tool.py ...
+    /home/gpu/miniconda3/envs/habitat/bin/python scripts/utils/mesh_annotation_tool.py \\
+        --out-dir annotations/mesh_segmentation
 """
 
 from __future__ import annotations

@@ -1,3 +1,10 @@
+"""Compiles a kb_teleop.py recording folder's rgb_*.png / depth_*.png frames
+into MP4s.
+
+Usage:
+    python scripts/utils/pix2vid.py [--input <mars_teleop_out*>] [--fps 15]
+"""
+
 import argparse
 import glob
 import os

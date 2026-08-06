@@ -11,8 +11,8 @@ Flow (next.md #1/#2):
      it, so the obstacle layout stays fixed across ablation runs.
 
 Usage:
-    python generate_rock_env.py --out-dir rock_envs/run1 --num-rocks 15 --seed 7
-    python generate_rock_env.py --out-dir rock_envs/run1 --verify   # re-load + open in habitat_sim
+    python scripts/utils/generate_rock_env.py --out-dir rock_envs/run1 --num-rocks 15 --seed 7
+    python scripts/utils/generate_rock_env.py --out-dir rock_envs/run1 --verify   # re-load + open in habitat_sim
 """
 
 from __future__ import annotations

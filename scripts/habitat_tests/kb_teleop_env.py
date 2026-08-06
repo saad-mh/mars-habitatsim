@@ -1,21 +1,11 @@
 """Same WASD/space/x teleop UI as kb_teleop.py, but driven through
-sam_vla.env.habitat_env.MarsHabitatEnv with with_semantic=True and the
-annotation meshes registered -- i.e. the exact same simulation setup
-sam_vla/run_segmentation_sweep.py uses to build training data (sensor specs,
-camera-height formula, registered rock/bedrock/hole_in_ground hulls), not
-just matching sensors/pose. Saved frames get the same three assets a sweep
-run writes (rgb/, masks_instance/, masks_category/) plus
-segmentation_frames.jsonl + summary.json via the same EpisodeLogger +
-segmentation_capture helpers, so the output directory is a drop-in
---run-dir for finetune_sam2_lora.py, and spot_check_segmentation /
-overlay_category_mask work on it unmodified.
+sam_vla.env.habitat_env.MarsHabitatEnv with the annotation meshes registered
+-- the exact sim setup run_segmentation_sweep.py uses, so saved frames
+(rgb/, masks_instance/, masks_category/, segmentation_frames.jsonl) are a
+drop-in --run-dir for finetune_sam2_lora.py / spot_check_segmentation.
 
-ANNOTATIONS_DIR is annotations/mesh_tight_bound2, not
-run_segmentation_sweep.py's own --annotations-dir default
-(annotations/mesh_segmentation) -- mesh_tight_bound2 is what the actual
-sweep runs behind sam_lora_runs/exp2 and exp3 used (see stats.md / bash
-history), so this matches the real training data source, not the script's
-default.
+Usage:
+    python scripts/habitat_tests/kb_teleop_env.py
 """
 
 import shutil
