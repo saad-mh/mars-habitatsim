@@ -68,32 +68,54 @@ human-decision or extra model-load component beyond the one shared model already
 
 ## Phased plan
 
-### Phase 0 — real trigger + logging scaffolding (no behavior change yet)
+### Phase 0 — real trigger + logging scaffolding (no behavior change yet) — DONE
 
-- Wire `BeliefGoalTracker.uncertainty_value()` against a new `--uncertainty-threshold` CLI flag in
-  `sam_vla/run_navdp_rollout.py` (single-goal mode only, mirroring the existing `belief_tracker is not
-  None` gate). On crossing, log an `uncertainty_trigger` event (step, uncertainty value, mu/bearing/distance)
-  in **both** conditions — Condition B just logs and continues; nothing else changes yet.
-- Add the four timer hooks above as inert instrumentation (`model_load_ms` around both server managers'
-  `start()`; a `latency_ms`-passthrough field on any future logged VLM call) so Phase 1+ has somewhere to
-  write into. Extend `RolloutLogger.log_step`/`EpisodeLogger.log_frame` (whichever logger the chosen
-  rollout script uses — `run_navdp_rollout.py`/`run_qwen_vla_rollout.py` currently use `RolloutLogger`,
-  which has no timing fields at all today) with an optional `uncertainty_event: Optional[dict]` payload
-  carrying the four buckets plus `attempt`, `condition` (`"human"`/`"autonomous"`), `resolved` (goal found
-  before/after `max_units`).
+- `--uncertainty-threshold` CLI flag wired in `sam_vla/run_navdp_rollout.py`'s single-goal path
+  ([run_navdp_rollout.py:1113-1121](sam_vla/run_navdp_rollout.py:1113)), checked every step against
+  `BeliefGoalTracker.uncertainty_value()` ([run_navdp_rollout.py:724-765](sam_vla/run_navdp_rollout.py:724)).
+  Rising-edge only (`uncertainty_was_above` gate) so a long occlusion logs one `uncertainty_trigger`
+  event, not one per step spent above threshold. Currently always tags `condition: "autonomous"` with
+  every timing bucket `None` — Phase 2/3 is what actually populates them.
+- `RolloutLogger.log_step` takes an optional `uncertainty_event: Optional[dict]`
+  ([rollout_logger.py:49-65](sam_vla/logging/rollout_logger.py:49)), written into each step's manifest
+  entry (`None` on every step that isn't a trigger).
+- `model_load_ms` timer hooks are live in both server managers' `start()` —
+  [qwen_server_manager.py:77-104](sam_vla/vlm/qwen_server_manager.py:77) and
+  [internvl_server_manager.py:89-129](vl_direction/internvl_server_manager.py:89) — `0.0` if a server
+  was already running (nothing to attribute to this process's load), else wall time from `t0` to the
+  first successful health check.
 
-### Phase 1 — autonomous motion primitives (shared by both conditions' plumbing)
+### Phase 1 — autonomous motion primitives (shared by both conditions' plumbing) — DONE
 
-- New `rotate_sweep(env, pose, degrees_per_step, n_steps) -> list[(pose, rgb)]` — in-place rotation
-  sequence via `integrate_mars(pose, Action(0, 0, yaw_rate), dt)` + `env.step`, capturing a frame per
-  step, for feeding into `request_human_heading(frame)`/`retry(new_frame)`.
-- New `drive_toward_heading(env, pose, heading_deg, max_units, goal_visible_fn) -> (final_pose, units_covered, found)`
-  — repeatedly calls `integrate_mars`/`env.step` with `v_fwd` fixed and `yaw_rate` steering toward
-  `heading_deg`, stopping early if `goal_visible_fn()` becomes true or `max_units` is covered. This is the
-  piece that doesn't exist anywhere in the repo today (confirmed: `kb_teleop_vl.py` only ever resumes
-  manual WASD after `submit_heading`).
-- Both are pure/sim-facing helpers, candidates for `sam_vla/core/` (e.g. `sam_vla/core/uncertainty_motion.py`)
-  so they're reusable from whichever rollout script hosts Study 1.
+New module [`sam_vla/core/uncertainty_motion.py`](sam_vla/core/uncertainty_motion.py), pure/sim-facing
+(env is duck-typed: `step(pose)`, `get_observation(frame_idx)`, `get_full_observation(frame_idx)` — no
+VLM/UncertaintySession import), unit-tested against a fake env in
+[`sam_vla/core/tests/test_uncertainty_motion.py`](sam_vla/core/tests/test_uncertainty_motion.py) (11
+tests, run via `/home/gpu/miniconda3/envs/habitat/bin/python -m pytest
+sam_vla/core/tests/test_uncertainty_motion.py`):
+
+- `yaw_rate_toward_heading(current_yaw, target_yaw, turn_kp, max_yaw_rate) -> float` — the steering law
+  itself, pulled out so it's testable with no env at all; wraps the heading error to `(-pi, pi]` first so
+  it always turns the short way.
+- `rotate_sweep(env, pose, degrees_per_step, n_steps, dt=0.1) -> list[(pose, rgb)]` — in-place rotation
+  via `integrate_mars` + `env.step`, capturing a frame per step for
+  `request_human_heading(frame)`/`retry(new_frame)`. No translation, so `(x, z)` is unchanged when it
+  returns.
+- `drive_toward_heading(env, pose, heading_deg, max_units, goal_visible_fn, v_fwd=0.5, turn_kp=1.4,
+  max_yaw_rate=1.0, dt=0.1) -> (final_pose, units_covered, found)` — repeatedly calls
+  `integrate_mars`/`env.step` with `v_fwd` fixed, steering via `yaw_rate_toward_heading`, stopping early
+  once `goal_visible_fn(obs)` (obs = `env.get_full_observation()`, so callers can reuse the same
+  `MESH_GOAL_ID`-mask check the main rollout loop uses) is true or `max_units` m is covered. This is the
+  piece that didn't exist anywhere in the repo before (confirmed: `kb_teleop_vl.py`, now at
+  `scripts/habitat_tests/kb_teleop_vl.py`, only ever resumes manual WASD after `submit_heading`).
+
+  **Important convention note for Phase 2**: `heading_deg` here is an ABSOLUTE world heading (`Pose.yaw`'s
+  convention, degrees), *not* the rover-front-relative angle `UncertaintySession.submit_heading` deals in
+  (see `kb_teleop_vl.py`'s numpad mapping, `UNCERTAINTY_HEADING_KEYS` — 8=0°/front, 6=+90°/right,
+  4=-90°/left, positive=clockwise=right). Phase 2 must convert: capture the world yaw *before*
+  `rotate_sweep` spins the rover around (that's the human's "front" reference), then
+  `target_world_yaw_deg = reference_yaw_deg - human_angle_deg` (positive human angle = turn right = yaw
+  decreases, since `Pose.yaw` is CCW-positive) before calling `drive_toward_heading`.
 
 ### Phase 2 — Condition A (human-in-the-loop) wiring
 
