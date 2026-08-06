@@ -46,8 +46,18 @@ from sam_vla.core.goal_geometry import (
 )
 from sam_vla.core.pose_integrator import integrate_mars
 from sam_vla.core.types import Action, GoalSpec
+from sam_vla.core.uncertainty_motion import (
+    drive_toward_heading,
+    resolve_absolute_heading_deg,
+    rotate_sweep,
+)
 from sam_vla.logging.rollout_logger import RolloutLogger
 from sam_vla.perception.semantic_overlay import overlay_semantic_masks
+from vl_direction.client import get_client
+from vl_direction.intervention import mode_flag
+from vl_direction.intervention.mode_flag import SessionMode
+from vl_direction.qwen_server_manager import QwenServerManager as VlQwenServerManager
+from vl_direction.uncertainty_session import UncertaintySession
 
 
 def register_goal_obstacle_masks(
@@ -201,6 +211,180 @@ def _multi_goal_resegment(
     return goal_masks
 
 
+_UNCERTAINTY_HEADING_LAYOUT = {
+    # key -> (angle_deg, grid_row, grid_col); mirrors kb_teleop_vl.py's
+    # UNCERTAINTY_HEADING_KEYS numpad convention (8=front/0, 6=right/+90,
+    # 4=left/-90, 2=back/180, positive=clockwise) so a human used to that
+    # live demo sees the same layout here.
+    "7": (-45.0, 0, 0),
+    "8": (0.0, 0, 1),
+    "9": (45.0, 0, 2),
+    "4": (-90.0, 1, 0),
+    "6": (90.0, 1, 2),
+    "1": (-135.0, 2, 0),
+    "2": (180.0, 2, 1),
+    "3": (135.0, 2, 2),
+}
+
+
+def _prompt_human_heading(frame_rgb, sweep_description, attempt, max_retries):
+    """Study 1 (next.md) Phase 2 human-input surface: a modal Tk popup,
+    blocking (mainloop) until the human picks a heading. Needs a real
+    display (DISPLAY set / X available) -- the tradeoff next.md's Phase 2
+    open question flagged in choosing this over a headless terminal prompt:
+    the human sees the actual sweep frame, but this can't run over a bare
+    SSH session. If the window is closed without a pick, falls back to
+    0deg (straight ahead) rather than raising."""
+    import tkinter as tk
+
+    from PIL import Image, ImageTk
+
+    root = tk.Tk()
+    root.title(f"Uncertainty handoff -- attempt {attempt + 1}/{max_retries + 1}")
+    chosen = {"angle_deg": None}
+
+    img = Image.fromarray(np.asarray(frame_rgb, dtype=np.uint8))
+    tk_img = ImageTk.PhotoImage(img)
+    img_label = tk.Label(root, image=tk_img)
+    img_label.image = tk_img  # keep a reference so it isn't GC'd
+    img_label.grid(row=0, column=0, columnspan=3)
+
+    tk.Label(
+        root,
+        text=f"VLM sweep: {sweep_description}",
+        wraplength=400,
+        justify="left",
+    ).grid(row=1, column=0, columnspan=3, sticky="w")
+
+    def pick(angle):
+        chosen["angle_deg"] = angle
+        root.destroy()
+
+    for key, (angle, r, c) in _UNCERTAINTY_HEADING_LAYOUT.items():
+        tk.Button(
+            root,
+            text=f"{key}: {angle:+.0f}°",
+            width=8,
+            command=lambda a=angle: pick(a),
+        ).grid(row=2 + r, column=c)
+
+    root.mainloop()
+    return chosen["angle_deg"] if chosen["angle_deg"] is not None else 0.0
+
+
+def _run_uncertainty_handoff(
+    env,
+    pose,
+    step,
+    episode_id,
+    client,
+    current_uncertainty,
+    uncertainty_threshold,
+    dt,
+    sweep_degrees_per_step,
+    sweep_steps,
+    max_units,
+    max_retries,
+    drive_v_fwd,
+    lost_goal_min_px,
+    prompt_fn=None,
+):
+    """Study 1 (next.md) Phase 2, Condition A: pause normal policy stepping
+    and run the stop-rotate-ask-drive-retry cycle around the real
+    UncertaintySession + Phase 1's rotate_sweep/drive_toward_heading. A
+    fresh UncertaintySession is built per call (covariance_value = the live
+    uncertainty at this trigger) rather than reused across triggers, since
+    UncertaintySession.covariance_value is fixed at construction -- see
+    next.md's non-goal against changing vl_direction's own contract.
+
+    prompt_fn(frame, sweep_description, attempt, max_retries) -> angle_deg is
+    the human-input surface (a Tk popup by default, see
+    _prompt_human_heading) -- injectable so this orchestration is testable
+    with a canned prompt_fn and no real display/VLM.
+
+    Returns a dict: final_pose, attempt, resolved, vlm_inference_ms,
+    human_decision_ms, drive_ms.
+    """
+    prompt_fn = prompt_fn if prompt_fn is not None else _prompt_human_heading
+    session = UncertaintySession(
+        episode_id=episode_id,
+        covariance_threshold=uncertainty_threshold,
+        covariance_value=current_uncertainty,
+        client=client,
+    )
+
+    def goal_visible_fn(obs):
+        return (
+            int((np.asarray(obs.semantic) == MESH_GOAL_ID).sum()) >= lost_goal_min_px
+        )
+
+    reference_yaw = pose.yaw
+    cur_pose = pose
+    vlm_inference_ms = 0.0
+    human_decision_ms = 0.0
+    drive_ms = 0.0
+    attempt = 0
+    resolved = False
+
+    mode_flag.set_mode(SessionMode.HUMAN_INTERVENED)
+    try:
+        while attempt <= max_retries and not resolved:
+            frames = rotate_sweep(
+                env,
+                cur_pose,
+                sweep_degrees_per_step,
+                sweep_steps,
+                dt=dt,
+                frame_idx_start=step,
+            )
+            cur_pose = frames[-1][0]
+            last_frame = frames[-1][1]
+
+            vlm_result = (
+                session.request_human_heading(last_frame)
+                if attempt == 0
+                else session.retry(last_frame)
+            )
+            vlm_inference_ms += vlm_result.latency_ms
+            sweep_description = vlm_result.raw_response
+
+            t_human = time.monotonic()
+            angle_deg = prompt_fn(last_frame, sweep_description, attempt, max_retries)
+            human_decision_ms += (time.monotonic() - t_human) * 1000.0
+
+            submit_result = session.submit_heading(
+                angle_deg=angle_deg, max_units=max_units
+            )
+            payload = submit_result.uncertainty_payload
+            target_heading_deg = resolve_absolute_heading_deg(reference_yaw, angle_deg)
+
+            t_drive = time.monotonic()
+            cur_pose, _units, found = drive_toward_heading(
+                env,
+                cur_pose,
+                target_heading_deg,
+                payload.max_units,
+                goal_visible_fn,
+                v_fwd=drive_v_fwd,
+                dt=dt,
+                frame_idx_start=step,
+            )
+            drive_ms += (time.monotonic() - t_drive) * 1000.0
+            resolved = found
+            attempt += 1
+    finally:
+        mode_flag.reset()
+
+    return {
+        "final_pose": cur_pose,
+        "attempt": attempt,
+        "resolved": resolved,
+        "vlm_inference_ms": vlm_inference_ms,
+        "human_decision_ms": human_decision_ms,
+        "drive_ms": drive_ms,
+    }
+
+
 def run(
     scene_path: str,
     heightmap_path: str,
@@ -256,6 +440,13 @@ def run(
     goal_success_radius: float = 1.0,
     base_marker_radius: float = None,
     uncertainty_threshold: float = None,
+    uncertainty_condition: str = "autonomous",
+    uncertainty_max_retries: int = 3,
+    uncertainty_max_units: float = None,
+    uncertainty_sweep_degrees_per_step: float = 45.0,
+    uncertainty_sweep_steps: int = 8,
+    uncertainty_drive_v_fwd: float = 0.5,
+    uncertainty_mock_client: bool = False,
 ) -> None:
     if base_station and multi_goal:
         raise ValueError(
@@ -277,10 +468,31 @@ def run(
     qwen_manager = QwenServerManager()
     logger = RolloutLogger()
 
+    # Study 1 (next.md) Phase 2, Condition A: only spin up vl_direction's own
+    # Qwen server + client when a human-in-the-loop handoff can actually fire
+    # (single-goal mode, threshold set, condition asked for). get_client("qwen")
+    # is used rather than the InternVL backend -- InternVL's model runner is
+    # still NotImplementedError stubs (see vl_direction/client.py's docstring),
+    # so "qwen" is the only backend that's actually wired end-to-end today,
+    # exactly what kb_teleop_vl.py's real, working integration uses.
+    human_handoff_enabled = (
+        uncertainty_condition == "human"
+        and uncertainty_threshold is not None
+        and not multi_goal
+        and not base_station
+    )
+    vl_qwen_manager = None
+    uncertainty_client = None
+    if human_handoff_enabled:
+        uncertainty_client = get_client("mock" if uncertainty_mock_client else "qwen")
+        if not uncertainty_mock_client:
+            vl_qwen_manager = VlQwenServerManager()
+    uncertainty_model_load_charged = False
+
     with MarsHabitatEnv(
         scene_path,
         heightmap_path,
-        services=[qwen_manager],
+        services=[qwen_manager] + ([vl_qwen_manager] if vl_qwen_manager else []),
         start_x=start_x,
         start_z=start_z,
         start_yaw=math.radians(start_yaw_deg),
@@ -728,9 +940,41 @@ def run(
                     current_uncertainty = belief_tracker.uncertainty_value()
                     is_above = current_uncertainty >= uncertainty_threshold
                     if is_above and not uncertainty_was_above:
-                        # Study 1 Phase 0: trigger is logged only -- neither condition
-                        # (human handoff vs. autonomous) is wired up yet (Phase 2/3),
-                        # so this always reports "autonomous" with no resolution.
+                        # Study 1 Phase 2: Condition A (human_handoff_enabled) pauses
+                        # normal policy stepping and runs the stop-rotate-ask-drive-
+                        # retry cycle; Condition B (the default) just logs and lets
+                        # the policy keep driving on its own belief -- see next.md's
+                        # "What Condition B means" section.
+                        handoff = None
+                        if human_handoff_enabled:
+                            handoff = _run_uncertainty_handoff(
+                                env=env,
+                                pose=new_pose,
+                                step=step,
+                                episode_id=Path(out_dir).name,
+                                client=uncertainty_client,
+                                current_uncertainty=current_uncertainty,
+                                uncertainty_threshold=uncertainty_threshold,
+                                dt=dt,
+                                sweep_degrees_per_step=uncertainty_sweep_degrees_per_step,
+                                sweep_steps=uncertainty_sweep_steps,
+                                max_units=uncertainty_max_units,
+                                max_retries=uncertainty_max_retries,
+                                drive_v_fwd=uncertainty_drive_v_fwd,
+                                lost_goal_min_px=lost_goal_min_px,
+                            )
+                            new_pose = handoff["final_pose"]
+
+                        model_load_ms = None
+                        if human_handoff_enabled:
+                            if vl_qwen_manager is None:
+                                model_load_ms = 0.0  # mock client, nothing to load
+                            elif not uncertainty_model_load_charged:
+                                model_load_ms = vl_qwen_manager.load_ms
+                                uncertainty_model_load_charged = True
+                            else:
+                                model_load_ms = 0.0  # already charged this episode
+
                         uncertainty_event = {
                             "type": "uncertainty_trigger",
                             "step": step,
@@ -748,18 +992,24 @@ def run(
                             ),
                             "bearing": belief_tracker.bearing(),
                             "distance": belief_tracker.distance(),
-                            "condition": "autonomous",
-                            "attempt": 0,
-                            "resolved": None,
-                            "model_load_ms": None,
-                            "vlm_inference_ms": None,
-                            "human_decision_ms": None,
-                            "drive_ms": None,
+                            "condition": uncertainty_condition,
+                            "attempt": handoff["attempt"] if handoff else 0,
+                            "resolved": handoff["resolved"] if handoff else None,
+                            "model_load_ms": model_load_ms,
+                            "vlm_inference_ms": (
+                                handoff["vlm_inference_ms"] if handoff else None
+                            ),
+                            "human_decision_ms": (
+                                handoff["human_decision_ms"] if handoff else None
+                            ),
+                            "drive_ms": handoff["drive_ms"] if handoff else None,
                         }
                         print(
                             f"[uncertainty] trigger at step={step} "
                             f"uncertainty={current_uncertainty:.4f} "
-                            f"(threshold={uncertainty_threshold})",
+                            f"(threshold={uncertainty_threshold}) "
+                            f"condition={uncertainty_condition} "
+                            f"resolved={uncertainty_event['resolved']}",
                             flush=True,
                         )
                     uncertainty_was_above = is_above
@@ -1116,8 +1366,56 @@ if __name__ == "__main__":
         default=None,
         help="Study 1 (next.md) trigger: BeliefGoalTracker.uncertainty_value() crossing this "
         "logs an uncertainty_trigger event (single-goal mode only, i.e. not --multi-goal/"
-        "--base-station). Default: off (no trigger, no behavior change). Phase 0 only logs "
-        "the crossing -- nothing acts on it yet.",
+        "--base-station). Default: off (no trigger, no behavior change).",
+    )
+    parser.add_argument(
+        "--uncertainty-condition",
+        choices=["autonomous", "human"],
+        default="autonomous",
+        help="Study 1 ablation condition at each --uncertainty-threshold crossing: "
+        "'autonomous' (Condition B, default) just logs the trigger and lets the policy "
+        "keep driving; 'human' (Condition A) pauses policy stepping and runs the "
+        "stop-rotate-ask-drive-retry handoff via a Tk popup. No effect if "
+        "--uncertainty-threshold is unset.",
+    )
+    parser.add_argument(
+        "--uncertainty-max-retries",
+        type=int,
+        default=3,
+        help="Condition A: cap on rotate+ask+drive retries per trigger before giving up "
+        "unresolved",
+    )
+    parser.add_argument(
+        "--uncertainty-max-units",
+        type=float,
+        default=None,
+        help="Condition A: forward distance (m) to drive per attempt before re-sweeping; "
+        "default falls through to vl_direction.config.DEFAULT_MAX_UNITS via "
+        "UncertaintySession.submit_heading",
+    )
+    parser.add_argument(
+        "--uncertainty-sweep-degrees-per-step",
+        type=float,
+        default=45.0,
+        help="Condition A: rotation increment (deg) per rotate_sweep step",
+    )
+    parser.add_argument(
+        "--uncertainty-sweep-steps",
+        type=int,
+        default=8,
+        help="Condition A: number of rotate_sweep steps (default 8 * 45deg = full 360 sweep)",
+    )
+    parser.add_argument(
+        "--uncertainty-drive-v-fwd",
+        type=float,
+        default=0.5,
+        help="Condition A: forward speed (m/s) during drive_toward_heading",
+    )
+    parser.add_argument(
+        "--uncertainty-mock-client",
+        action="store_true",
+        help="Condition A: use MockInternVLClient instead of spawning vl_direction's own "
+        "Qwen server -- for exercising the handoff loop without a live qwen_vlm server",
     )
     args = parser.parse_args()
 
@@ -1187,4 +1485,11 @@ if __name__ == "__main__":
         goal_success_radius=args.goal_success_radius,
         base_marker_radius=args.base_marker_radius,
         uncertainty_threshold=args.uncertainty_threshold,
+        uncertainty_condition=args.uncertainty_condition,
+        uncertainty_max_retries=args.uncertainty_max_retries,
+        uncertainty_max_units=args.uncertainty_max_units,
+        uncertainty_sweep_degrees_per_step=args.uncertainty_sweep_degrees_per_step,
+        uncertainty_sweep_steps=args.uncertainty_sweep_steps,
+        uncertainty_drive_v_fwd=args.uncertainty_drive_v_fwd,
+        uncertainty_mock_client=args.uncertainty_mock_client,
     )

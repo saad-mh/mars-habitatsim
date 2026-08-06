@@ -6,6 +6,7 @@ import pytest
 from sam_vla.core.types import Observation, Pose
 from sam_vla.core.uncertainty_motion import (
     drive_toward_heading,
+    resolve_absolute_heading_deg,
     rotate_sweep,
     yaw_rate_toward_heading,
 )
@@ -83,6 +84,23 @@ def test_yaw_rate_toward_heading_clamps_to_max():
 def test_yaw_rate_toward_heading_zero_at_target():
     rate = yaw_rate_toward_heading(1.2, 1.2, turn_kp=5.0, max_yaw_rate=10.0)
     assert rate == pytest.approx(0.0)
+
+
+def test_resolve_absolute_heading_deg_front_is_reference_yaw():
+    result = resolve_absolute_heading_deg(math.radians(30.0), 0.0)
+    assert result == pytest.approx(30.0)
+
+
+def test_resolve_absolute_heading_deg_right_subtracts():
+    # Facing world yaw=0 (i.e. +x), human says "turn right 90" -> since
+    # Pose.yaw is CCW-positive, a rightward/clockwise turn is a DEcrease.
+    result = resolve_absolute_heading_deg(0.0, 90.0)
+    assert result == pytest.approx(-90.0)
+
+
+def test_resolve_absolute_heading_deg_left_adds():
+    result = resolve_absolute_heading_deg(0.0, -90.0)
+    assert result == pytest.approx(90.0)
 
 
 def test_rotate_sweep_returns_one_frame_per_step():

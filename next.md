@@ -117,20 +117,54 @@ sam_vla/core/tests/test_uncertainty_motion.py`):
   `target_world_yaw_deg = reference_yaw_deg - human_angle_deg` (positive human angle = turn right = yaw
   decreases, since `Pose.yaw` is CCW-positive) before calling `drive_toward_heading`.
 
-### Phase 2 — Condition A (human-in-the-loop) wiring
+### Phase 2 — Condition A (human-in-the-loop) wiring — DONE
 
-- On trigger: pause normal policy stepping, run `rotate_sweep`, call
-  `uncertainty_session.request_human_heading(frame)`, record `vlm_inference_ms` from the result.
-- Present the sweep result to a human and collect a heading — since the target rollout scripts are
-  headless (no Tkinter), use a simple blocking terminal prompt (`input()`) showing the VLM's sweep
-  description and the available heading choices, timestamped start-to-input for `human_decision_ms`. (A
-  Tk popup mirroring `kb_teleop_vl.py`'s numpad-heading UI is a fine alternative if a visual view of the
-  sweep frames matters more than running headless — flag as an open question, not blocking.)
-- Call `submit_heading(angle_deg=chosen)`, run `drive_toward_heading` for the returned `max_units`,
-  timing it into `drive_ms`. If not found, call `retry()` and repeat (Phase 1's `rotate_sweep` again),
-  capping attempts via a new `--uncertainty-max-retries` flag.
-- Flip `SessionMode` to `HUMAN_INTERVENED` for the duration of the halt (currently unused by any call
-  site — this is the first real consumer) so `hci_metrics.py`'s by-mode aggregates work unmodified.
+Resolved open question: **Tk popup**, not a terminal prompt (user's explicit choice — trades headless/
+SSH-friendliness for showing the human the actual sweep frame). Implemented directly in
+[`sam_vla/run_navdp_rollout.py`](sam_vla/run_navdp_rollout.py) rather than a new module, since Study 1 is
+specific to this entry point:
+
+- `_prompt_human_heading(frame_rgb, sweep_description, attempt, max_retries) -> angle_deg` — modal Tk
+  popup (blocks on `mainloop()`), numpad-style buttons mirroring `kb_teleop_vl.py`'s
+  `UNCERTAINTY_HEADING_KEYS` layout (`_UNCERTAINTY_HEADING_LAYOUT`), showing the sweep frame + the VLM's
+  sweep description. Falls back to `0.0` (front) if the window is closed without a pick, rather than
+  raising. Needs a real display — that's the accepted tradeoff of the Tk choice.
+- `_run_uncertainty_handoff(env, pose, step, episode_id, client, current_uncertainty,
+  uncertainty_threshold, dt, sweep_degrees_per_step, sweep_steps, max_units, max_retries, drive_v_fwd,
+  lost_goal_min_px, prompt_fn=None) -> dict` — the actual stop-rotate-ask-drive-retry loop: `rotate_sweep`
+  → `UncertaintySession.request_human_heading`/`.retry` (`vlm_inference_ms` accumulated from
+  `result.latency_ms`) → `prompt_fn` (timed into `human_decision_ms`) → `submit_heading` →
+  `resolve_absolute_heading_deg` (converts the human's rover-front-relative angle into the absolute world
+  heading `drive_toward_heading` needs, using the yaw captured *before* `rotate_sweep` ran as the "front"
+  reference) → `drive_toward_heading` (timed into `drive_ms`), looping up to `max_retries` if not
+  resolved. Flips `SessionMode` to `HUMAN_INTERVENED` for the duration via a `try/finally` (guaranteed
+  reset even if `prompt_fn` raises — tested). `prompt_fn` is injectable so this whole loop is unit-tested
+  (4 tests in
+  [`sam_vla/tests/test_run_navdp_rollout_uncertainty.py`](sam_vla/tests/test_run_navdp_rollout_uncertainty.py))
+  against a fake env + `MockInternVLClient`, with no real display, sim, or live VLM.
+- A **fresh `UncertaintySession` is constructed per trigger** (not reused across triggers/episode), with
+  `covariance_value=current_uncertainty` — `UncertaintySession.covariance_value` is fixed at
+  construction, so this is the only way to have each trigger's VLM context reflect the *actual* live
+  uncertainty without changing `vl_direction`'s own contract (the stated non-goal).
+- **Backend note**: uses `get_client("qwen")` / `vl_direction.qwen_server_manager.QwenServerManager`
+  (confirmed real and working, same as `kb_teleop_vl.py`'s live integration) rather than the InternVL
+  backend/`InternVLServerManager` the "Existing building blocks" table above names — InternVL's model
+  runner is still `NotImplementedError` stubs (see `vl_direction/client.py`'s module docstring), so it
+  can't actually serve a request yet. Added the same `model_load_ms` timer hook to
+  `vl_direction/qwen_server_manager.py` that Phase 0 added to the other two managers (it hadn't been
+  covered, since Phase 0's table didn't know Phase 2 would end up needing this specific one). New CLI
+  flags: `--uncertainty-condition {autonomous,human}` (default `autonomous`, i.e. unchanged Condition B
+  behavior), `--uncertainty-max-retries`, `--uncertainty-max-units`,
+  `--uncertainty-sweep-degrees-per-step`, `--uncertainty-sweep-steps`, `--uncertainty-drive-v-fwd`,
+  `--uncertainty-mock-client` (swaps in `MockInternVLClient`, skipping the real server spawn — for
+  exercising the flow without a live `qwen_vlm` server).
+- `model_load_ms` is charged once per episode (first trigger only; `0.0` on subsequent triggers in the
+  same run) via a `uncertainty_model_load_charged` flag — resolves Phase 0's open question in favor of
+  "once per process/episode," since each `run()` call is one episode with its own server subprocess.
+
+**Not yet exercised end-to-end against the real sim** (no GPU/display run performed as part of this
+change — only unit/orchestration tests above): a real `--uncertainty-condition human` rollout still needs
+a live `qwen_vlm` server, a display for the Tk popup, and a real `--ckpt`/`--scene-path` to actually try.
 
 ### Phase 3 — Condition B (autonomous baseline) + paired runs
 

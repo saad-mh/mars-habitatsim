@@ -42,6 +42,18 @@ def yaw_rate_toward_heading(
     return float(np.clip(turn_kp * err, -max_yaw_rate, max_yaw_rate))
 
 
+def resolve_absolute_heading_deg(reference_yaw: float, human_angle_deg: float) -> float:
+    """Converts a human-supplied rover-front-relative heading (the convention
+    UncertaintySession.submit_heading's angle_deg uses: 0=front, positive=
+    clockwise/right -- matching kb_teleop_vl.py's numpad mapping,
+    UNCERTAINTY_HEADING_KEYS) into an absolute world heading in degrees
+    (Pose.yaw's CCW-positive-from-+x convention), anchored at reference_yaw
+    (radians) -- the world yaw captured BEFORE rotate_sweep ran, i.e. the
+    human's "front" when they were asked. Pose.yaw is CCW-positive, so a
+    clockwise/rightward human angle subtracts from the reference yaw."""
+    return math.degrees(reference_yaw) - human_angle_deg
+
+
 def rotate_sweep(
     env,
     pose: Pose,
