@@ -62,6 +62,10 @@ class InternVLServerManager:
         )
         self._process = None
         self._owns_process = False
+        # Study 1 (next.md) model_load_ms bucket: elapsed wall time this call to
+        # start() spent waiting for the subprocess to come up. 0.0 if a server was
+        # already running (nothing to attribute to this process's load).
+        self.load_ms = None
 
     def _health_check(self, timeout: float = 1.0) -> bool:
         try:
@@ -83,11 +87,13 @@ class InternVLServerManager:
             return False
 
     def start(self) -> None:
+        t0 = time.monotonic()
         if self._health_check():
             print(
                 f"[InternVLServerManager] server already running on port {self.port}, not spawning"
             )
             self._owns_process = False
+            self.load_ms = 0.0
             return
 
         print(
@@ -107,7 +113,8 @@ class InternVLServerManager:
         deadline = time.time() + self.startup_timeout
         while time.time() < deadline:
             if self._health_check():
-                print("[InternVLServerManager] server is up")
+                self.load_ms = (time.monotonic() - t0) * 1000.0
+                print(f"[InternVLServerManager] server is up ({self.load_ms:.0f}ms)")
                 return
             if self._process.poll() is not None:
                 raise RuntimeError(

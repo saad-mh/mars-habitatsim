@@ -53,11 +53,16 @@ class RolloutLogger:
         pose: Pose,
         vla_result: Optional[dict] = None,
         vis_rgb: Optional[np.ndarray] = None,
+        uncertainty_event: Optional[dict] = None,
     ) -> None:
         """vis_rgb, if given, is the goal/obstacle-overlaid version of obs.rgb
         (see perception.semantic_overlay.overlay_semantic_masks) for the same
         step -- used in place of the raw frame by save_frames/save_video so the
-        dumped video shows what the rover's mask-conditioned policy is seeing."""
+        dumped video shows what the rover's mask-conditioned policy is seeing.
+
+        uncertainty_event, if given, is a Study 1 (next.md) uncertainty_trigger
+        payload -- one-off per rising-edge crossing of --uncertainty-threshold,
+        not per step. None on every other step."""
         rgb = np.asarray(obs.rgb, dtype=np.uint8)
         pose_tuple = (pose.x, pose.y, pose.z, pose.yaw)
         action_tuple = (action.v_fwd, action.v_lat, action.yaw_rate)
@@ -91,6 +96,7 @@ class RolloutLogger:
                 ),
                 "distance_to_goal": dist,
                 "timestamp": timestamp,
+                "uncertainty_event": uncertainty_event,
             }
         )
 

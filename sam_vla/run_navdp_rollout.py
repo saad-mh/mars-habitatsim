@@ -255,6 +255,7 @@ def run(
     dwell_seconds: float = 5.0,
     goal_success_radius: float = 1.0,
     base_marker_radius: float = None,
+    uncertainty_threshold: float = None,
 ) -> None:
     if base_station and multi_goal:
         raise ValueError(
@@ -495,6 +496,10 @@ def run(
         )
         cbf_active_steps = 0
         hard_gate_fired_steps = 0
+        # Study 1 Phase 0 (next.md): rising-edge trigger only -- logged once per
+        # crossing, not every step spent above threshold, so a long occlusion
+        # doesn't spam one uncertainty_trigger event per step.
+        uncertainty_was_above = False
 
         for step in range(max_steps):
             obs = env.get_observation(frame_idx=step)
@@ -716,8 +721,48 @@ def run(
 
             new_pose = integrate_mars(obs.pose, action, dt)
             env.step(new_pose)
+            uncertainty_event = None
             if not multi_goal and not base_station:
                 belief_tracker.propagate(action, dt)
+                if uncertainty_threshold is not None:
+                    current_uncertainty = belief_tracker.uncertainty_value()
+                    is_above = current_uncertainty >= uncertainty_threshold
+                    if is_above and not uncertainty_was_above:
+                        # Study 1 Phase 0: trigger is logged only -- neither condition
+                        # (human handoff vs. autonomous) is wired up yet (Phase 2/3),
+                        # so this always reports "autonomous" with no resolution.
+                        uncertainty_event = {
+                            "type": "uncertainty_trigger",
+                            "step": step,
+                            "uncertainty": current_uncertainty,
+                            "threshold": uncertainty_threshold,
+                            "belief_forward": (
+                                None
+                                if belief_tracker.belief_g is None
+                                else float(belief_tracker.belief_g[0])
+                            ),
+                            "belief_left": (
+                                None
+                                if belief_tracker.belief_g is None
+                                else float(belief_tracker.belief_g[1])
+                            ),
+                            "bearing": belief_tracker.bearing(),
+                            "distance": belief_tracker.distance(),
+                            "condition": "autonomous",
+                            "attempt": 0,
+                            "resolved": None,
+                            "model_load_ms": None,
+                            "vlm_inference_ms": None,
+                            "human_decision_ms": None,
+                            "drive_ms": None,
+                        }
+                        print(
+                            f"[uncertainty] trigger at step={step} "
+                            f"uncertainty={current_uncertainty:.4f} "
+                            f"(threshold={uncertainty_threshold})",
+                            flush=True,
+                        )
+                    uncertainty_was_above = is_above
 
             if base_station:
                 dist_target = (
@@ -785,7 +830,12 @@ def run(
                     **cbf_info,
                 }
             logger.log_step(
-                obs, action, new_pose, vla_result=vla_result, vis_rgb=vis_rgb
+                obs,
+                action,
+                new_pose,
+                vla_result=vla_result,
+                vis_rgb=vis_rgb,
+                uncertainty_event=uncertainty_event,
             )
 
             if step % 10 == 0:
@@ -1060,6 +1110,15 @@ if __name__ == "__main__":
         default=None,
         help="radius (m) of the synthetic base-station marker disc (default: --obj-mask-radius)",
     )
+    parser.add_argument(
+        "--uncertainty-threshold",
+        type=float,
+        default=None,
+        help="Study 1 (next.md) trigger: BeliefGoalTracker.uncertainty_value() crossing this "
+        "logs an uncertainty_trigger event (single-goal mode only, i.e. not --multi-goal/"
+        "--base-station). Default: off (no trigger, no behavior change). Phase 0 only logs "
+        "the crossing -- nothing acts on it yet.",
+    )
     args = parser.parse_args()
 
     if args.base_station and args.multi_goal:
@@ -1127,4 +1186,5 @@ if __name__ == "__main__":
         dwell_seconds=args.dwell_seconds,
         goal_success_radius=args.goal_success_radius,
         base_marker_radius=args.base_marker_radius,
+        uncertainty_threshold=args.uncertainty_threshold,
     )
