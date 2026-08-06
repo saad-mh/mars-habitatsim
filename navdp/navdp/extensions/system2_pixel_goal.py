@@ -184,6 +184,113 @@ def render_goal_mask(
     return mask
 
 
+@dataclass
+class ExploreDecision:
+    direction: str        # "left" | "right" | "back" | "forward"
+    raw: str = ""         # the VLM's raw answer (for logging/debug)
+
+
+class QwenExplorer:
+    """Frozen Qwen2.5-VL as a FREE-SPACE explorer -- picks the next explore
+    primitive (left/right/back/forward) from the current view + a short memory of
+    directions already tried.
+
+    It is NOT a target detector. In an unfamiliar Mars scene the VLM has no
+    semantic goal to recognise, so the *only* thing asked of it is a geometric,
+    zero-shot judgement it CAN make: "which way is the most open, drivable
+    terrain to explore?". The "found" decision is made elsewhere (the goal-mesh
+    mask reappearing), never by this model.
+
+    Runs on the slow System-2 cadence (see the rollout's --qwen-explore-every);
+    between calls the last decision is held and the fast diffusion policy keeps
+    executing it. The chosen primitive is written into the SAME command channel
+    the VLA adapter already consumes, so no change to the policy path is needed.
+
+    4-bit loading keeps the 7B within a 24 GB 4090; use the 3B for headroom.
+    """
+
+    DEFAULT_PROMPT = (
+        "You are steering a ground rover over rough, unfamiliar Mars-like terrain. "
+        "A goal is currently OUT OF VIEW and you must explore to reveal it. "
+        "Looking ONLY at this image, which single direction leads to the most open, "
+        "flat, drivable terrain that would uncover new area? "
+        "Recently tried directions (avoid repeating if they led nowhere): {memory}. "
+        "Answer with exactly one word: LEFT, RIGHT, BACK, or FORWARD."
+    )
+
+    def __init__(
+        self,
+        model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        device: str = "cuda",
+        load_in_4bit: bool = True,
+        max_new_tokens: int = 16,
+        memory_len: int = 4,
+        prompt_template: Optional[str] = None,
+    ):
+        self.model_id = model_id
+        self.device = device
+        self.load_in_4bit = bool(load_in_4bit)
+        self.max_new_tokens = int(max_new_tokens)
+        self.prompt_template = prompt_template or self.DEFAULT_PROMPT
+        self.memory: list = []               # recent decisions, most-recent last
+        self.memory_len = max(int(memory_len), 0)
+        self._model = None
+        self._processor = None
+
+    def _ensure_loaded(self) -> None:
+        if self._model is not None:
+            return
+        import torch
+        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+        kwargs = {"torch_dtype": torch.float16, "device_map": self.device}
+        if self.load_in_4bit:
+            from transformers import BitsAndBytesConfig
+
+            kwargs.pop("device_map", None)
+            kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+            kwargs["device_map"] = "auto"
+        self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(self.model_id, **kwargs).eval()
+        self._processor = AutoProcessor.from_pretrained(self.model_id)
+
+    def decide(self, rgb: np.ndarray, extra_hint: str = "") -> ExploreDecision:
+        self._ensure_loaded()
+        import torch
+        from PIL import Image
+
+        image = Image.fromarray(np.asarray(rgb, dtype=np.uint8))
+        mem = ", ".join(self.memory) if self.memory else "none yet"
+        prompt = self.prompt_template.format(memory=mem)
+        if extra_hint:
+            prompt = prompt + " " + extra_hint
+        messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}]
+        text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self._processor(text=[text], images=[image], return_tensors="pt").to(self._model.device)
+        with torch.no_grad():
+            out = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+        gen = out[0, inputs["input_ids"].shape[1]:]
+        answer = self._processor.decode(gen, skip_special_tokens=True)
+        direction = parse_explore_direction(answer)
+        if self.memory_len:
+            self.memory.append(direction)
+            self.memory = self.memory[-self.memory_len:]
+        return ExploreDecision(direction=direction, raw=answer.strip())
+
+
+def parse_explore_direction(text: str, default: str = "left") -> str:
+    """Pull a single explore primitive out of a VLM answer. Order matters: check
+    the more specific words first. Falls back to `default` if none is found."""
+    t = (text or "").lower()
+    for word in ("forward", "straight", "back", "reverse", "left", "right"):
+        if word in t:
+            if word in ("straight",):
+                return "forward"
+            if word in ("reverse",):
+                return "back"
+            return word
+    return default
+
+
 class System2Scheduler:
     """Run the slow grounder every `every` steps; hold the last pixel goal.
 

@@ -11,6 +11,7 @@ from .belief_control import (
     strength_from_sigma_ale,
 )
 from .foresight_gate import ForesightGate, ForesightResult, action_to_delta_pose
+from .grounding_dino import Detection, GroundingDINODetector
 from .obstacle_map import DepthObstacleMap
 from .safe_diffusion import (
     build_cbf_guidance,
@@ -26,11 +27,14 @@ from .safe_diffusion import (
     tangential_around_obstacle,
 )
 from .system2_pixel_goal import (
+    ExploreDecision,
     PixelGoal,
     PixelGoalGrounder,
+    QwenExplorer,
     QwenVLPixelGoal,
     StubPixelGoal,
     System2Scheduler,
+    parse_explore_direction,
     parse_pixel_coordinate,
     render_goal_mask,
 )
@@ -51,12 +55,15 @@ __all__ = [
     "EpistemicGateDecision",
     "ForesightGate",
     "ForesightResult",
+    "ExploreDecision",
     "PixelGoal",
     "PixelGoalGrounder",
+    "QwenExplorer",
     "QwenVLPixelGoal",
     "RouteManager",
     "StubPixelGoal",
     "System2Scheduler",
+    "parse_explore_direction",
     "action_to_delta_pose",
     "build_cbf_guidance",
     "cbf_horizon_cost",
@@ -83,4 +90,6 @@ __all__ = [
     "refine_bank_with_model",
     "speed_scale_from_u_occ",
     "strength_from_sigma_ale",
+    "Detection",
+    "GroundingDINODetector",
 ]
