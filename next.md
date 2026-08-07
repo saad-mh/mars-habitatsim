@@ -319,31 +319,114 @@ in this path today. Perturb `action.v_fwd`/`action.v_lat`/`action.yaw_rate` (equ
 `dx`/`dz`/`dtheta` `integrate_mars` computes internally) with the ported formula immediately before this
 call.
 
-## New building block: `sam_vla/core/sensor_noise.py`
+## New building block: `sam_vla/core/sensor_noise.py` — DONE
 
 - `apply_odom_noise(action: Action, odom_noise_std: float, rng: np.random.Generator) -> Action` — pure
   function, returns a new `Action` with the scenario.py formula applied (full-scale on `v_fwd`/`v_lat`,
   half-scale on `yaw_rate`, matching the dx/dy/dtheta split since these are the same physical quantities
-  pre-integration). Unit-testable with no sim dependency, same style as Phase 0's `ghost_mask.py` pure
-  functions.
-- Called at `run_navdp_rollout.py:713`, gated by a new `--drive-odom-noise-std` CLI flag (distinct name
-  from the existing `--belief-odom-noise`, to keep "real motion noise" and "belief's own noise-belief"
-  unambiguous in logs and flag help text).
+  pre-integration). `odom_noise_std <= 0.0` returns `action` unchanged with no RNG draw. Unit-tested (7
+  tests: identity at 0/negative std, no RNG consumption when disabled, all-three-fields perturbed,
+  determinism under a seeded RNG, the 1.0:0.5 translational:yaw std ratio checked empirically over 20k
+  draws, return type) in
+  [`sam_vla/core/tests/test_sensor_noise.py`](sam_vla/core/tests/test_sensor_noise.py) — no sim dependency.
+- **Clarification the original plan didn't spell out**: `belief_exp/scenario.py` itself keeps *ground
+  truth* motion clean (`ego_motion_true` is explicitly noise-free) and only corrupts the *odometry report*
+  fed to `SubgoalBeliefBank.update()` — i.e. reality stays clean, the belief's input is noisy. This
+  study's stated goal ("real noise... drives the rover", "not a numpy approximation") is a different
+  experiment: it corrupts the rover's *actual physical motion*. Naively perturbing the same `action`
+  object used for both `integrate_mars`/`env.step()` (reality) and `belief_tracker.propagate()` (the
+  belief's dead reckoning) would give the belief tracker perfect, noise-free knowledge of exactly how much
+  it got perturbed — no belief/reality mismatch at all, defeating the point of watching the belief's own
+  uncertainty trajectory. Implemented instead as two separate values at the injection site: a
+  `commanded_action` (post-policy/CBF, clean — what `belief_tracker.propagate()` dead-reckons on, same as
+  a real robot integrating its own commanded/measured velocity) and an `executed_action` (
+  `apply_odom_noise(commanded_action, ...)` — what actually moves the rover via `integrate_mars`/
+  `env.step()`, and what gets logged/shown in the video overlay as the real driving delta).
+- Called at [`run_navdp_rollout.py`](sam_vla/run_navdp_rollout.py)'s confirmed injection site (search
+  `commanded_action`/`executed_action` — line numbers have shifted since this plan was written), gated by
+  new `--drive-odom-noise-std` (default `0.0`, byte-identical to today's behavior) and
+  `--drive-odom-noise-seed` CLI flags — distinct names from the existing `--belief-odom-noise`, to keep
+  "real motion noise" and "belief's own noise-belief" unambiguous in logs and flag help text. One RNG
+  (`np.random.default_rng(drive_odom_noise_seed)`) constructed once per episode so `--drive-odom-noise-seed`
+  reproduces the exact noise sequence run-to-run.
+- Also added: per-step `uncertainty_value` in the single-goal path's logged `vla_result` (previously only
+  present inside the rarer `uncertainty_event` payload, logged only on threshold-crossings) — needed so
+  the full trajectory is available for the belief-calibration comparison below, not just the moments a
+  `--uncertainty-threshold` happens to be crossed.
+- **Not yet exercised against the real sim** (same caveat pattern as Study 1's phases) — only unit-tested
+  against `sam_vla/core/tests/test_sensor_noise.py`'s fixtures; a real `--drive-odom-noise-std > 0` rollout
+  still needs a scene/heightmap/checkpoint to actually try.
 
-## Sweep design (this time actually running the simulation)
+## Sweep design (this time actually running the simulation) — driver + analysis DONE, real sim run NOT DONE
 
-- Reuse an existing checkpoint/scene/goal config (whatever the current default rollout invocation in
-  `usage` uses) so this is a controlled variable, not a confound.
-- For each `env_odom_noise_std` in the recovered/re-derived range (e.g. `{0.0, 0.041, 0.068, 0.109, 0.15,
-  ~0.075-stress-point}`), run N real episodes (N chosen for statistical power — `belief_exp`'s own sweeps
-  used 60-200 episodes/config as a reference point, though real Habitat rollouts are far more expensive
-  per-episode so N will likely be much smaller; decide based on available compute).
-- Per episode, log (via `RolloutLogger`/`EpisodeLogger`, extending as needed): success, steps/time to
-  goal, final distance to goal, CBF-trigger count (existing `distances_to_obstacles`/`cbf_active` fields
-  already support this), and the belief tracker's own `uncertainty_value()` trajectory for direct
-  comparison against `belief_exp`'s offline `calibration_nll`/`coverage_1sigma`/`coverage_2sigma` at the
-  same nominal noise level — this is the actual "does the offline numpy approximation hold up in the real
-  sim" validity check the study is going after.
+- New [`sam_vla/study2_noise_sweep.py`](sam_vla/study2_noise_sweep.py), modeled directly on
+  `sam_vla/study1_paired_runs.py`'s subprocess-per-run shape: given a JSON episode list (same
+  `{"id", "start_x", "start_z", "start_yaw"}` shape Study 1 uses) and a comma-separated `--noise-levels`
+  list (default `0.0,0.041,0.068,0.075,0.109,0.15` — next.md's recovered `belief_exp` range plus the
+  ~0.075 non-viable stress point), runs `sam_vla.run_navdp_rollout` once per `(episode, noise_level)`,
+  forwarding everything after `--` verbatim (scene/heightmap/ckpt/CBF/etc); the driver owns
+  `--start-x`/`--start-z`/`--start-yaw`/`--drive-odom-noise-std`/`--drive-odom-noise-seed`/`--out-dir` per
+  run and raises if forwarded args try to also set any of those. Each episode gets one stable seed
+  (`_episode_seed`, index-derived) reused across every noise level it's swept at, so only the noise
+  *magnitude* varies across a given episode's sweep, not the underlying draw sequence too. Writes
+  `sweep_manifest.json` incrementally; `--keep-going`/`--dry-run` behave the same as Study 1's driver.
+  Unit-tested (command construction, forwarded-arg validation, per-episode seed stability/reuse, manifest
+  bookkeeping, stop-on-failure vs `--keep-going`, `--dry-run`) against a mocked `subprocess.run` in
+  [`sam_vla/tests/test_study2_noise_sweep.py`](sam_vla/tests/test_study2_noise_sweep.py) — no real
+  rollout, sim, or subprocess.
+- New [`sam_vla/study2_analysis.py`](sam_vla/study2_analysis.py), modeled on `sam_vla/study1_analysis.py`:
+  per `(episode, noise_level)` run, computes `success`/`steps_to_goal`/`final_distance_to_goal` (same
+  distance-based derivation Study 1 uses, since the single-goal loop still has no goal-reached break),
+  `cbf_trigger_rate` (fraction of steps with `vla_result["blocked"]`, from `CbfObstacleAvoidance.apply`'s
+  per-step flag — this plan's original claim of an existing `distances_to_obstacles` field was wrong, no
+  such field exists; `blocked`/`hard_gate_fired` inside `vla_result` are what's actually there), and
+  `mean_uncertainty`/`max_uncertainty` from the per-step `uncertainty_value` added above. `--out-csv` writes
+  the full per-run table; `summarize_by_noise_level()` groups by noise level (sorted ascending) and reports
+  mean success rate / mean steps-to-goal (successes only) / mean CBF-trigger rate / mean uncertainty per
+  level — the actual noise-vs-performance/calibration curve. Unit-tested (metric extraction, CBF/
+  uncertainty aggregation, all-NaN-distance edge case, skip-on-failed/missing run, grouping+sorting,
+  CSV round-trip) against synthetic `manifest.json`/`rollout.npz` fixtures in
+  [`sam_vla/tests/test_study2_analysis.py`](sam_vla/tests/test_study2_analysis.py) — no real rollout data
+  needed.
+- **First real batch run (2026-08-07)**: [`sam_vla/study2_run_real_sweep.sh`](sam_vla/study2_run_real_sweep.sh)
+  wraps the sweep driver with this machine's real assets (`assets/marsyard2022.glb`,
+  `marsyard2022_terrain_hm.png` — the `.tif` heightmap hits the same goal-depth-backprojection quirk
+  Integration Phase 4 flagged at this start pose, see below — `navdp/ckpt_last.pt`). Ran 2 episodes ×
+  `{0.0, 0.075, 0.15}` noise levels (`study2_episodes.json`), 150 steps each, `--cbf --zero-lateral`, all 6
+  runs completed cleanly (`study2_real_run1/analysis.csv`). This validates the *mechanism* end-to-end, not
+  yet a statistically meaningful result — deliberately small-scale, see caveats below:
+  - **Noise is confirmed physically real**: comparing `ep00`'s `noise=0.0` vs `noise=0.15` rollout.npz poses,
+    position divergence grows from 0.09m at step 10 to 7.05m at step 140 (mean 3.26m over the whole
+    trajectory) — the two conditions started identically and only diverge because
+    `--drive-odom-noise-std` is actually perturbing the executed motion, not a no-op.
+  - **No episode reached the goal** (`success=False` for all 6 rows) — 150 steps at this policy's typical
+    ~0.3-0.5 mean `v_fwd` wasn't enough to close an 8-15m starting range; a real statistical-power run
+    needs more steps per episode, not more noise levels, to actually produce success/failure signal.
+  - **`ep00`'s `final_distance_to_goal` is `NaN` for all 3 noise levels** — the same
+    `"[WARN] goal bbox had no valid depth; skipping goal mask"` quirk the Integration project's Phase 4 hit
+    at this exact start pose (`--start-x 0 --start-z 8 --start-yaw 0`), pre-existing and orthogonal to
+    noise injection (see `sam_vla/core/goal_geometry.py`). `ep01` (`-2, 8, 120`) didn't hit it and got real
+    distances (~4.2-4.8m final).
+  - **`mean_uncertainty`/`max_uncertainty` are flat at exactly `0.05` (`sigma_visible`'s default) across
+    every run** — the goal stayed continuously visible for all 150 steps in every episode here, so
+    `BeliefGoalTracker.uncertainty_value()` never left its post-sighting reset value. The belief-vs-reality
+    mismatch this study wants to observe (noisy dead-reckoning while the goal is occluded) needs episodes
+    that actually lose sight of the goal at some point -- this first batch's short, close-range, obstacle-free
+    episodes never did. **CBF never triggered either** (`cbf_trigger_rate=0.0` throughout) for the same
+    reason: no obstacle was near either spawn point.
+  - Net: the plumbing is confirmed correct and noise is confirmed to physically drive real position error,
+    but this batch's episodes are too short/clear to yet show the noise-vs-performance or
+    noise-vs-belief-calibration curves this study is actually after -- next real batch should use longer
+    `--max-steps`, episodes with genuine occlusion (e.g. terrain/obstacle blocking line of sight partway
+    through), and enough episodes per noise level for the success-rate/CBF-rate numbers to be more than 0/2.
+- Confirmed via direct inspection (2026-08-07): despite the "Important caveat" section above saying
+  `belief_exp/results/` was emptied by commit `63d7869`, the actual 200-episode/config sweep CSVs this
+  section's noise-level table was recovered from (`s10_21_max_confidence_summary.csv`, dated 2026-07-28)
+  are still present locally under `belief_exp/results/` — gitignored (`.gitignore`'s `results` entry), not
+  tracked, so `git log`/`git show` won't find them, but readable directly. Re-checked the numbers against
+  this file: they match the table above exactly. So the "whether to re-run `sigma_min_sweep.py` fresh" open
+  question below is resolved in practice — the real 200-episode data this study needs already exists on
+  this machine; re-running is only needed if the noise-level grid needs finer resolution than what's there.
 
 ## Non-goals
 
@@ -360,10 +443,9 @@ call.
 - Exact episode count per noise level, given real Habitat rollouts are much more expensive than
   `belief_exp`'s numpy episodes — depends on available compute/time budget, not resolvable in the
   abstract.
-- Whether to re-run `belief_exp/sigma_min_sweep.py` fresh (to get results actually present on disk and
-  reproducible going forward) before starting Study 2, vs. just citing the recovered historical numbers
-  above with a note — recommend re-running, since the table above is explicitly flagged as
-  git-history-only and not a standing artifact.
+- ~~Whether to re-run `belief_exp/sigma_min_sweep.py` fresh~~ — resolved 2026-08-07: the real 200-episode
+  data is already present locally (gitignored, not git-tracked — see the sweep-design section above), no
+  re-run needed unless a finer noise-level grid is wanted.
 - Whether `--drive-odom-noise-std` should also perturb the *initial* `env.step()` teleport target
   directly (pose-space noise) instead of/in addition to the pre-integration action-space noise above —
   the scenario.py formula is action/delta-space, so action-space is the faithful port, but worth

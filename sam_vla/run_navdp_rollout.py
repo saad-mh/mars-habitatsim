@@ -46,6 +46,7 @@ from sam_vla.core.goal_geometry import (
     mask_pixel_center,
 )
 from sam_vla.core.pose_integrator import integrate_mars
+from sam_vla.core.sensor_noise import apply_odom_noise
 from sam_vla.core.types import Action, GoalSpec
 from sam_vla.core.uncertainty_motion import (
     drive_toward_heading,
@@ -315,9 +316,7 @@ def _run_uncertainty_handoff(
     )
 
     def goal_visible_fn(obs):
-        return (
-            int((np.asarray(obs.semantic) == MESH_GOAL_ID).sum()) >= lost_goal_min_px
-        )
+        return int((np.asarray(obs.semantic) == MESH_GOAL_ID).sum()) >= lost_goal_min_px
 
     reference_yaw = pose.yaw
     cur_pose = pose
@@ -422,6 +421,8 @@ def run(
     zero_lateral: bool = True,
     belief_goal_range: float = 8.0,
     belief_odom_noise: float = 0.0,
+    drive_odom_noise_std: float = 0.0,
+    drive_odom_noise_seed: int = None,
     lost_goal_min_px: int = 10,
     lost_goal_ghost: bool = False,
     lost_goal_turn_kp: float = 1.4,
@@ -470,7 +471,9 @@ def run(
         )
     if policy_backend == "navdp-upstream":
         if not navdp_upstream_ckpt:
-            raise ValueError("--navdp-upstream-ckpt is required with --policy-backend navdp-upstream")
+            raise ValueError(
+                "--navdp-upstream-ckpt is required with --policy-backend navdp-upstream"
+            )
         if multi_goal or base_station:
             raise ValueError(
                 "--policy-backend navdp-upstream only supports the single-goal path today "
@@ -752,6 +755,10 @@ def run(
         )
         cbf_active_steps = 0
         hard_gate_fired_steps = 0
+        # Study 2 (next.md): one RNG for the whole episode, so --drive-odom-noise-seed
+        # reproduces the exact noise sequence run-to-run. Unused (no draws) when
+        # drive_odom_noise_std <= 0.0.
+        drive_noise_rng = np.random.default_rng(drive_odom_noise_seed)
         # Study 1 Phase 0 (next.md): rising-edge trigger only -- logged once per
         # crossing, not every step spent above threshold, so a long occlusion
         # doesn't spam one uncertainty_trigger event per step.
@@ -988,11 +995,28 @@ def run(
                 if cbf_info.get("hard_gate_fired"):
                     hard_gate_fired_steps += 1
 
-            new_pose = integrate_mars(obs.pose, action, dt)
+            # Study 2 (next.md): commanded_action is what the policy/CBF actually
+            # decided (also what belief_tracker dead-reckons on below -- a real
+            # robot's odometry model integrates its own commanded/measured
+            # velocity, not ground truth). executed_action is what really moves
+            # the rover, corrupted by --drive-odom-noise-std to simulate real
+            # actuator/wheel-slip noise. Keeping these separate (rather than
+            # perturbing `action` in place before belief_tracker.propagate) is
+            # what makes this a real belief-vs-reality mismatch instead of a
+            # noise the belief tracker is silently told about -- see next.md's
+            # Study 2 injection-point note.
+            commanded_action = action
+            executed_action = (
+                apply_odom_noise(commanded_action, drive_odom_noise_std, drive_noise_rng)
+                if drive_odom_noise_std > 0.0
+                else commanded_action
+            )
+            new_pose = integrate_mars(obs.pose, executed_action, dt)
             env.step(new_pose)
+            action = executed_action
             uncertainty_event = None
             if not multi_goal and not base_station:
-                belief_tracker.propagate(action, dt)
+                belief_tracker.propagate(commanded_action, dt)
                 if uncertainty_threshold is not None:
                     current_uncertainty = belief_tracker.uncertainty_value()
                     is_above = current_uncertainty >= uncertainty_threshold
@@ -1134,6 +1158,10 @@ def run(
                         else float(belief_tracker.belief_g[1])
                     ),
                     "goal_visible": goal_visible,
+                    # Study 2 (next.md): logged every step (not just on threshold
+                    # crossing, unlike uncertainty_event) so the full trajectory is
+                    # comparable against belief_exp's offline calibration metrics.
+                    "uncertainty_value": belief_tracker.uncertainty_value(),
                     **cbf_info,
                 }
             logger.log_step(
@@ -1344,6 +1372,25 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="Gaussian odom noise per step for belief dead-reckoning (0 = perfect)",
+    )
+    parser.add_argument(
+        "--drive-odom-noise-std",
+        type=float,
+        default=0.0,
+        help="Study 2 (next.md): Gaussian noise std injected into the REAL commanded "
+        "action (v_fwd/v_lat full-scale, yaw_rate half-scale) immediately before "
+        "integrate_mars/env.step, simulating real actuator/wheel-slip noise on the "
+        "rover's actual motion. Distinct from --belief-odom-noise, which is the belief "
+        "tracker's own noise-belief and never perturbs real motion (0 = no noise, "
+        "today's unchanged behavior). belief_tracker.propagate() still sees the clean, "
+        "pre-noise action -- it dead-reckons on what was commanded, not on the real "
+        "(noisy) motion, so a real belief/reality mismatch can appear.",
+    )
+    parser.add_argument(
+        "--drive-odom-noise-seed",
+        type=int,
+        default=None,
+        help="Seed for --drive-odom-noise-std's RNG (default: unseeded, non-reproducible)",
     )
     parser.add_argument(
         "--lost-goal-min-px",
@@ -1557,6 +1604,8 @@ if __name__ == "__main__":
         zero_lateral=args.zero_lateral,
         belief_goal_range=args.belief_goal_range,
         belief_odom_noise=args.belief_odom_noise,
+        drive_odom_noise_std=args.drive_odom_noise_std,
+        drive_odom_noise_seed=args.drive_odom_noise_seed,
         lost_goal_min_px=args.lost_goal_min_px,
         lost_goal_ghost=lost_goal_ghost,
         lost_goal_turn_kp=args.lost_goal_turn_kp,
