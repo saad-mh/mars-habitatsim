@@ -98,9 +98,7 @@ def resolve_navdp_upstream_root(raw: Optional[str]) -> Path:
     raise FileNotFoundError(
         "Could not find the vendored InternRobotics/NavDP checkout (expected "
         "baselines/navdp/navdp_server.py). Pass navdp_upstream_root=/path/to/NavDP "
-        "or set NAVDP_UPSTREAM_ROOT -- see next.md's Integration project Phase 0 "
-        "(git clone github.com/InternRobotics/NavDP, gated checkpoint via their "
-        "Google Form)."
+        "or set NAVDP_UPSTREAM_ROOT"
     )
 
 
