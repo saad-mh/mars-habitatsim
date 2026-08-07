@@ -690,6 +690,38 @@ smoke test (`navdp_upstream_policy.py`'s `__main__` block) against all of that f
   — no orphans), i.e. `NavdpUpstreamPolicy.stop()`/`ServiceRegistry.stop_all()` both behaved correctly under
   a real full rollout, not just the isolated unit tests.
 
+### Phase 5 — made the default, fixed a silent-fallback goal bug — DONE (2026-08-07)
+
+`--policy-backend` now defaults to `navdp-upstream` for the single-goal path (`run_navdp_rollout.py`'s
+`run()` resolves `policy_backend=None` to `"navdp-upstream"` unless `--multi-goal`/`--base-station` is set,
+in which case it auto-falls-back to `navdp-s2dit` — the only two paths that backend doesn't support yet).
+`navdp-s2dit` (`NavdpPolicy`, this repo's own in-house model) is now referred to as the **legacy** backend
+in help text/comments, but the class itself is untouched, per the non-goal below — multi-goal/base-station
+still need it. `--navdp-upstream-ckpt` now defaults to `navdp/navdp-cross-modal.ckpt` (repo-relative,
+gitignored) if present, mirroring `NavdpPolicy`'s own in-repo `--navdp-root` fallback, so a plain
+single-goal invocation with no flags beyond `--navdp-upstream-root`/`$NAVDP_UPSTREAM_ROOT` just works on a
+checkout that already has Phase 0's checkpoint.
+
+Also fixed the exact failure mode Phase 4's comparison run surfaced and flagged as unresolved: when
+`belief_tracker.belief_g` has never been observed yet this episode (mask below `lost_goal_min_px`, or
+depth invalid at the mask — which can happen even while the goal marker is plainly visible to a human in
+the annotated/overlay frame, since the marker mesh is a flat, terrain-following patch susceptible to the
+same grazing-angle thin-sliver rendering as the annotation-hull issue described in "Known issues" —
+`register_object_mask`/`goal_geometry.terrain_patch_mesh` use the identical flat-patch geometry class),
+`run_navdp_rollout.py`'s loop used to call `act_verbose()` anyway, silently sending
+`NavdpUpstreamPolicy`'s hidden constructor default (`default_goal_forward=5.0, default_goal_left=0.0` —
+"go straight") to the server. Every log field looked like real goal-seeking, but the rover was actually
+driving on a fabricated point — which reads exactly like "given a point goal, but it drives away" even
+though the goal is visibly annotated on screen. Fixed: the loop now tracks
+`navdp_upstream_goal_unresolved` and, when true, skips `act_verbose()` for that step entirely (holds
+position, action `[0,0,0]`), logs `vla_result={"goal_observed": False}`, and prints a throttled console
+warning — the same "skip the policy call, keep logging" pattern the base-station DWELL phase already
+uses. The moment a real sighting resolves `belief_g`, normal driving resumes. Independently confirmed the
+underlying `[forward, left]` sign/axis convention itself (Phase 2/3's own work) is correct by
+cross-deriving it from `pose_integrator.integrate_mars`'s `v_lat` rightward-positive convention and
+`goal_geometry.bbox_to_world`'s camera-frame backprojection, both of which agree with `mask_to_body`'s
+`[rng, -right]` — so this was a fallback-visibility bug, not a coordinate bug.
+
 ## Non-goals
 
 - Don't modify anything under this repo's own `navdp/` package, or `NavdpPolicy` itself — this is a new,

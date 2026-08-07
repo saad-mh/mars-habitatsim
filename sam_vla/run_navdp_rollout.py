@@ -5,6 +5,19 @@ base-station out-and-back goal sequencing.
 
 Usage:
     conda activate habitat
+    # Default single-goal run: --policy-backend navdp-upstream (the real, published
+    # NavDP), needs $NAVDP_UPSTREAM_ROOT set / --navdp-upstream-root passed, and picks
+    # up navdp/navdp-cross-modal.ckpt automatically if present.
+    python -m sam_vla.run_navdp_rollout \
+        --scene-path assets/marsyard2022.glb \
+        --heightmap-path marsyard2022_terrain_hm_1025.tif \
+        --navdp-upstream-root /path/to/InternRobotics/NavDP \
+        --start-x 0 --start-z 8 --start-yaw 0 \
+        --max-steps 300 --cbf \
+        --out-dir outputs/navdp_upstream_smoke_test
+
+    # --multi-goal/--base-station still need the legacy in-house backend
+    # (navdp-upstream doesn't support them yet), selected automatically:
     python -m sam_vla.run_navdp_rollout \
         --scene-path assets/marsyard2022.glb \
         --heightmap-path marsyard2022_terrain_hm_1025.tif \
@@ -21,6 +34,7 @@ import argparse
 import math
 import time, datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -385,6 +399,16 @@ def _run_uncertainty_handoff(
     }
 
 
+def _default_navdp_upstream_ckpt() -> Optional[str]:
+    """Repo-relative fallback for --navdp-upstream-ckpt, mirroring navdp_policy.py's
+    in-repo fallback for --navdp-root: navdp-upstream is now the default policy
+    backend, so a plain invocation should just work on a checkout that already has
+    the (gitignored) checkpoint at navdp/navdp-cross-modal.ckpt, same path Phase 0
+    of next.md's Integration project downloaded it to."""
+    candidate = Path(__file__).resolve().parent.parent / "navdp" / "navdp-cross-modal.ckpt"
+    return str(candidate) if candidate.exists() else None
+
+
 def run(
     scene_path: str,
     heightmap_path: str,
@@ -449,7 +473,7 @@ def run(
     uncertainty_sweep_steps: int = 8,
     uncertainty_drive_v_fwd: float = 0.5,
     uncertainty_mock_client: bool = False,
-    policy_backend: str = "navdp-s2dit",
+    policy_backend: str = None,
     navdp_upstream_ckpt: str = None,
     navdp_upstream_root: str = None,
     navdp_upstream_port: int = None,
@@ -465,22 +489,31 @@ def run(
             "--base-station and --multi-goal are mutually exclusive -- they solve "
             "different problems, see next.md §1"
         )
+    if policy_backend is None:
+        # Default to the real, published NavDP model (navdp-upstream) -- navdp-s2dit
+        # (this repo's own in-house model) is now the legacy fallback, kept only for
+        # --multi-goal/--base-station, which navdp-upstream doesn't support yet (see
+        # next.md's Integration project non-goals).
+        policy_backend = "navdp-s2dit" if (multi_goal or base_station) else "navdp-upstream"
     if policy_backend not in ("navdp-s2dit", "navdp-upstream"):
         raise ValueError(
             f"--policy-backend must be 'navdp-s2dit' or 'navdp-upstream', got {policy_backend!r}"
         )
     if policy_backend == "navdp-upstream":
-        if not navdp_upstream_ckpt:
-            raise ValueError(
-                "--navdp-upstream-ckpt is required with --policy-backend navdp-upstream"
-            )
         if multi_goal or base_station:
             raise ValueError(
                 "--policy-backend navdp-upstream only supports the single-goal path today "
-                "-- see next.md's Integration project non-goals"
+                "-- pass --policy-backend navdp-s2dit (legacy) for --multi-goal/--base-station"
+            )
+        if not navdp_upstream_ckpt:
+            navdp_upstream_ckpt = _default_navdp_upstream_ckpt()
+        if not navdp_upstream_ckpt:
+            raise ValueError(
+                "--navdp-upstream-ckpt is required with --policy-backend navdp-upstream "
+                "(no checkpoint found at the default navdp/navdp-cross-modal.ckpt either)"
             )
     elif not ckpt_path:
-        raise ValueError("--ckpt is required with --policy-backend navdp-s2dit")
+        raise ValueError("--ckpt is required with --policy-backend navdp-s2dit (legacy)")
     # Both --multi-goal and --base-station need `from navdp.extensions import ...`
     # before NavdpPolicy is constructed below (that's normally what puts navdp_root
     # on sys.path, via its own _add_navdp_to_path call) -- do it here first so those
@@ -688,10 +721,12 @@ def run(
                 env, obs0, goal_spec, goal_position, obj_mask_radius, out_dir
             )
 
-        # <-- policy plugged in here. --policy-backend selects between NavdpPolicy
-        # (this repo's own S2DiT/VL3-DP model, default, unchanged behavior) and
+        # <-- policy plugged in here. --policy-backend selects between
         # NavdpUpstreamPolicy (the real published NavDP via its HTTP server, see
-        # next.md's "Integration project" section) -- both share the same
+        # next.md's "Integration project" section -- default for single-goal runs)
+        # and NavdpPolicy (this repo's own in-house S2DiT/VL3-DP model, now the
+        # legacy backend, auto-selected for --multi-goal/--base-station, which
+        # navdp-upstream doesn't support yet) -- both share the same
         # act_verbose(obs, semantic, goal_spec, step) -> (Action, dict) shape, so
         # the loop below needs no branching beyond this construction.
         if policy_backend == "navdp-upstream":
@@ -773,6 +808,7 @@ def run(
             route_finished_this_step = False
             just_entered_dwell = False
             phase_for_log = phase
+            navdp_upstream_goal_unresolved = False
             if multi_goal:
                 goal_masks = {}
                 if step % seg_interval_steps == 0:
@@ -908,6 +944,41 @@ def run(
                     if belief_tracker.belief_g is not None:
                         goal_forward, goal_left = belief_tracker.belief_g
                         policy.set_goal_body(goal_forward, goal_left)
+                    else:
+                        navdp_upstream_goal_unresolved = True
+
+            if navdp_upstream_goal_unresolved:
+                # belief_tracker has never seen the goal mask with valid enough
+                # pixels/depth this episode (e.g. the annotated goal marker is
+                # on-screen but the mask is a thin, grazing-angle sliver below
+                # lost_goal_min_px, or its depth patch is invalid), so
+                # belief_g is still None. Calling act_verbose() now would send
+                # NavdpUpstreamPolicy's own hidden constructor default
+                # (default_goal_forward=5.0, default_goal_left=0.0 -- "go
+                # straight") to the server, which drives the rover confidently
+                # in an arbitrary direction while every log field *looks* like
+                # real goal-seeking. That silent fallback is exactly what next.md's
+                # Integration-project Phase 4 run hit. Hold instead of guessing,
+                # and say so loudly -- the moment the mask/depth resolve (even
+                # one frame with a valid sighting), the branch above takes over
+                # and driving resumes with a real point.
+                action = Action(v_fwd=0.0, v_lat=0.0, yaw_rate=0.0)
+                new_pose = obs.pose
+                env.step(new_pose)
+                vis_rgb = overlay_semantic_masks(
+                    obs.rgb, semantic_render, text=f"t={step} WAITING FOR GOAL SIGHTING"
+                )
+                vla_result = {"goal_observed": False}
+                logger.log_step(
+                    obs, action, new_pose, vla_result=vla_result, vis_rgb=vis_rgb
+                )
+                if step % 10 == 0:
+                    print(
+                        f"[navdp-upstream] step={step} goal never observed yet -- "
+                        f"holding instead of driving on a fabricated default goal point",
+                        flush=True,
+                    )
+                continue
 
             if base_station and phase == "DWELL" and not just_entered_dwell:
                 # Hold position -- skip the policy/CBF call entirely (next.md §4) but
@@ -1222,32 +1293,38 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ckpt",
         default=None,
-        help="Path to trained NavDP/S2DiT checkpoint (required unless --policy-backend navdp-upstream)",
+        help="Path to trained NavDP/S2DiT checkpoint (legacy backend; required only with "
+        "--policy-backend navdp-s2dit)",
     )
     parser.add_argument(
         "--navdp-root",
         default=None,
-        help="Path to the navdp repo (default: ./navdp or $NAVDP_ROOT)",
+        help="Path to the navdp repo (default: ./navdp or $NAVDP_ROOT) -- only used by the "
+        "legacy navdp-s2dit backend",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--sample-steps", type=int, default=20)
     parser.add_argument(
         "--policy-backend",
         choices=["navdp-s2dit", "navdp-upstream"],
-        default="navdp-s2dit",
+        default=None,
         help=(
-            "navdp-s2dit (default): this repo's own in-house S2DiT/VL3-DP model "
-            "via NavdpPolicy, unchanged. navdp-upstream: the real published NavDP "
+            "navdp-upstream (default for single-goal runs): the real published NavDP "
             "(Cai et al., arXiv 2505.08712) via its HTTP server -- see next.md's "
             "'Integration project' section. Requires a vendored InternRobotics/NavDP "
-            "checkout and a gated checkpoint (Google Form on their repo); only "
-            "supports the single-goal path (no --multi-goal/--base-station)."
+            "checkout ($NAVDP_UPSTREAM_ROOT/--navdp-upstream-root) and a gated checkpoint "
+            "(Google Form on their repo; defaults to navdp/navdp-cross-modal.ckpt if present); "
+            "only supports the single-goal path. navdp-s2dit: legacy, this repo's own "
+            "in-house S2DiT/VL3-DP model via NavdpPolicy -- automatically used instead "
+            "when --multi-goal/--base-station is passed, since navdp-upstream doesn't "
+            "support those yet."
         ),
     )
     parser.add_argument(
         "--navdp-upstream-ckpt",
         default=None,
-        help="Path to the upstream NavDP .ckpt (required with --policy-backend navdp-upstream)",
+        help="Path to the upstream NavDP .ckpt (default: navdp/navdp-cross-modal.ckpt if it "
+        "exists, with --policy-backend navdp-upstream)",
     )
     parser.add_argument(
         "--navdp-upstream-root",
