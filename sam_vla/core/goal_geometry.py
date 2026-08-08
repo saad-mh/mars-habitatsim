@@ -11,7 +11,7 @@ already commits to (heading = (cos_yaw, sin_yaw) in the x-z plane).
 from __future__ import annotations
 
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -96,6 +96,42 @@ def bbox_to_world(
     world_y = pose.y - y_cam
 
     return (world_x, world_y, world_z)
+
+
+def project_world_to_pixel(
+    pose: Pose,
+    world_xyz: GoalPosition,
+    hfov_deg: float,
+    width: int,
+    height: int,
+) -> Optional[tuple[int, int]]:
+    """Inverse of bbox_to_world: project a world-frame (x, y, z) point into
+    pixel coords for `pose`'s camera, or None if it's behind the camera or
+    outside the frame. Lets a caller keep a *fixed* world point (e.g. a
+    click-selected goal) visually anchored in the live camera view every
+    frame via reprojection, instead of relying on a rendered scene marker --
+    dynamically registered objects (register_object_mask and friends) render
+    zero pixels on this machine, see CLAUDE.md's dynamic-object-render-bug
+    note, so a projected overlay is the only reliable way to mark a fixed 3D
+    point in the environment view.
+    """
+    wx, wy, wz = world_xyz
+    dx = wx - pose.x
+    dz = wz - pose.z
+    cos_yaw, sin_yaw = math.cos(pose.yaw), math.sin(pose.yaw)
+    z_cam = dx * cos_yaw + dz * sin_yaw
+    if z_cam <= 1e-3:
+        return None
+    x_cam = dx * sin_yaw - dz * cos_yaw
+    y_cam = pose.y - wy
+
+    fx = (width / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+    fy = fx
+    px = x_cam * fx / z_cam + width / 2.0
+    py = y_cam * fy / z_cam + height / 2.0
+    if not (0 <= px < width and 0 <= py < height):
+        return None
+    return (int(round(px)), int(round(py)))
 
 
 def backproject_goal_position(

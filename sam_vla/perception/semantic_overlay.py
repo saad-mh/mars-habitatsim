@@ -52,6 +52,28 @@ def overlay_semantic_masks(
     return overlaid
 
 
+def draw_point_marker(
+    rgb: np.ndarray,
+    pixel: tuple[int, int],
+    radius: int = 10,
+    color: tuple[int, int, int] = (212, 160, 23),
+) -> np.ndarray:
+    """Crosshair + ring at `pixel` (x, y) image coords -- used to keep a
+    reprojected fixed-world-point goal (see goal_geometry.project_world_to_pixel)
+    visually anchored in the live camera view every frame, since dynamically
+    registered scene objects don't render on this machine (CLAUDE.md's
+    dynamic-object-render-bug note)."""
+    img = Image.fromarray(np.asarray(rgb))
+    draw = ImageDraw.Draw(img)
+    x, y = pixel
+    draw.line([(x - radius, y), (x + radius, y)], fill=color, width=2)
+    draw.line([(x, y - radius), (x, y + radius)], fill=color, width=2)
+    draw.ellipse(
+        [x - radius, y - radius, x + radius, y + radius], outline=color, width=2
+    )
+    return np.asarray(img, dtype=np.uint8)
+
+
 if __name__ == "__main__":
     rgb = np.full((8, 8, 3), 128, dtype=np.uint8)
     semantic = np.zeros((8, 8), dtype=np.int32)

@@ -29,6 +29,7 @@ def body_frame_goal(pose: Pose, world_xz: tuple[float, float]) -> tuple[float, f
     cos_yaw, sin_yaw = math.cos(pose.yaw), math.sin(pose.yaw)
     forward = dx * cos_yaw + dz * sin_yaw
     left = dz * cos_yaw - dx * sin_yaw
+    # print(f"body pose -> {forward}, {left} (from world {gx}, {gz})")
     return forward, left
 
 

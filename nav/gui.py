@@ -19,7 +19,7 @@ from typing import Optional
 
 import tkinter as tk
 from tkinter import ttk
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 from nav.rover_controller import RoverController
 
@@ -40,15 +40,22 @@ class NavGuiApp:
     PLOT_SIZE = 420
     PLOT_RANGE = 6.0  # meters shown top-to-bottom of the body-frame plot
 
-    def __init__(self, root: tk.Tk, controller: RoverController, max_linear: float, max_angular: float):
+    def __init__(
+        self,
+        root: tk.Tk,
+        controller: RoverController,
+        max_linear: float,
+        max_angular: float,
+    ):
         self.root = root
         self.controller = controller
         self.max_linear = max_linear
         self.max_angular = max_angular
         self.closed = False
         self._manual_held: set[str] = set()
+        self._pending_click_norm: Optional[tuple[float, float]] = None
 
-        root.title("mars-habitatsim/nav -- NavDP (upstream) rover control")
+        root.title("mars-habitatsim/nav")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         main = ttk.Frame(root, padding=8)
@@ -56,38 +63,85 @@ class NavGuiApp:
 
         self.cam_label = ttk.Label(main)
         self.cam_label.grid(row=0, column=0, padx=4, pady=4)
-        self._blank_photo = ImageTk.PhotoImage(Image.new("RGB", (self.CAM_SIZE, self.CAM_SIZE), "#222"))
+        self._blank_photo = ImageTk.PhotoImage(
+            Image.new("RGB", (self.CAM_SIZE, self.CAM_SIZE), "#222")
+        )
         self.cam_label.configure(image=self._blank_photo)
+        self.cam_label.bind("<Button-1>", self.on_cam_click)
 
-        self.plot = tk.Canvas(main, width=self.PLOT_SIZE, height=self.PLOT_SIZE, bg="white")
+        self.plot = tk.Canvas(
+            main, width=self.PLOT_SIZE, height=self.PLOT_SIZE, bg="white"
+        )
         self.plot.grid(row=0, column=1, padx=4, pady=4)
 
         bar = ttk.Frame(main)
         bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 2))
-        ttk.Button(bar, text="Resolve Goal (auto)", command=self.resolve_goal).pack(side="left", padx=2)
-        ttk.Button(bar, text="Random Goal", command=self.random_goal).pack(side="left", padx=8)
+        ttk.Button(bar, text="Resolve Goal (auto)", command=self.resolve_goal).pack(
+            side="left", padx=2
+        )
+        ttk.Button(bar, text="Random Goal", command=self.random_goal).pack(
+            side="left", padx=8
+        )
         ttk.Button(bar, text="Go Home", command=self.go_home).pack(side="left", padx=2)
-        ttk.Button(bar, text="Reset Rover", command=self.reset_rover).pack(side="left", padx=8)
+        ttk.Button(bar, text="Reset Rover", command=self.reset_rover).pack(
+            side="left", padx=8
+        )
         ttk.Button(bar, text="STOP", command=self.stop).pack(side="left", padx=10)
 
         drive = ttk.Frame(main)
         drive.grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
         ttk.Label(drive, text="Manual drive (hold, or arrow keys):").pack(side="left")
-        for label, direction in (("<", "left"), ("^", "fwd"), ("v", "back"), (">", "right")):
+        for label, direction in (
+            ("<", "left"),
+            ("^", "fwd"),
+            ("v", "back"),
+            (">", "right"),
+        ):
             b = ttk.Button(drive, text=label, width=3)
             b.bind("<ButtonPress-1>", lambda e, d=direction: self.manual_press(d))
             b.bind("<ButtonRelease-1>", lambda e, d=direction: self.manual_release(d))
             b.pack(side="left", padx=2)
-        for key, direction in (("Up", "fwd"), ("Down", "back"), ("Left", "left"), ("Right", "right")):
+        for key, direction in (
+            ("Up", "fwd"),
+            ("Down", "back"),
+            ("Left", "left"),
+            ("Right", "right"),
+        ):
             root.bind(f"<KeyPress-{key}>", lambda e, d=direction: self.manual_press(d))
-            root.bind(f"<KeyRelease-{key}>", lambda e, d=direction: self.manual_release(d))
+            root.bind(
+                f"<KeyRelease-{key}>", lambda e, d=direction: self.manual_release(d)
+            )
+        root.bind("<Escape>", lambda e: self.cancel_pixel_click())
+
+        click_row = ttk.Frame(main)
+        click_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(click_row, text="Click the camera view to pick a goal point:").pack(
+            side="left"
+        )
+        self.confirm_click_btn = ttk.Button(
+            click_row,
+            text="Confirm Point Goal",
+            command=self.confirm_pixel_goal,
+            state="disabled",
+        )
+        self.confirm_click_btn.pack(side="left", padx=8)
+        self.cancel_click_btn = ttk.Button(
+            click_row, text="Cancel", command=self.cancel_pixel_click, state="disabled"
+        )
+        self.cancel_click_btn.pack(side="left", padx=2)
+        self.click_status_label = ttk.Label(click_row, text="", anchor="w")
+        self.click_status_label.pack(side="left", padx=8)
 
         self.status = ttk.Label(
-            main, text="starting...", font=("TkDefaultFont", 11, "bold"), width=110, anchor="w"
+            main,
+            text="starting",
+            font=("TkDefaultFont", 11, "bold"),
+            width=110,
+            anchor="w",
         )
-        self.status.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.info = ttk.Label(main, text="", width=110, anchor="w")
-        self.info.grid(row=4, column=0, columnspan=2, sticky="w")
+        self.info.grid(row=5, column=0, columnspan=2, sticky="w")
 
         self._photo = None
         self.root.after(REFRESH_MS, self.refresh)
@@ -95,26 +149,55 @@ class NavGuiApp:
     # ---------------- commands ---------------- #
     def resolve_goal(self) -> None:
         self._manual_held.clear()
+        self.cancel_pixel_click()
         self.controller.request_resolve()
 
     def random_goal(self) -> None:
         self._manual_held.clear()
+        self.cancel_pixel_click()
         self.controller.random_goal()
 
     def go_home(self) -> None:
         self._manual_held.clear()
+        self.cancel_pixel_click()
         self.controller.go_home()
 
     def reset_rover(self) -> None:
         self._manual_held.clear()
+        self.cancel_pixel_click()
         self.controller.request_reset()
 
     def stop(self) -> None:
         self._manual_held.clear()
+        self.cancel_pixel_click()
         self.controller.stop_driving()
+
+    # ---------------- click-to-goal ---------------- #
+    def on_cam_click(self, event) -> None:
+        nx = min(max(event.x / self.CAM_SIZE, 0.0), 1.0)
+        ny = min(max(event.y / self.CAM_SIZE, 0.0), 1.0)
+        self._pending_click_norm = (nx, ny)
+        self.confirm_click_btn.configure(state="normal")
+        self.cancel_click_btn.configure(state="normal")
+
+    def confirm_pixel_goal(self) -> None:
+        if self._pending_click_norm is None:
+            return
+        self._manual_held.clear()
+        nx, ny = self._pending_click_norm
+        self.controller.request_pixel_goal(nx, ny)
+        self._pending_click_norm = None
+        self.confirm_click_btn.configure(state="disabled")
+        self.cancel_click_btn.configure(state="disabled")
+
+    def cancel_pixel_click(self) -> None:
+        self._pending_click_norm = None
+        self.confirm_click_btn.configure(state="disabled")
+        self.cancel_click_btn.configure(state="disabled")
 
     # ---------------- manual drive ---------------- #
     def manual_press(self, direction: str) -> None:
+        self.cancel_pixel_click()
         self._manual_held.add(direction)
         self._manual_update()
 
@@ -150,15 +233,22 @@ class NavGuiApp:
         if d.vis_rgb is not None:
             img = Image.fromarray(d.vis_rgb).convert("RGB")
             img = img.resize((self.CAM_SIZE, self.CAM_SIZE))
+            if self._pending_click_norm is not None:
+                img = self._draw_pending_click(img)
             self._photo = ImageTk.PhotoImage(img)
             self.cam_label.configure(image=self._photo)
 
+        self.click_status_label.configure(text=d.click_status)
         self._draw_plot(d)
 
         mode_txt = d.mode.upper()
         if d.goal_reached:
             mode_txt += " (GOAL REACHED)"
-        alive_txt = "" if self.controller.is_alive() else "  [controller thread died -- see console]"
+        alive_txt = (
+            ""
+            if self.controller.is_alive()
+            else "  [controller thread died -- see console]"
+        )
         self.status.configure(text=f"[{mode_txt}] {d.status_text}{alive_txt}")
 
         pose_txt = (
@@ -173,25 +263,45 @@ class NavGuiApp:
         if d.cbf_info.get("hard_gate_fired"):
             cbf_txt += "  CBF:hard-gate"
         self.info.configure(
-            text=f"{pose_txt}   step={d.step}  frames={d.frame_count}   "
+            text=f"{pose_txt}   step={d.step} "
             f"v=[{act.v_fwd:.2f},{act.v_lat:.2f}] yaw_rate={act.yaw_rate:+.2f}{cbf_txt}"
         )
 
         self.root.after(REFRESH_MS, self.refresh)
 
+    def _draw_pending_click(self, img: Image.Image) -> Image.Image:
+        # Not-yet-confirmed marker at the last click, cyan to read as distinct
+        # from the gold confirmed-goal marker the controller reprojects into
+        # vis_rgb every frame once a click is confirmed (rover_controller's
+        # draw_point_marker).
+        nx, ny = self._pending_click_norm
+        x, y = nx * self.CAM_SIZE, ny * self.CAM_SIZE
+        r = 10
+        draw = ImageDraw.Draw(img)
+        draw.line([(x - r, y), (x + r, y)], fill="#00e5ff", width=2)
+        draw.line([(x, y - r), (x, y + r)], fill="#00e5ff", width=2)
+        draw.ellipse([x - r, y - r, x + r, y + r], outline="#00e5ff", width=2)
+        return img
+
     def _draw_plot(self, d) -> None:
         self.plot.delete("all")
         S, R = self.PLOT_SIZE, self.PLOT_RANGE
 
-        def to_px(forward, left):  # body frame (fwd, left) -> canvas (origin at rover, facing up)
+        def to_px(
+            forward, left
+        ):  # body frame (fwd, left) -> canvas (origin at rover, facing up)
             return S / 2 - (left / R) * (S / 2), S - (forward / R) * S * 0.92 - 20
 
         self.plot.create_line(0, S - 20, S, S - 20, fill="#ddd")
-        self.plot.create_oval(S / 2 - 5, S - 25, S / 2 + 5, S - 15, fill="black")  # rover
+        self.plot.create_oval(
+            S / 2 - 5, S - 25, S / 2 + 5, S - 15, fill="black"
+        )  # rover
 
         if d.obstacle_point is not None:
             ox, oy = to_px(d.obstacle_point[0], d.obstacle_point[1])
-            self.plot.create_oval(ox - 5, oy - 5, ox + 5, oy + 5, outline="#c0392b", width=2)
+            self.plot.create_oval(
+                ox - 5, oy - 5, ox + 5, oy + 5, outline="#c0392b", width=2
+            )
 
         if d.trajectory is not None and len(d.trajectory) > 1:
             pts = [to_px(float(p[0]), float(p[1])) for p in d.trajectory]
@@ -199,7 +309,9 @@ class NavGuiApp:
 
         if d.belief_g is not None:
             gx, gy = to_px(d.belief_g[0], d.belief_g[1])
-            self.plot.create_text(gx, gy, text="*", fill="#d4a017", font=("TkDefaultFont", 26))
+            self.plot.create_text(
+                gx, gy, text="*", fill="#d4a017", font=("TkDefaultFont", 26)
+            )
 
     def tick_forever(self) -> None:
         self.root.mainloop()
@@ -239,10 +351,18 @@ def build_controller(args: argparse.Namespace) -> RoverController:
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scene-path", default=str(REPO_ROOT / "assets" / "marsyard2022.glb"))
-    ap.add_argument("--heightmap-path", default=str(REPO_ROOT / "marsyard2022_terrain_hm_1025.tif"))
-    ap.add_argument("--rock-field", default=None, help="rock_field.json manifest (optional)")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--scene-path", default=str(REPO_ROOT / "assets" / "marsyard2022.glb")
+    )
+    ap.add_argument(
+        "--heightmap-path", default=str(REPO_ROOT / "marsyard2022_terrain_hm_1025.tif")
+    )
+    ap.add_argument(
+        "--rock-field", default=None, help="rock_field.json manifest (optional)"
+    )
     ap.add_argument(
         "--navdp-upstream-ckpt",
         default=None,
@@ -263,14 +383,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         "needed for the CBF safety layer's generic obstacle/avoidance math, unrelated to which "
         "driving policy is active",
     )
-    ap.add_argument("--start-x", type=float, default=0.0)
-    ap.add_argument("--start-z", type=float, default=8.0)
+    ap.add_argument("--start-x", type=float, default=8.0)
+    ap.add_argument("--start-z", type=float, default=10.0)
     ap.add_argument("--start-yaw", type=float, default=0.0, help="degrees")
     ap.add_argument("--dt", type=float, default=0.1)
     ap.add_argument("--hz", type=float, default=10.0, help="controller tick rate")
     ap.add_argument("--max-linear", type=float, default=0.6)
     ap.add_argument("--max-angular", type=float, default=0.6)
-    ap.add_argument("--no-cbf", action="store_true", help="disable CBF cone-mode obstacle avoidance")
+    ap.add_argument(
+        "--no-cbf", action="store_true", help="disable CBF cone-mode obstacle avoidance"
+    )
     ap.add_argument("--cbf-d-safe", type=float, default=0.75)
     ap.add_argument("--cbf-gamma", type=float, default=0.3)
     ap.add_argument("--cbf-deadzone", type=float, default=0.6)
@@ -286,7 +408,9 @@ def main(argv=None) -> None:
     controller.start()
 
     root = tk.Tk()
-    app = NavGuiApp(root, controller, max_linear=args.max_linear, max_angular=args.max_angular)
+    app = NavGuiApp(
+        root, controller, max_linear=args.max_linear, max_angular=args.max_angular
+    )
     try:
         app.tick_forever()
     finally:

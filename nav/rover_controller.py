@@ -22,12 +22,20 @@ Driving modes:
              and CBF entirely (a human takes full responsibility, same
              convention every manual-drive tool in this repo uses).
   point   -- drive to a world-frame (x, z) point (random-ahead / go-home /
-             any caller-supplied point) with no detector in the loop:
-             goal_math.body_frame_goal recovers the ground-truth body-frame
-             point every tick, fed straight into BeliefGoalTracker via
-             observe_body_point (see its docstring -- built for exactly this,
-             ground-truth callers with no mask/depth to source a sighting
-             from).
+             click-to-goal / any caller-supplied point) with no detector in
+             the loop: goal_math.body_frame_goal recovers the ground-truth
+             body-frame point every tick, fed straight into BeliefGoalTracker
+             via observe_body_point (see its docstring -- built for exactly
+             this, ground-truth callers with no mask/depth to source a
+             sighting from). A click-to-goal point is anchored once by
+             request_pixel_goal's depth backprojection (goal_geometry.
+             bbox_to_world on a small patch around the clicked pixel), not
+             re-derived from anything that could drift -- and kept visually
+             marked in the live camera view every frame by reprojecting it
+             back to pixel coords (goal_geometry.project_world_to_pixel)
+             rather than registering a scene object, since dynamically
+             registered objects render zero pixels on this machine (see
+             CLAUDE.md's dynamic-object-render-bug note).
   resolve -- one-shot first_frame_resolver.resolve_verbose() on the current
              frame (SAM2 detections + Qwen VLM salience pick, no per-preset
              text targeting -- qwen_client.select_goal has no such
@@ -64,13 +72,17 @@ from sam_vla.core.goal_geometry import (
     backproject_goal_position,
     bbox_to_world,
     intrinsics_from_hfov,
+    project_world_to_pixel,
 )
 from sam_vla.core.pose_integrator import integrate_mars
 from sam_vla.core.types import Action, GoalSpec, Pose
 from sam_vla.env.habitat_env import HFOV_DEG, MarsHabitatEnv
 from sam_vla.env.terrain import SIZE_X, SIZE_Z
 from sam_vla.goal_resolution import first_frame_resolver
-from sam_vla.perception.semantic_overlay import overlay_semantic_masks
+from sam_vla.perception.semantic_overlay import (
+    draw_point_marker,
+    overlay_semantic_masks,
+)
 from sam_vla.policy.navdp_upstream_policy import NavdpUpstreamPolicy
 from sam_vla.safety.cbf_avoidance import CbfObstacleAvoidance
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
@@ -82,8 +94,7 @@ MODE_POINT = "point"
 MODE_RESOLVE = "resolve"
 MODE_MANUAL = "manual"
 
-# Ground-truth distance at which a point goal counts as reached -- independently
-# chosen (not imported), same rover-scale ballpark as launch_mars.sh's own GUI.
+# Ground-truth distance at which a point goal counts as reached
 POINT_GOAL_REACHED_M = 0.7
 
 
@@ -108,6 +119,7 @@ class DisplayState:
     frame_count: int = 0
     goal_reached: bool = False
     error_text: str = ""
+    click_status: str = ""
 
 
 class RoverController:
@@ -196,6 +208,7 @@ class RoverController:
         self._world_goal: Optional[tuple] = None
         self._pending_resolve = False
         self._pending_reset = False
+        self._pending_pixel_click: Optional[tuple] = None
 
         self.display = DisplayState()
         self._rng = np.random.default_rng()
@@ -221,7 +234,9 @@ class RoverController:
     def set_manual(self, v_fwd: float, yaw_rate: float) -> None:
         with self._lock:
             self._mode = MODE_MANUAL
-            self._manual_action = Action(v_fwd=float(v_fwd), v_lat=0.0, yaw_rate=float(yaw_rate))
+            self._manual_action = Action(
+                v_fwd=float(v_fwd), v_lat=0.0, yaw_rate=float(yaw_rate)
+            )
 
     def random_goal(self) -> None:
         with self._lock:
@@ -246,6 +261,14 @@ class RoverController:
             self._mode = MODE_POINT
             self.display.goal_reached = False
 
+    def request_pixel_goal(self, x_norm: float, y_norm: float) -> None:
+        """Queue a click-to-goal request: (x_norm, y_norm) are normalized
+        [0, 1] image coords in the *displayed* camera frame (origin
+        top-left). Resolved against the live depth frame on the controller
+        thread next tick -- see _handle_pixel_click."""
+        with self._lock:
+            self._pending_pixel_click = (float(x_norm), float(y_norm))
+
     def request_resolve(self) -> None:
         with self._lock:
             self._pending_resolve = True
@@ -264,9 +287,6 @@ class RoverController:
         with self._lock:
             return copy.copy(self.display)
 
-    # ------------------------------------------------------------------ #
-    # controller-thread body
-    # ------------------------------------------------------------------ #
     def _run(self) -> None:
         # CbfObstacleAvoidance needs `navdp.extensions` (this repo's own navdp/
         # package's generic CBF/obstacle math -- unrelated to which driving
@@ -340,7 +360,7 @@ class RoverController:
             while self._running:
                 t0 = time.time()
 
-                do_resolve, do_reset = self._consume_pending()
+                do_resolve, do_reset, pixel_click = self._consume_pending()
 
                 if do_reset:
                     for obj in goal_objects + obstacle_objects:
@@ -364,6 +384,7 @@ class RoverController:
                         self._manual_action = Action(0.0, 0.0, 0.0)
                         self.display.status_text = "reset to spawn"
                         self.display.goal_reached = False
+                        self.display.click_status = ""
 
                 if do_resolve:
                     goal_objects, obstacle_objects, goal_spec = self._do_resolve(
@@ -371,15 +392,18 @@ class RoverController:
                     )
                     belief_tracker.belief_g = None
 
-                with self._lock:
-                    mode = self._mode
-                    manual_action = self._manual_action
-                    world_goal = self._world_goal
-
                 obs = env.get_observation(frame_idx=step)
                 semantic = env.get_semantic_frame()
                 goal_mask = (semantic == MESH_GOAL_ID).astype("uint8") * 255
                 obstacle_mask = (semantic == MESH_OBST_ID).astype("uint8") * 255
+
+                if pixel_click is not None:
+                    self._handle_pixel_click(obs, pixel_click)
+
+                with self._lock:
+                    mode = self._mode
+                    manual_action = self._manual_action
+                    world_goal = self._world_goal
 
                 action = Action(0.0, 0.0, 0.0)
                 trajectory = None
@@ -430,7 +454,9 @@ class RoverController:
                     obstacle_point = avoidance.nearest_obstacle(
                         obstacle_mask, obs.depth, intr
                     )
-                    action, cbf_info = avoidance.apply(action, obstacle_point, goal_bearing)
+                    action, cbf_info = avoidance.apply(
+                        action, obstacle_point, goal_bearing
+                    )
 
                 new_pose = integrate_mars(obs.pose, action, self.dt)
                 env.step(new_pose)
@@ -444,8 +470,21 @@ class RoverController:
                 elif mode == MODE_RESOLVE and belief_tracker.belief_g is not None:
                     dist_to_goal = belief_tracker.distance()
 
+                goal_pixel = None
+                if mode == MODE_POINT and world_goal is not None:
+                    goal_y = env.get_height_at_xz(world_goal[0], world_goal[1])
+                    goal_pixel = project_world_to_pixel(
+                        obs.pose,
+                        (world_goal[0], goal_y, world_goal[1]),
+                        HFOV_DEG,
+                        obs.rgb.shape[1],
+                        obs.rgb.shape[0],
+                    )
+
                 status = self._status_text(mode, unresolved, goal_spec, dist_to_goal)
                 vis_rgb = overlay_semantic_masks(obs.rgb, semantic, text=status)
+                if goal_pixel is not None:
+                    vis_rgb = draw_point_marker(vis_rgb, goal_pixel)
 
                 with self._lock:
                     d = self.display
@@ -463,7 +502,9 @@ class RoverController:
                     )
                     d.trajectory = trajectory
                     d.obstacle_point = (
-                        None if obstacle_point is None else tuple(float(v) for v in obstacle_point)
+                        None
+                        if obstacle_point is None
+                        else tuple(float(v) for v in obstacle_point)
                     )
                     d.cbf_info = cbf_info
                     d.step = step
@@ -479,13 +520,47 @@ class RoverController:
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
-    def _consume_pending(self) -> tuple[bool, bool]:
+    def _consume_pending(self) -> tuple[bool, bool, Optional[tuple]]:
         with self._lock:
             do_resolve = self._pending_resolve
             do_reset = self._pending_reset
+            pixel_click = self._pending_pixel_click
             self._pending_resolve = False
             self._pending_reset = False
-        return do_resolve, do_reset
+            self._pending_pixel_click = None
+        return do_resolve, do_reset, pixel_click
+
+    def _handle_pixel_click(self, obs, pixel_click: tuple) -> None:
+        """Backproject a clicked (x_norm, y_norm) into a world-frame (x, z)
+        point via the live depth frame and switch to MODE_POINT driving
+        toward it -- same bbox_to_world median-over-patch machinery
+        first_frame_resolver's goal already uses, applied to a small patch
+        around the clicked pixel (not just the single pixel) so a click that
+        lands exactly on a depth discontinuity (a rock's silhouette edge)
+        doesn't seed a wildly wrong point. Unlike the belief-tracked RESOLVE
+        goal, this point is never re-derived from odometry/dead-reckoning --
+        it's a fixed world coordinate, recovered fresh from ground-truth pose
+        every tick by body_frame_goal, so it can't drift."""
+        x_norm, y_norm = pixel_click
+        height, width = np.asarray(obs.depth).shape[:2]
+        px, py = x_norm * width, y_norm * height
+        margin = 4.0
+        bbox_norm = (
+            max(0.0, (px - margin) / width),
+            max(0.0, (py - margin) / height),
+            min(1.0, (px + margin) / width),
+            min(1.0, (py + margin) / height),
+        )
+        goal_xyz = bbox_to_world(obs, bbox_norm, hfov_deg=HFOV_DEG)
+        with self._lock:
+            if goal_xyz is None:
+                self.display.click_status = "click ignored: no valid depth there"
+                return
+            gx, _gy, gz = goal_xyz
+            self._world_goal = (gx, gz)
+            self._mode = MODE_POINT
+            self.display.goal_reached = False
+            self.display.click_status = f"point goal set at world ({gx:.1f}, {gz:.1f})"
 
     def _new_belief_tracker(self) -> BeliefGoalTracker:
         return BeliefGoalTracker(
@@ -525,7 +600,9 @@ class RoverController:
             )
         else:
             with self._lock:
-                self.display.status_text = "resolved goal has no valid depth -- skipping mask"
+                self.display.status_text = (
+                    "resolved goal has no valid depth -- skipping mask"
+                )
         for i, obstacle_bbox in enumerate(goal_spec_r.obstacle_bboxes_norm):
             obstacle_position = bbox_to_world(obs_r, obstacle_bbox, hfov_deg=HFOV_DEG)
             if obstacle_position is None:
