@@ -24,9 +24,10 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
 
 import tkinter as tk
+import customtkinter as ctk
 
 import quaternion
 
@@ -80,6 +81,19 @@ UNCERTAINTY_HEADING_KEYS = {
     "1": -135.0,
     "4": -90.0,
     "7": -45.0,
+}
+# Numpad grid position for each heading key above -- drives the heads-up
+# panel's clickable button layout (next.md Goal 2, point 2: "numpad layout
+# drawn as actual labeled regions, not just implied by key bindings").
+UNCERTAINTY_HEADING_GRID_POS = {
+    "7": (0, 0),
+    "8": (0, 1),
+    "9": (0, 2),
+    "4": (1, 0),
+    "6": (1, 2),
+    "1": (2, 0),
+    "2": (2, 1),
+    "3": (2, 2),
 }
 
 CAMERA_HFOV_DEG = 90.0
@@ -351,20 +365,116 @@ class VLTeleopApp:
         self.closed = False
         self.last_vl_line = ""
 
-        self.root = tk.Tk()
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.root = ctk.CTk()
         self.root.title("kb teleop")
 
-        self.image_label = tk.Label(self.root)
+        video_frame = ctk.CTkFrame(self.root)
+        video_frame.pack(padx=10, pady=(10, 4))
+        # Plain tk.Label (not CTkLabel) for the per-frame video blit -- this
+        # updates every render() call and a raw PhotoImage swap is cheaper
+        # than rebuilding a CTkImage every frame; it still lives inside a
+        # CTkFrame so it reads as part of the same themed window.
+        self.image_label = tk.Label(video_frame, bd=0)
         self.image_label.pack()
 
-        self.info_label = tk.Label(
+        mono_font = ctk.CTkFont(family="Consolas", size=12)
+        self.status_panel = ctk.CTkFrame(self.root)
+        self.status_panel.pack(fill="x", padx=10, pady=4)
+        self.status_value_label = ctk.CTkLabel(
+            self.status_panel, text="", anchor="w", justify="left", font=mono_font
+        )
+        self.status_value_label.pack(fill="x", padx=10, pady=(8, 2))
+        self.vl_line_label = ctk.CTkLabel(
+            self.status_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            font=mono_font,
+            text_color="#e8e04a",
+        )
+        self.vl_line_label.pack(fill="x", padx=10)
+        self.ghost_line_label = ctk.CTkLabel(
+            self.status_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            font=mono_font,
+            text_color="#4ade80",
+        )
+        self.ghost_line_label.pack(fill="x", padx=10)
+        self.goal_status_label = ctk.CTkLabel(
+            self.status_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            font=mono_font,
+            text_color="#60a5fa",
+        )
+        if self.goal_enabled:
+            self.goal_status_label.pack(fill="x", padx=10, pady=(0, 8))
+        else:
+            self.status_value_label.pack_configure(pady=(8, 8))
+
+        # Uncertainty-halt heads-up panel (next.md Goal 2, point 2): a bounded
+        # box with its own background/border so it's legible over any terrain
+        # color, packed only while halted_for_uncertainty -- see
+        # _sync_uncertainty_panel. Distinct border/title color for "VLM
+        # request in flight" vs. "waiting for your keypress" (today both
+        # looked identical, plain cyan text, until the text itself changed).
+        self.uncertainty_panel = ctk.CTkFrame(self.root, border_width=2)
+        self.uncertainty_title = ctk.CTkLabel(
+            self.uncertainty_panel, text="", font=ctk.CTkFont(size=15, weight="bold")
+        )
+        self.uncertainty_title.pack(pady=(10, 2))
+        self.uncertainty_desc = ctk.CTkLabel(
+            self.uncertainty_panel,
+            text="",
+            wraplength=460,
+            justify="left",
+            font=ctk.CTkFont(size=12),
+        )
+        self.uncertainty_desc.pack(padx=12, pady=(0, 10), fill="x")
+
+        heading_grid = ctk.CTkFrame(self.uncertainty_panel, fg_color="transparent")
+        heading_grid.pack(pady=(0, 6))
+        self.uncertainty_buttons = {}
+        for key, angle in UNCERTAINTY_HEADING_KEYS.items():
+            r, c = UNCERTAINTY_HEADING_GRID_POS[key]
+            btn = ctk.CTkButton(
+                heading_grid,
+                text=f"{key}\n{angle:+.0f}°",
+                width=70,
+                height=50,
+                command=lambda a=angle: self._submit_uncertainty_heading(a),
+            )
+            btn.grid(row=r, column=c, padx=4, pady=4)
+            self.uncertainty_buttons[key] = btn
+
+        self.uncertainty_retry_button = ctk.CTkButton(
+            self.uncertainty_panel,
+            text="Retry (R)",
+            fg_color="#b45309",
+            hover_color="#92400e",
+            command=self._request_uncertainty_retry,
+        )
+        self.uncertainty_retry_button.pack(pady=(0, 12))
+        # Not packed yet -- _sync_uncertainty_panel() packs/unpacks it as
+        # halted_for_uncertainty flips. Tracked via a plain flag rather than
+        # winfo_ismapped(), which reflects window-manager mapping state and
+        # can lag pack()/pack_forget() calls right after window creation.
+        self._uncertainty_panel_visible = False
+
+        self.info_label = ctk.CTkLabel(
             self.root,
             text=(
-                "W/S move | A/D turn | Q/E height | U force-uncertainty-halt | X quit  "
+                "W/S move | A/D turn | Q/E height | U force-uncertainty-halt | X quit"
             ),
-            font=("Arial", 12),
+            font=ctk.CTkFont(size=12),
         )
-        self.info_label.pack()
+        self.info_label.pack(pady=(0, 8))
 
         self.root.bind("<KeyPress>", self.on_key)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -847,11 +957,27 @@ class VLTeleopApp:
             return
 
         if key == "r":
-            self._dispatch_uncertainty_request(retry=True)
+            self._request_uncertainty_retry()
             return
 
         angle = UNCERTAINTY_HEADING_KEYS.get(key)
         if angle is None:
+            return
+
+        self._submit_uncertainty_heading(angle)
+
+    def _request_uncertainty_retry(self):
+        """Shared by the 'R' key and the heads-up panel's Retry button."""
+        if self.uncertainty_request_in_flight:
+            return
+        self._dispatch_uncertainty_request(retry=True)
+        self._sync_uncertainty_panel()
+
+    def _submit_uncertainty_heading(self, angle):
+        """Shared by the numpad keys and the heads-up panel's heading
+        buttons -- resolves the halt with the given rover-front-relative
+        angle_deg."""
+        if self.uncertainty_request_in_flight:
             return
 
         result = self.uncertainty_session.submit_heading(angle_deg=angle)
@@ -866,6 +992,41 @@ class VLTeleopApp:
         self.uncertainty_time_since_seen = 0.0
         self.halted_for_uncertainty = False
         self.render()
+
+    def _sync_uncertainty_panel(self):
+        """Shows/hides the heads-up panel and updates its in-flight vs.
+        waiting-for-input visual state. Called every render() plus right
+        after dispatching a retry (button click doesn't otherwise trigger a
+        render until the VLM result lands)."""
+        if not self.halted_for_uncertainty:
+            if self._uncertainty_panel_visible:
+                self.uncertainty_panel.pack_forget()
+                self._uncertainty_panel_visible = False
+            return
+
+        if not self._uncertainty_panel_visible:
+            self.uncertainty_panel.pack(fill="x", padx=10, pady=(0, 8))
+            self._uncertainty_panel_visible = True
+
+        in_flight = self.uncertainty_request_in_flight
+        button_state = "disabled" if in_flight else "normal"
+        for btn in self.uncertainty_buttons.values():
+            btn.configure(state=button_state)
+        self.uncertainty_retry_button.configure(state=button_state)
+
+        if in_flight:
+            self.uncertainty_panel.configure(border_color="#f59e0b")
+            self.uncertainty_title.configure(
+                text="REQUESTING VLM SWEEP...", text_color="#f59e0b"
+            )
+        else:
+            self.uncertainty_panel.configure(border_color="#38bdf8")
+            self.uncertainty_title.configure(
+                text="HALTED -- choose a heading", text_color="#38bdf8"
+            )
+        self.uncertainty_desc.configure(
+            text=self.last_uncertainty_line or "Waiting for VLM sweep description..."
+        )
 
     def render(self):
         obs = self.sim.get_sensor_observations()
@@ -1004,13 +1165,18 @@ class VLTeleopApp:
             img_arr = annotated_rgb
 
         img = Image.fromarray(img_arr)
-        draw = ImageDraw.Draw(img)
 
+        # Status/telemetry text used to be baked into the frame with
+        # ImageDraw; now rendered as real CTkLabel widgets in self.status_panel
+        # (next.md Goal 2 UI pass) so the video stays a clean image and text
+        # is crisp/selectable regardless of terrain color underneath.
         status = f"x={self.x:.2f} y={self.y:.2f} z={self.z:.2f} yaw={np.rad2deg(self.yaw):.1f} clearance={self.clearance:.2f} cov={self.uncertainty_covariance:.2f}"
         if self.halted_for_uncertainty:
             status += "  [HALTED: awaiting heading]"
+        self.status_value_label.configure(text=status)
+        self.vl_line_label.configure(text=self.last_vl_line)
+        self.ghost_line_label.configure(text=self.last_ghost_mask_line)
 
-        goal_status = ""
         if self.goal_enabled:
             bearing = self.goal_belief.bearing()
             distance = self.goal_belief.distance()
@@ -1022,15 +1188,9 @@ class VLTeleopApp:
                     f"bearing={math.degrees(bearing):.1f}deg dist={distance:.2f}m "
                     f"unc={self.goal_belief.uncertainty_value():.2f}"
                 )
+            self.goal_status_label.configure(text=goal_status)
 
-        header_h = 119 if self.goal_enabled else 97
-        draw.rectangle([0, 0, img.width, header_h], fill=(0, 0, 0))
-        draw.text((10, 8), status, fill=(255, 255, 255))
-        draw.text((10, 30), self.last_vl_line, fill=(255, 255, 0))
-        draw.text((10, 52), self.last_uncertainty_line, fill=(0, 255, 255))
-        draw.text((10, 74), self.last_ghost_mask_line, fill=(0, 255, 0))
-        if self.goal_enabled:
-            draw.text((10, 96), goal_status, fill=(80, 160, 255))
+        self._sync_uncertainty_panel()
 
         self.tk_img = ImageTk.PhotoImage(img)
         self.image_label.configure(image=self.tk_img)

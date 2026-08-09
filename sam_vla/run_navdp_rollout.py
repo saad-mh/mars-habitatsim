@@ -242,50 +242,139 @@ _UNCERTAINTY_HEADING_LAYOUT = {
     "3": (135.0, 2, 2),
 }
 
+# Keyword -> angle_deg, used to guess a "recommended" heading from the VLM's
+# free-text sweep description so the popup can pre-highlight one button.
+# Purely a cosmetic nudge (next.md Goal 2 open question) -- never trusted as
+# a parsed decision, the human still has to click to actually pick.
+_DIRECTION_KEYWORDS = [
+    ("front-left", -45.0),
+    ("forward-left", -45.0),
+    ("front-right", 45.0),
+    ("forward-right", 45.0),
+    ("straight ahead", 0.0),
+    ("straight", 0.0),
+    ("forward", 0.0),
+    ("front", 0.0),
+    ("ahead", 0.0),
+    ("left", -90.0),
+    ("right", 90.0),
+    ("behind", 180.0),
+    ("back", 180.0),
+]
+
+
+def _guess_recommended_heading(sweep_description):
+    text = (sweep_description or "").lower()
+    for keyword, angle in _DIRECTION_KEYWORDS:
+        if keyword in text:
+            return angle
+    return None
+
 
 def _prompt_human_heading(frame_rgb, sweep_description, attempt, max_retries):
-    """Study 1 (next.md) Phase 2 human-input surface: a modal Tk popup,
-    blocking (mainloop) until the human picks a heading. Needs a real
+    """Study 1 (next.md) Phase 2 human-input surface: a modal CustomTkinter
+    popup, blocking (mainloop) until the human picks a heading. Needs a real
     display (DISPLAY set / X available) -- the tradeoff next.md's Phase 2
     open question flagged in choosing this over a headless terminal prompt:
     the human sees the actual sweep frame, but this can't run over a bare
-    SSH session. If the window is closed without a pick, falls back to
-    0deg (straight ahead) rather than raising."""
-    import tkinter as tk
+    SSH session. Explicit Cancel button and window-close both fall back to
+    0deg (straight ahead), logged distinctly so an accidental close doesn't
+    read as a considered "front" pick in the console trail."""
+    import customtkinter as ctk
+    from PIL import Image
 
-    from PIL import Image, ImageTk
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("dark-blue")
 
-    root = tk.Tk()
+    root = ctk.CTk()
     root.title(f"Uncertainty handoff -- attempt {attempt + 1}/{max_retries + 1}")
-    chosen = {"angle_deg": None}
+    root.resizable(False, False)
+    chosen = {"angle_deg": None, "explicit": False}
+    recommended = _guess_recommended_heading(sweep_description)
 
+    header = ctk.CTkFrame(root, fg_color="transparent")
+    header.pack(fill="x", padx=16, pady=(14, 6))
+    ctk.CTkLabel(
+        header,
+        text="Rover is uncertain -- pick a heading",
+        font=ctk.CTkFont(size=17, weight="bold"),
+    ).pack(side="left")
+    ctk.CTkLabel(
+        header,
+        text=f"attempt {attempt + 1} / {max_retries + 1}",
+        font=ctk.CTkFont(size=13),
+        text_color="#f59e0b" if attempt > 0 else "#94a3b8",
+    ).pack(side="right")
+
+    # Larger/clearer sweep-frame display (next.md Goal 2, point 1): upscale
+    # small sim frames rather than showing them at native (often tiny) size.
     img = Image.fromarray(np.asarray(frame_rgb, dtype=np.uint8))
-    tk_img = ImageTk.PhotoImage(img)
-    img_label = tk.Label(root, image=tk_img)
-    img_label.image = tk_img  # keep a reference so it isn't GC'd
-    img_label.grid(row=0, column=0, columnspan=3)
+    display_w = max(img.width, 480)
+    scale = display_w / img.width
+    display_size = (display_w, int(img.height * scale))
+    ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=display_size)
+    img_label = ctk.CTkLabel(root, image=ctk_img, text="")
+    img_label.pack(padx=16, pady=4)
 
-    tk.Label(
+    ctk.CTkLabel(
         root,
         text=f"VLM sweep: {sweep_description}",
-        wraplength=400,
+        wraplength=display_w,
         justify="left",
-    ).grid(row=1, column=0, columnspan=3, sticky="w")
+        anchor="w",
+    ).pack(fill="x", padx=16, pady=(4, 10))
 
-    def pick(angle):
+    def pick(angle, explicit=True):
         chosen["angle_deg"] = angle
+        chosen["explicit"] = explicit
         root.destroy()
 
+    grid = ctk.CTkFrame(root, fg_color="transparent")
+    grid.pack(padx=16, pady=(0, 6))
     for key, (angle, r, c) in _UNCERTAINTY_HEADING_LAYOUT.items():
-        tk.Button(
-            root,
-            text=f"{key}: {angle:+.0f}°",
-            width=8,
+        is_recommended = recommended is not None and angle == recommended
+        btn = ctk.CTkButton(
+            grid,
+            text=f"{key}: {angle:+.0f}°" + (" ★" if is_recommended else ""),
+            width=96,
+            height=56,
+            fg_color="#15803d" if is_recommended else None,
+            hover_color="#166534" if is_recommended else None,
             command=lambda a=angle: pick(a),
-        ).grid(row=2 + r, column=c)
+        )
+        btn.grid(row=r, column=c, padx=5, pady=5)
+    if recommended is not None:
+        ctk.CTkLabel(
+            root,
+            text="★ = direction the VLM's sweep description implies",
+            font=ctk.CTkFont(size=11),
+            text_color="#4ade80",
+        ).pack(pady=(0, 6))
 
+    footer = ctk.CTkFrame(root, fg_color="transparent")
+    footer.pack(fill="x", padx=16, pady=(4, 14))
+    ctk.CTkButton(
+        footer,
+        text="Cancel (defaults to 0°/front)",
+        fg_color="#7f1d1d",
+        hover_color="#991b1b",
+        command=lambda: pick(0.0, explicit=True),
+    ).pack(side="right")
+
+    def on_close():
+        pick(0.0, explicit=False)
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
-    return chosen["angle_deg"] if chosen["angle_deg"] is not None else 0.0
+
+    if chosen["angle_deg"] is None:
+        chosen["angle_deg"] = 0.0
+    if not chosen["explicit"]:
+        print(
+            "[uncertainty] popup window closed without an explicit pick -- "
+            "defaulting to 0.0deg (front)"
+        )
+    return chosen["angle_deg"]
 
 
 def _run_uncertainty_handoff(

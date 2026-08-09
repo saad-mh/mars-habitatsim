@@ -1,4 +1,4 @@
-# Two studies: human-in-the-loop uncertainty handoff, and real-world sensor-noise injection
+# Two studies: human-in-the-loop uncertainty handoff, and real-world sensor-noise injection, plus a nav-GUI UX pass
 
 ## Status of the previous plan this file held
 
@@ -8,7 +8,141 @@ the ghost-mask-mode addendum (VLM-placed circle, `vl_direction`'s fourth mode) a
 merged. **Phase 2 (wiring the ghost mask into `sam_vla/run_navdp_rollout.py`'s real rollout loop) was
 never done** — `grep -n "ghost_mask" sam_vla/run_navdp_rollout.py` currently returns nothing. If that's
 still wanted, re-derive it from `git log -p -- next.md` (the plan text is intact in history) rather than
-from memory — don't re-plan it from scratch. This file now tracks two new, unrelated studies.
+from memory — don't re-plan it from scratch. This file now tracks two new, unrelated studies, plus (as of
+2026-08-09) a nav-GUI UX pass below.
+
+---
+
+# Goals for 2026-08-09 — nav-GUI segmentation confirm/rerun loop + uncertainty-prompt UI polish
+
+Two goals, both scoped to the interactive `nav/` GUI (`nav/gui.py` `NavGuiApp` + `nav/rover_controller.py`
+`RoverController`) rather than the batch rollout scripts. Verified against the actual code in this session
+(2026-08-09), not re-derived from memory:
+
+## Goal 1 — proper spawn → segment → confirm/rerun → click-goal → drive flow
+
+### Current state (verified)
+
+The individual pieces already exist and are wired, but **skip the confirm/rerun step** the user wants:
+
+| Piece | Where | Current behavior |
+|---|---|---|
+| Spawn/reset | `RoverController.request_reset()` ([nav/rover_controller.py:276-278](nav/rover_controller.py:276)), consumed in `_env_loop` ([:365-387](nav/rover_controller.py:365)) | Un-tags prior goal/obstacle mesh objects, rebuilds `BeliefGoalTracker`/CBF, teleports agent to `(start_x, start_z, start_yaw_deg)`. Bound to "Reset Rover" ([nav/gui.py:86-88](nav/gui.py:86)). Already correct as a spawn step — no change needed. |
+| SAM2 segmentation | "Resolve Goal (auto)" button ([nav/gui.py:79-81](nav/gui.py:79)) → `request_resolve()` → `_do_resolve` ([nav/rover_controller.py:575-625](nav/rover_controller.py:575)) → `first_frame_resolver.resolve_verbose` (SAM2 + Qwen VLM salience pick) | Result rendered as a live green/red alpha overlay ([sam_vla/perception/semantic_overlay.py:17-52](sam_vla/perception/semantic_overlay.py:17)) plus a status banner with the resolved instruction text. |
+| **Missing**: confirm/rerun gate | N/A | `_do_resolve` sets `_mode = MODE_RESOLVE` immediately ([nav/rover_controller.py:621](nav/rover_controller.py:621)) and driving starts on the *next* tick — there is no "is this segmentation correct? [Confirm] [Rerun]" pause. Re-clicking "Resolve Goal (auto)" does re-run segmentation, but only as a same-button redo, not as an explicit rejection step, and it doesn't stop a drive already in progress from a bad prior resolve. |
+| Click-to-goal | `NavGuiApp.on_cam_click` ([nav/gui.py:176-181](nav/gui.py:176)) → "Confirm Point Goal" ([:183-191](nav/gui.py:183)) → `request_pixel_goal(nx, ny)` ([nav/rover_controller.py:264-270](nav/rover_controller.py:264)) → `_handle_pixel_click` backprojects via depth to world `(x, z)` ([:533-563](nav/rover_controller.py:533)), sets `MODE_POINT`. | Already end-to-end (click → Confirm → drives every tick automatically). This part already matches "click to choose goal → drive towards goal" — no change needed. |
+
+### Plan
+
+1. Add an explicit **segmentation-review state** between "Resolve Goal (auto)" and driving: after
+   `_do_resolve` produces a mask/overlay, hold in a new `MODE_REVIEW_SEGMENTATION` (don't fall through to
+   `MODE_RESOLVE`/driving) until the user clicks **Confirm** (proceed to `MODE_RESOLVE`, start driving,
+   same as today) or **Rerun** (call `_do_resolve` again, e.g. with a different SAM2 seed/prompt variant if
+   `first_frame_resolver` supports one, otherwise just re-invoke it as-is) or **Pick manually** (fall
+   through to the existing click-to-goal flow instead of the auto-resolved goal).
+2. Add the corresponding buttons to `nav/gui.py`'s button bar next to "Resolve Goal (auto)" — mirror the
+   existing "Confirm Point Goal" / "Cancel" pair's styling ([nav/gui.py:183-191](nav/gui.py:183)) so the
+   two confirm flows (segmentation-confirm, point-goal-confirm) look and behave consistently.
+3. Wire "Reset Rover" to also clear any pending `MODE_REVIEW_SEGMENTATION` state so a reset mid-review
+   doesn't leave a stale overlay/mode behind.
+4. This makes the full user-facing loop: **Reset (spawn) → Resolve Goal (auto, runs SAM2) → review overlay
+   → Confirm/Rerun/Pick-manually → drive** — the flow the goal describes, with the click-to-goal path kept
+   as the manual fallback it already is today.
+
+## Goal 2 — better UI for the VLM uncertainty prompt — DONE (2026-08-09)
+
+Both surfaces below were reworked using [CustomTkinter](https://customtkinter.tomschimansky.com/documentation)
+(`pip install customtkinter`, now in the `habitat` env alongside plain `tkinter` -- both scripts already
+required that env) instead of raw `tkinter` widgets, per the explicit ask. The blocking/return-`angle_deg`
+interface Study 1 depends on is unchanged; this was a presentation-only pass, confirmed by two standalone
+smoke tests (widget tree built + driven programmatically with `root.after`-scheduled synthetic clicks/state
+flips, no human needed) exercising the popup and the HUD panel's in-flight/waiting/hidden states.
+
+- **`run_navdp_rollout.py`'s `_prompt_human_heading`**: still a modal `CTk()` window blocking on
+  `mainloop()`. Now: sweep frame upscaled to >=480px wide (`CTkImage`) instead of shown at native sim
+  resolution, a visible `attempt N / max_retries+1` counter (amber once `attempt > 0`), a `_guess_recommended_heading`
+  keyword parser over the VLM's sweep-description text (front/left/right/back/diagonals) that highlights
+  the implied heading button green with a star, and an explicit red "Cancel (defaults to 0deg/front)"
+  button distinct from the window-close handler -- both still resolve to `0.0`, but the console log now
+  says which one fired (`"popup window closed without an explicit pick"` only on close/no-op, not on
+  Cancel), so an accidental close no longer reads as a considered front-pick in the log trail.
+- **`kb_teleop_vl.py`'s overlay**: the old `ImageDraw`-baked cyan text line is gone. The whole HUD (status/
+  VL-line/ghost-line/goal-status, previously `draw.rectangle`+`draw.text` onto the frame every render) is
+  now real `CTkLabel` widgets in a `status_panel` below the video `CTkFrame`, so text stays crisp
+  regardless of terrain color and the annotated frame sent to the VLM is unaffected either way (the header
+  was always display-only, drawn after `last_annotated_rgb` was captured). The uncertainty halt itself gets
+  a dedicated `uncertainty_panel`: bordered `CTkFrame`, packed only while `halted_for_uncertainty` (tracked
+  via a plain `_uncertainty_panel_visible` flag, not `winfo_ismapped()` -- that reflects window-manager
+  mapping state and lagged pack()/pack_forget() calls right after window creation in testing), a real 3x3
+  numpad-position grid of clickable `CTkButton`s (`UNCERTAINTY_HEADING_GRID_POS`) wired to the same
+  `_submit_uncertainty_heading`/`_request_uncertainty_retry` methods the numpad keys now call too (shared,
+  not duplicated), and a distinct visual state for in-flight (amber border/title, all buttons `disabled`)
+  vs. waiting-for-input (cyan border/title, buttons enabled) -- previously both looked identical.
+- Not yet exercised against a live Qwen server / real sim session end-to-end (only the standalone widget-tree
+  smoke tests above, no `--uncertainty-mock-client` or real `kb_teleop_vl.py` run performed) -- do that before
+  relying on this for an actual Study 1 human-condition run.
+
+### Current state (verified) -- as of before this rework, kept for history
+
+Two separate, diverged implementations exist, neither in the `nav/` GUI itself:
+
+- **`sam_vla/run_navdp_rollout.py`** `_prompt_human_heading` ([:246-289](sam_vla/run_navdp_rollout.py:246)):
+  a brand-new, hard-blocking `tk.Tk()` popup (`mainloop()`) showing the sweep RGB frame, a wrapped VLM
+  sweep-description label, and a 3×3 numpad-style angle-button grid
+  (`_UNCERTAINTY_HEADING_LAYOUT`, [:230-243](sam_vla/run_navdp_rollout.py:230)). No retry-count/countdown
+  widget, no way to see the prior VLM response once state changes, and closing the window without a pick
+  silently defaults to `0.0` (front) with no visible cancel affordance.
+- **`scripts/habitat_tests/kb_teleop_vl.py`** (`_dispatch_uncertainty_request`/`_uncertainty_worker`/
+  `_handle_halted_key`, [:789-868](scripts/habitat_tests/kb_teleop_vl.py:789)): no separate popup at all —
+  runs the VLM sweep call on a background thread and burns the result (attempt number + sweep text) as
+  cyan text directly onto the live camera frame at a fixed position ([:1029-1030](scripts/habitat_tests/kb_teleop_vl.py:1029)),
+  read via numpad keys 1/2/3/4/6/7/8/9 plus "R" to retry ([`UNCERTAINTY_HEADING_KEYS`, :74-83](scripts/habitat_tests/kb_teleop_vl.py:74)).
+  Non-blocking, but zero visual affordance beyond a line of burned-in text — no buttons, no highlighted
+  current selection, no visible "waiting for VLM" state distinct from "ready for input".
+
+The stated ask ("Have to Proper UI for both of them") means both need real polish, not a pick-one unify —
+they're used in different contexts (`run_navdp_rollout.py` = headed batch rollouts, `kb_teleop_vl.py` =
+live teleop) and next.md's Study 1 already depends on `run_navdp_rollout.py`'s popup shape for its
+`human_decision_ms` timing bucket, so its *interface* (return an `angle_deg`, block until answered) should
+stay stable even as its look improves.
+
+### Plan
+
+1. **`run_navdp_rollout.py`'s popup**: keep it a modal Tk window (Study 1's timing model depends on it
+   blocking), but improve it in place — larger/clearer sweep-frame display, a visible attempt/retry counter
+   (`attempt`/`max_retries` already passed into `_prompt_human_heading`, just not shown), a highlighted
+   "recommended" direction if the VLM's sweep description implies one, and a visible Cancel button that's
+   distinct from window-close (still defaulting to `0.0`, but as an explicit user action instead of an
+   accidental one).
+2. **`kb_teleop_vl.py`'s overlay**: replace the single fixed-position text burn-in with a proper
+   heads-up panel — bounded box with background so it's legible over any terrain color, the numpad layout
+   drawn as actual labeled regions (not just implied by key bindings), and a distinct visual state for
+   "VLM request in flight" vs. "waiting for your keypress" (today both look identical — plain cyan text —
+   until the text itself changes).
+3. Keep both implementations separate per the divergence above — this is a UI-quality pass on each, not a
+   consolidation into shared code (consolidating would be a larger refactor risking Study 1's already-tested
+   timing behavior, out of scope for today).
+
+## Non-goals
+
+- Don't change `first_frame_resolver`'s SAM2/Qwen resolution logic itself — Goal 1 only adds a
+  review/gate step around its existing output, not a different segmentation algorithm.
+- Don't touch Study 1's `_run_uncertainty_handoff` control-flow/timing logic
+  ([sam_vla/run_navdp_rollout.py:132-... region](sam_vla/run_navdp_rollout.py)) — Goal 2 is presentation
+  only; `human_decision_ms` must still measure the same thing it does today.
+- Don't merge `run_navdp_rollout.py`'s and `kb_teleop_vl.py`'s uncertainty-UI code paths into one shared
+  module as part of this pass (see Goal 2 plan, point 3).
+
+## Open questions
+
+- Whether "Rerun" in Goal 1 should vary the SAM2 seed/prompt or just re-invoke `first_frame_resolver`
+  identically (currently deterministic given the same frame, per Study 1's building-blocks table note on
+  `directive_engine.query`'s determinism) — a plain re-run would return the same mask every time, which may
+  not be what "rerun segmentation" implies. Needs `first_frame_resolver.resolve_verbose`'s signature
+  checked for an existing seed/variant knob before deciding.
+- Exact look of the "recommended direction" highlight in Goal 2's `run_navdp_rollout.py` popup — depends on
+  whether the VLM sweep description reliably names a direction in parseable form; may need a small parser
+  addition rather than being purely cosmetic.
 
 ---
 
