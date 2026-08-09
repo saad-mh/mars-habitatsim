@@ -37,6 +37,9 @@ class NavDPS2DiffOutput:
     fallback_stop: bool
     minimum_clearance: np.ndarray
     selected_minimum_clearance: float
+    mean_guidance_noise_correction: float
+    final_guidance_noise_correction: float
+    maximum_guidance_noise_correction: float
 
 
 class NavDPS2DiffClient:
@@ -142,6 +145,15 @@ class NavDPS2DiffClient:
             selected_minimum_clearance=float(
                 diagnostics["selected_minimum_clearance"][0]
             ),
+            mean_guidance_noise_correction=float(
+                diagnostics["mean_guidance_noise_correction"][0]
+            ),
+            final_guidance_noise_correction=float(
+                diagnostics["final_guidance_noise_correction"][0]
+            ),
+            maximum_guidance_noise_correction=float(
+                diagnostics["maximum_guidance_noise_correction"][0]
+            ),
         )
 
     @staticmethod
@@ -214,18 +226,26 @@ def start_server(args: argparse.Namespace) -> Optional[subprocess.Popen[Any]]:
         str(checkpoint),
         "--device",
         str(args.navdp_device),
+        "--seed",
+        str(args.seed),
         "--port",
         str(args.server_port),
         "--candidates",
         str(args.candidates),
         "--particles",
         str(args.particles),
+        "--particle-std",
+        str(args.particle_std),
         "--guidance-strength",
         str(args.guidance_strength),
+        "--temperature",
+        str(args.temperature),
         "--safe-distance",
         str(args.safe_distance),
         "--hard-collision-distance",
         str(args.hard_collision_distance),
+        "--safety-weight",
+        str(args.safety_weight),
         "--minimum-obstacle-depth",
         str(args.minimum_obstacle_depth),
         "--maximum-obstacle-depth",
@@ -737,6 +757,7 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--navdp-checkpoint", required=True)
     argument_parser.add_argument("--navdp-python", default=sys.executable)
     argument_parser.add_argument("--navdp-device", default="cuda:0")
+    argument_parser.add_argument("--seed", type=int, default=7)
     argument_parser.add_argument(
         "--start-server", action=argparse.BooleanOptionalAction, default=True
     )
@@ -745,9 +766,12 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--server-timeout", type=float, default=180.0)
     argument_parser.add_argument("--candidates", type=int, default=16)
     argument_parser.add_argument("--particles", type=int, default=8)
+    argument_parser.add_argument("--particle-std", type=float, default=0.22)
     argument_parser.add_argument("--guidance-strength", type=float, default=0.85)
+    argument_parser.add_argument("--temperature", type=float, default=0.35)
     argument_parser.add_argument("--safe-distance", type=float, default=0.42)
     argument_parser.add_argument("--hard-collision-distance", type=float, default=0.24)
+    argument_parser.add_argument("--safety-weight", type=float, default=35.0)
     argument_parser.add_argument("--minimum-obstacle-depth", type=float, default=0.10)
     argument_parser.add_argument("--maximum-obstacle-depth", type=float, default=5.0)
     argument_parser.add_argument("--maximum-obstacle-pixels", type=int, default=1536)
@@ -823,6 +847,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
+    np.random.seed(args.seed)
     if args.obstacle_mode == "ghost" and (
         args.ghost_obstacle_x is None or args.ghost_obstacle_z is None
     ):
@@ -909,6 +934,9 @@ def main() -> None:
                 "selected_index",
                 "fallback_stop",
                 "selected_minimum_clearance",
+                "mean_guidance_noise_correction",
+                "final_guidance_noise_correction",
+                "maximum_guidance_noise_correction",
                 "goal_distance",
             )
         }
@@ -1022,12 +1050,22 @@ def main() -> None:
             rows["selected_index"].append(result.selected_index)
             rows["fallback_stop"].append(result.fallback_stop)
             rows["selected_minimum_clearance"].append(result.selected_minimum_clearance)
+            rows["mean_guidance_noise_correction"].append(
+                result.mean_guidance_noise_correction
+            )
+            rows["final_guidance_noise_correction"].append(
+                result.final_guidance_noise_correction
+            )
+            rows["maximum_guidance_noise_correction"].append(
+                result.maximum_guidance_noise_correction
+            )
             rows["goal_distance"].append(goal_distance)
 
             if step % max(int(args.save_every), 1) == 0:
                 label = (
                     f"t={step} goal={goal_distance:.2f}m pixels={len(obstacle_pixels)} "
                     f"clear={result.selected_minimum_clearance:.2f}m "
+                    f"guide_rms={result.mean_guidance_noise_correction:.4f} "
                     f"v={action[0]:.2f} w={action[2]:.2f}"
                 )
                 frame = overlay_frame(rgb, goal_mask, obstacle_mask, label)
@@ -1037,7 +1075,9 @@ def main() -> None:
             print(
                 f"step={step:04d} goal={goal_distance:.2f}m "
                 f"pixels={len(obstacle_pixels)} selected={result.selected_index} "
-                f"fallback={result.fallback_stop} action={action.tolist()}",
+                f"fallback={result.fallback_stop} "
+                f"guide_rms={result.mean_guidance_noise_correction:.6f} "
+                f"action={action.tolist()}",
                 flush=True,
             )
             if goal_distance <= args.stop_distance:
