@@ -5,7 +5,7 @@ frame dispatches one of vl_direction's four modes on a background thread
 (movement never blocks on it): "cbf" go-around guidance when an obstacle is
 close and in view, "exploration" four-way prior otherwise, "uncertainty"
 heading-request halt when a synthetic covariance proxy drifts too high
-(numpad 1/2/3/4/6/7/8/9 to answer, U to force-trigger), and "ghost_mask" to
+(numpad 1/2/3/4/6/7/8/9 to answer), and "ghost_mask" to
 place a translucent ellipse toward a tracked belief anchor once it's out of
 frame. An optional real ground-truth goal (--goal-x/--goal-z/--goal-radius)
 feeds BeliefGoalTracker directly and, once acquired, permanently silences
@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import math
+import sys
 import threading
 import time
 from pathlib import Path
@@ -30,6 +31,10 @@ import tkinter as tk
 import customtkinter as ctk
 
 import quaternion
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import kb_teleop as kb
 from sam_vla.core.belief_tracking import BeliefGoalTracker, uncertainty_growth_increment
@@ -59,7 +64,7 @@ EXPLORATION_TASK_STR = "explore the terrain ahead"
 
 # --- uncertainty halt: synthetic covariance proxy (this script has no real belief
 # tracker) -- confidence drifts up while no synthetic obstacle is close enough to act
-# as a visual anchor, resets when one is. U forces an immediate halt for testing. ---
+# as a visual anchor, resets when one is. ---
 UNCERTAINTY_GROUNDING_RANGE_M = CBF_DISTANCE_THRESHOLD_M
 DEFAULT_UNCERTAINTY_COVARIANCE_THRESHOLD = vl_dir_config.DEFAULT_COVARIANCE_THRESHOLD
 DEFAULT_UNCERTAINTY_GROWTH_PER_STEP = 0.01
@@ -358,7 +363,7 @@ class VLTeleopApp:
         )
         print(
             f"[VLTeleopApp] uncertainty halt: growth={self.uncertainty_growth_per_step}/step, "
-            f"threshold={self.uncertainty_covariance_threshold} (press U to force-trigger)"
+            f"threshold={self.uncertainty_covariance_threshold}"
         )
 
         self.frame_idx = 0
@@ -470,7 +475,7 @@ class VLTeleopApp:
         self.info_label = ctk.CTkLabel(
             self.root,
             text=(
-                "W/S move | A/D turn | Q/E height | U force-uncertainty-halt | X quit"
+                "W/S move | A/D turn | Q/E height | X quit"
             ),
             font=ctk.CTkFont(size=12),
         )
@@ -1206,11 +1211,6 @@ class VLTeleopApp:
             self._handle_halted_key(key)
             return
 
-        if key == "u":
-            self.uncertainty_covariance = self.uncertainty_covariance_threshold
-            self.render()
-            return
-
         old_x = self.x
         old_z = self.z
 
@@ -1281,8 +1281,8 @@ def _parse_args():
         type=float,
         default=DEFAULT_UNCERTAINTY_GROWTH_PER_STEP,
         help="base per-frame covariance growth while no synthetic obstacle is nearby "
-        f"(default {DEFAULT_UNCERTAINTY_GROWTH_PER_STEP}); press U in-app to "
-        "force-trigger the halt instead of waiting on this",
+        f"(default {DEFAULT_UNCERTAINTY_GROWTH_PER_STEP}); lower this to trigger the "
+        "halt sooner for testing",
     )
     parser.add_argument(
         "--cov-growth-rate",

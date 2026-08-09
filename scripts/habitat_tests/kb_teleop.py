@@ -19,7 +19,7 @@ import habitat_sim
 from habitat_sim.agent import AgentConfiguration
 import quaternion
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent.parent
 
 SCENE = str(HERE / "assets" / "marsyard2022.glb")
 HEIGHTMAP = str(HERE / "marsyard2022_terrain_hm_1025.tif")

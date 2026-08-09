@@ -9,6 +9,7 @@ Usage:
 """
 
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -16,6 +17,10 @@ import numpy as np
 from PIL import Image, ImageTk, ImageDraw
 
 import tkinter as tk
+
+HERE = Path(__file__).resolve().parent.parent.parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
 from sam_vla.core.types import Pose
 from sam_vla.env.habitat_env import MarsHabitatEnv
@@ -30,8 +35,6 @@ from sam_vla.perception.spot_check_segmentation import (
     build_palette,
     overlay_category_mask,
 )
-
-HERE = Path(__file__).resolve().parent
 
 SCENE = str(HERE / "assets" / "marsyard2022.glb")
 HEIGHTMAP = str(HERE / "marsyard2022_terrain_hm_1025.tif")

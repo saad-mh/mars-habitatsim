@@ -93,6 +93,12 @@ MODE_IDLE = "idle"
 MODE_POINT = "point"
 MODE_RESOLVE = "resolve"
 MODE_MANUAL = "manual"
+# Holding state between a completed SAM2/Qwen resolve and the user accepting
+# it -- entered by _do_resolve instead of MODE_RESOLVE, left via
+# request_confirm_segmentation (-> MODE_RESOLVE, starts driving),
+# request_rerun_segmentation (stays here, re-invokes _do_resolve), or
+# request_pick_manually (-> MODE_IDLE, falls through to click-to-goal).
+MODE_REVIEW_SEGMENTATION = "review_segmentation"
 
 # Ground-truth distance at which a point goal counts as reached
 POINT_GOAL_REACHED_M = 0.7
@@ -107,7 +113,7 @@ class DisplayState:
     vis_rgb: Optional[np.ndarray] = None
     pose: Optional[Pose] = None
     mode: str = MODE_IDLE
-    status_text: str = "starting..."
+    status_text: str = "starting"
     action: Action = field(default_factory=lambda: Action(0.0, 0.0, 0.0))
     distance: Optional[float] = None
     goal_world: Optional[tuple] = None
@@ -209,6 +215,9 @@ class RoverController:
         self._pending_resolve = False
         self._pending_reset = False
         self._pending_pixel_click: Optional[tuple] = None
+        self._pending_confirm_segmentation = False
+        self._pending_rerun_segmentation = False
+        self._pending_pick_manually = False
 
         self.display = DisplayState()
         self._rng = np.random.default_rng()
@@ -272,6 +281,26 @@ class RoverController:
     def request_resolve(self) -> None:
         with self._lock:
             self._pending_resolve = True
+
+    def request_confirm_segmentation(self) -> None:
+        """Accept the goal/obstacle masks from the most recent resolve/rerun
+        -- MODE_REVIEW_SEGMENTATION -> MODE_RESOLVE, driving starts next
+        tick. No-op if not currently in review (stale click after a reset)."""
+        with self._lock:
+            self._pending_confirm_segmentation = True
+
+    def request_rerun_segmentation(self) -> None:
+        """Reject the current segmentation and re-invoke the resolver.
+        Stays in MODE_REVIEW_SEGMENTATION for another round of review."""
+        with self._lock:
+            self._pending_rerun_segmentation = True
+
+    def request_pick_manually(self) -> None:
+        """Reject the auto-resolved goal entirely and fall through to the
+        existing click-to-goal flow: untags the resolved masks and returns
+        to MODE_IDLE so a subsequent request_pixel_goal drives normally."""
+        with self._lock:
+            self._pending_pick_manually = True
 
     def request_reset(self) -> None:
         with self._lock:
@@ -360,7 +389,14 @@ class RoverController:
             while self._running:
                 t0 = time.time()
 
-                do_resolve, do_reset, pixel_click = self._consume_pending()
+                (
+                    do_resolve,
+                    do_reset,
+                    pixel_click,
+                    do_confirm_seg,
+                    do_rerun_seg,
+                    do_pick_manual,
+                ) = self._consume_pending()
 
                 if do_reset:
                     for obj in goal_objects + obstacle_objects:
@@ -386,11 +422,35 @@ class RoverController:
                         self.display.goal_reached = False
                         self.display.click_status = ""
 
-                if do_resolve:
+                if do_resolve or do_rerun_seg:
                     goal_objects, obstacle_objects, goal_spec = self._do_resolve(
                         env, step, mask_dir, goal_objects, obstacle_objects, goal_spec
                     )
                     belief_tracker.belief_g = None
+
+                if do_confirm_seg:
+                    with self._lock:
+                        if self._mode == MODE_REVIEW_SEGMENTATION:
+                            self._mode = MODE_RESOLVE
+                            self.display.status_text = (
+                                f"resolved: {goal_spec.instruction_text}"
+                            )
+                            self.display.goal_reached = False
+
+                if do_pick_manual:
+                    with self._lock:
+                        was_reviewing = self._mode == MODE_REVIEW_SEGMENTATION
+                        if was_reviewing:
+                            self._mode = MODE_IDLE
+                            self._world_goal = None
+                            self.display.status_text = (
+                                "pick a goal point manually -- click the camera view"
+                            )
+                            self.display.goal_reached = False
+                    if was_reviewing:
+                        for obj in goal_objects + obstacle_objects:
+                            obj.semantic_id = 0
+                        goal_objects, obstacle_objects = [], []
 
                 obs = env.get_observation(frame_idx=step)
                 semantic = env.get_semantic_frame()
@@ -520,15 +580,30 @@ class RoverController:
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
-    def _consume_pending(self) -> tuple[bool, bool, Optional[tuple]]:
+    def _consume_pending(
+        self,
+    ) -> tuple[bool, bool, Optional[tuple], bool, bool, bool]:
         with self._lock:
             do_resolve = self._pending_resolve
             do_reset = self._pending_reset
             pixel_click = self._pending_pixel_click
+            do_confirm_seg = self._pending_confirm_segmentation
+            do_rerun_seg = self._pending_rerun_segmentation
+            do_pick_manual = self._pending_pick_manually
             self._pending_resolve = False
             self._pending_reset = False
             self._pending_pixel_click = None
-        return do_resolve, do_reset, pixel_click
+            self._pending_confirm_segmentation = False
+            self._pending_rerun_segmentation = False
+            self._pending_pick_manually = False
+        return (
+            do_resolve,
+            do_reset,
+            pixel_click,
+            do_confirm_seg,
+            do_rerun_seg,
+            do_pick_manual,
+        )
 
     def _handle_pixel_click(self, obs, pixel_click: tuple) -> None:
         """Backproject a clicked (x_norm, y_norm) into a world-frame (x, z)
@@ -598,11 +673,15 @@ class RoverController:
                     goal_position, MESH_GOAL_ID, self.obj_mask_radius, mask_dir, "goal"
                 )
             )
+            status_msg = (
+                f"reviewing resolved goal: '{goal_spec_r.instruction_text}' -- "
+                "Confirm to drive, Rerun to retry, or Pick Manually"
+            )
         else:
-            with self._lock:
-                self.display.status_text = (
-                    "resolved goal has no valid depth -- skipping mask"
-                )
+            status_msg = (
+                "resolved goal has no valid depth -- skipping mask "
+                "(Rerun or Pick Manually)"
+            )
         for i, obstacle_bbox in enumerate(goal_spec_r.obstacle_bboxes_norm):
             obstacle_position = bbox_to_world(obs_r, obstacle_bbox, hfov_deg=HFOV_DEG)
             if obstacle_position is None:
@@ -618,9 +697,9 @@ class RoverController:
             )
 
         with self._lock:
-            self._mode = MODE_RESOLVE
+            self._mode = MODE_REVIEW_SEGMENTATION
             self._world_goal = None
-            self.display.status_text = f"resolved: {goal_spec_r.instruction_text}"
+            self.display.status_text = status_msg
             self.display.goal_reached = False
         return new_goal_objects, new_obstacle_objects, goal_spec_r
 
@@ -633,6 +712,9 @@ class RoverController:
             return "MANUAL DRIVE"
         if mode == MODE_POINT:
             return f"POINT GOAL  dist={dist_txt}"
+        if mode == MODE_REVIEW_SEGMENTATION:
+            label = goal_spec.instruction_text if goal_spec is not None else "?"
+            return f"REVIEW SEGMENTATION '{label}' -- Confirm / Rerun / Pick Manually"
         if mode == MODE_RESOLVE:
             if unresolved:
                 return "RESOLVE  waiting for goal sighting..."

@@ -4,6 +4,12 @@ the in-house, single-process equivalent of Nav_new/MARS/launch_mars.sh's
 DINO+NavDP GUI, driving the actual published NavDP model instead of this
 repo's own custom S2DiT+NavDP model (see rover_controller.py's docstring).
 
+UI follows the same customtkinter conventions as
+scripts/habitat_tests/kb_teleop_vl.py: dark theme, grouped CTkFrame panels,
+and state-only panels (segmentation review, click-to-goal confirm) that
+appear/disappear via pack()/pack_forget() instead of sitting on screen
+disabled -- mirrors that script's uncertainty-halt panel.
+
 Run via nav/launch_nav.sh, or directly:
     conda activate habitat
     cd mars-habitatsim
@@ -18,13 +24,31 @@ from pathlib import Path
 from typing import Optional
 
 import tkinter as tk
-from tkinter import ttk
+import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 
-from nav.rover_controller import RoverController
+from nav.rover_controller import MODE_REVIEW_SEGMENTATION, RoverController
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REFRESH_MS = 66  # ~15 Hz GUI repaint, independent of the controller's own hz
+
+PLOT_BG = "#242424"
+PLOT_AXIS = "#555555"
+PLOT_ROVER = "#e5e7eb"
+PLOT_OBSTACLE = "#f87171"
+PLOT_TRAJECTORY = "#f97373"
+PLOT_GOAL = "#fbbf24"
+
+# Mode -> accent color, shared by the big mode label and (where relevant)
+# the panel that goes with that mode -- keeps color the one consistent cue
+# for "what is the rover doing right now" across the whole window.
+MODE_COLORS = {
+    "idle": "#9ca3af",
+    "manual": "#60a5fa",
+    "point": "#4ade80",
+    "resolve": "#c084fc",
+    MODE_REVIEW_SEGMENTATION: "#f59e0b",
+}
 
 
 def _default_navdp_upstream_ckpt() -> Optional[str]:
@@ -42,7 +66,7 @@ class NavGuiApp:
 
     def __init__(
         self,
-        root: tk.Tk,
+        root: ctk.CTk,
         controller: RoverController,
         max_linear: float,
         max_angular: float,
@@ -54,53 +78,147 @@ class NavGuiApp:
         self.closed = False
         self._manual_held: set[str] = set()
         self._pending_click_norm: Optional[tuple[float, float]] = None
+        self._seg_panel_visible = False
+        self._click_panel_visible = False
 
         root.title("mars-habitatsim/nav")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        main = ttk.Frame(root, padding=8)
-        main.grid(sticky="nsew")
+        mono_font = ctk.CTkFont(family="Consolas", size=12)
+        mode_font = ctk.CTkFont(size=17, weight="bold")
 
-        self.cam_label = ttk.Label(main)
-        self.cam_label.grid(row=0, column=0, padx=4, pady=4)
+        # -- camera view + body-frame plot, side by side -- #
+        top_row = ctk.CTkFrame(root, fg_color="transparent")
+        top_row.pack(padx=10, pady=(10, 4))
+
+        cam_frame = ctk.CTkFrame(top_row)
+        cam_frame.pack(side="left", padx=(0, 4))
+        # Plain tk.Label (not CTkLabel) for the per-frame video blit, same
+        # reasoning as kb_teleop_vl.py: a raw PhotoImage swap every refresh
+        # is cheaper than rebuilding a CTkImage each time.
+        self.cam_label = tk.Label(cam_frame, bd=0)
+        self.cam_label.pack(padx=4, pady=(4, 2))
         self._blank_photo = ImageTk.PhotoImage(
             Image.new("RGB", (self.CAM_SIZE, self.CAM_SIZE), "#222")
         )
         self.cam_label.configure(image=self._blank_photo)
         self.cam_label.bind("<Button-1>", self.on_cam_click)
+        ctk.CTkLabel(
+            cam_frame,
+            text="click the view to set a goal point",
+            font=ctk.CTkFont(size=11),
+            text_color="#9ca3af",
+        ).pack(pady=(0, 4))
 
+        plot_frame = ctk.CTkFrame(top_row)
+        plot_frame.pack(side="left", padx=(4, 0))
+        ctk.CTkLabel(
+            plot_frame, text="body-frame view", font=ctk.CTkFont(size=11)
+        ).pack(pady=(4, 0))
         self.plot = tk.Canvas(
-            main, width=self.PLOT_SIZE, height=self.PLOT_SIZE, bg="white"
+            plot_frame,
+            width=self.PLOT_SIZE,
+            height=self.PLOT_SIZE,
+            bg=PLOT_BG,
+            highlightthickness=0,
         )
-        self.plot.grid(row=0, column=1, padx=4, pady=4)
+        self.plot.pack(padx=4, pady=(2, 4))
 
-        bar = ttk.Frame(main)
-        bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 2))
-        ttk.Button(bar, text="Resolve Goal (auto)", command=self.resolve_goal).pack(
-            side="left", padx=2
+        # -- status panel: mode + detail + telemetry, always visible -- #
+        self.status_panel = ctk.CTkFrame(root)
+        self.status_panel.pack(fill="x", padx=10, pady=4)
+        self.mode_label = ctk.CTkLabel(
+            self.status_panel, text="", anchor="w", justify="left", font=mode_font
         )
-        ttk.Button(bar, text="Random Goal", command=self.random_goal).pack(
-            side="left", padx=8
+        self.mode_label.pack(fill="x", padx=10, pady=(8, 0))
+        self.detail_label = ctk.CTkLabel(
+            self.status_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            wraplength=860,
+            font=ctk.CTkFont(size=12),
         )
-        ttk.Button(bar, text="Go Home", command=self.go_home).pack(side="left", padx=2)
-        ttk.Button(bar, text="Reset Rover", command=self.reset_rover).pack(
-            side="left", padx=8
+        self.detail_label.pack(fill="x", padx=10, pady=(2, 2))
+        self.telemetry_label = ctk.CTkLabel(
+            self.status_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            font=mono_font,
+            text_color="#9ca3af",
         )
-        ttk.Button(bar, text="STOP", command=self.stop).pack(side="left", padx=10)
+        self.telemetry_label.pack(fill="x", padx=10, pady=(0, 2))
+        self.alive_label = ctk.CTkLabel(
+            self.status_panel,
+            text="controller thread died -- see console",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#f87171",
+        )
+        self._alive_label_visible = False
 
-        drive = ttk.Frame(main)
-        drive.grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
-        ttk.Label(drive, text="Manual drive (hold, or arrow keys):").pack(side="left")
-        for label, direction in (
-            ("<", "left"),
-            ("^", "fwd"),
-            ("v", "back"),
-            (">", "right"),
-        ):
-            b = ttk.Button(drive, text=label, width=3)
+        # -- primary action bar -- #
+        actions = ctk.CTkFrame(root)
+        actions.pack(fill="x", padx=10, pady=4)
+        ctk.CTkLabel(
+            actions, text="Goal", font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=(10, 10), pady=8)
+        ctk.CTkButton(
+            actions, text="Segment", command=self.resolve_goal, width=150
+        ).grid(row=0, column=1, padx=4, pady=8)
+        ctk.CTkButton(
+            actions, text="Random Goal", command=self.random_goal, width=120
+        ).grid(row=0, column=2, padx=4, pady=8)
+        ctk.CTkButton(actions, text="Go Home", command=self.go_home, width=100).grid(
+            row=0, column=3, padx=4, pady=8
+        )
+        ctk.CTkButton(
+            actions,
+            text="Reset Rover",
+            command=self.reset_rover,
+            width=110,
+            fg_color="#4b5563",
+            hover_color="#374151",
+        ).grid(row=0, column=4, padx=(20, 4), pady=8)
+        ctk.CTkButton(
+            actions,
+            text="STOP",
+            command=self.stop,
+            width=90,
+            fg_color="#b91c1c",
+            hover_color="#991b1b",
+        ).grid(row=0, column=5, padx=(4, 10), pady=8)
+
+        # -- manual drive: D-pad, always visible -- #
+        drive = ctk.CTkFrame(root)
+        drive.pack(fill="x", padx=10, pady=4)
+        ctk.CTkLabel(
+            drive,
+            text="Manual Drive",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, rowspan=3, sticky="w", padx=(10, 16), pady=8)
+        dpad = ctk.CTkFrame(drive, fg_color="transparent")
+        dpad.grid(row=0, column=1, rowspan=3, pady=6)
+        dpad_cells = {
+            "fwd": (0, 1, "↑"),
+            "left": (1, 0, "←"),
+            "right": (1, 2, "→"),
+            "back": (2, 1, "↓"),
+        }
+        for direction, (r, c, glyph) in dpad_cells.items():
+            b = ctk.CTkButton(dpad, text=glyph, width=56, height=44)
             b.bind("<ButtonPress-1>", lambda e, d=direction: self.manual_press(d))
             b.bind("<ButtonRelease-1>", lambda e, d=direction: self.manual_release(d))
-            b.pack(side="left", padx=2)
+            b.grid(row=r, column=c, padx=4, pady=4)
+        ctk.CTkLabel(
+            drive,
+            text="hold a direction, or use the arrow keys -- Esc cancels a pending click",
+            font=ctk.CTkFont(size=11),
+            text_color="#9ca3af",
+        ).grid(row=0, column=2, sticky="w", padx=10)
+
         for key, direction in (
             ("Up", "fwd"),
             ("Down", "back"),
@@ -113,35 +231,82 @@ class NavGuiApp:
             )
         root.bind("<Escape>", lambda e: self.cancel_pixel_click())
 
-        click_row = ttk.Frame(main)
-        click_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=2)
-        ttk.Label(click_row, text="Click the camera view to pick a goal point:").pack(
-            side="left"
+        # -- segmentation review panel: only packed while actually
+        # reviewing (Goal 1) -- bordered like kb_teleop_vl's uncertainty
+        # halt panel so it reads as "action needed", not a fourth static
+        # button row. -- #
+        self.seg_panel = ctk.CTkFrame(root, border_width=2, border_color="#f59e0b")
+        ctk.CTkLabel(
+            self.seg_panel,
+            text="REVIEWING RESOLVED GOAL",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#f59e0b",
+        ).pack(pady=(10, 2))
+        self.seg_desc_label = ctk.CTkLabel(
+            self.seg_panel, text="", wraplength=860, justify="left"
         )
-        self.confirm_click_btn = ttk.Button(
-            click_row,
+        self.seg_desc_label.pack(padx=12, pady=(0, 8), fill="x")
+        seg_btn_row = ctk.CTkFrame(self.seg_panel, fg_color="transparent")
+        seg_btn_row.pack(pady=(0, 12))
+        ctk.CTkButton(
+            seg_btn_row,
+            text="Confirm",
+            command=self.confirm_segmentation,
+            width=120,
+            fg_color="#15803d",
+            hover_color="#166534",
+        ).grid(row=0, column=0, padx=6)
+        ctk.CTkButton(
+            seg_btn_row,
+            text="Rerun",
+            command=self.rerun_segmentation,
+            width=120,
+            fg_color="#b45309",
+            hover_color="#92400e",
+        ).grid(row=0, column=1, padx=6)
+        ctk.CTkButton(
+            seg_btn_row,
+            text="Pick Manually",
+            command=self.pick_manually,
+            width=140,
+        ).grid(row=0, column=2, padx=6)
+
+        # -- click-to-goal confirm panel: only packed while a click is
+        # pending confirmation. -- #
+        self.click_panel = ctk.CTkFrame(root, border_width=2, border_color="#00b8d4")
+        self.click_desc_label = ctk.CTkLabel(
+            self.click_panel,
+            text="Set the goal at the point you clicked?",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#22d3ee",
+        )
+        self.click_desc_label.pack(pady=(10, 6))
+        click_btn_row = ctk.CTkFrame(self.click_panel, fg_color="transparent")
+        click_btn_row.pack(pady=(0, 10))
+        ctk.CTkButton(
+            click_btn_row,
             text="Confirm Point Goal",
             command=self.confirm_pixel_goal,
-            state="disabled",
-        )
-        self.confirm_click_btn.pack(side="left", padx=8)
-        self.cancel_click_btn = ttk.Button(
-            click_row, text="Cancel", command=self.cancel_pixel_click, state="disabled"
-        )
-        self.cancel_click_btn.pack(side="left", padx=2)
-        self.click_status_label = ttk.Label(click_row, text="", anchor="w")
-        self.click_status_label.pack(side="left", padx=8)
+            width=160,
+            fg_color="#15803d",
+            hover_color="#166534",
+        ).grid(row=0, column=0, padx=6)
+        ctk.CTkButton(
+            click_btn_row,
+            text="Cancel",
+            command=self.cancel_pixel_click,
+            width=100,
+            fg_color="#4b5563",
+            hover_color="#374151",
+        ).grid(row=0, column=1, padx=6)
 
-        self.status = ttk.Label(
-            main,
-            text="starting",
-            font=("TkDefaultFont", 11, "bold"),
-            width=110,
-            anchor="w",
+        # -- persistent click-result line (last click's outcome, e.g. "point
+        # goal set at world (x, z)" or "click ignored: no valid depth
+        # there") -- stays visible after the confirm panel above closes. -- #
+        self.click_status_label = ctk.CTkLabel(
+            root, text="", anchor="w", font=ctk.CTkFont(size=11), text_color="#9ca3af"
         )
-        self.status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.info = ttk.Label(main, text="", width=110, anchor="w")
-        self.info.grid(row=5, column=0, columnspan=2, sticky="w")
+        self.click_status_label.pack(fill="x", padx=14, pady=(0, 8))
 
         self._photo = None
         self.root.after(REFRESH_MS, self.refresh)
@@ -172,13 +337,22 @@ class NavGuiApp:
         self.cancel_pixel_click()
         self.controller.stop_driving()
 
+    # ---------------- segmentation review (Goal 1) ---------------- #
+    def confirm_segmentation(self) -> None:
+        self.controller.request_confirm_segmentation()
+
+    def rerun_segmentation(self) -> None:
+        self.controller.request_rerun_segmentation()
+
+    def pick_manually(self) -> None:
+        self._manual_held.clear()
+        self.controller.request_pick_manually()
+
     # ---------------- click-to-goal ---------------- #
     def on_cam_click(self, event) -> None:
         nx = min(max(event.x / self.CAM_SIZE, 0.0), 1.0)
         ny = min(max(event.y / self.CAM_SIZE, 0.0), 1.0)
         self._pending_click_norm = (nx, ny)
-        self.confirm_click_btn.configure(state="normal")
-        self.cancel_click_btn.configure(state="normal")
 
     def confirm_pixel_goal(self) -> None:
         if self._pending_click_norm is None:
@@ -187,13 +361,9 @@ class NavGuiApp:
         nx, ny = self._pending_click_norm
         self.controller.request_pixel_goal(nx, ny)
         self._pending_click_norm = None
-        self.confirm_click_btn.configure(state="disabled")
-        self.cancel_click_btn.configure(state="disabled")
 
     def cancel_pixel_click(self) -> None:
         self._pending_click_norm = None
-        self.confirm_click_btn.configure(state="disabled")
-        self.cancel_click_btn.configure(state="disabled")
 
     # ---------------- manual drive ---------------- #
     def manual_press(self, direction: str) -> None:
@@ -238,18 +408,18 @@ class NavGuiApp:
             self._photo = ImageTk.PhotoImage(img)
             self.cam_label.configure(image=self._photo)
 
-        self.click_status_label.configure(text=d.click_status)
         self._draw_plot(d)
+        self._sync_seg_panel(d)
+        self._sync_click_panel()
+        self.click_status_label.configure(text=d.click_status)
 
-        mode_txt = d.mode.upper()
+        mode_txt = d.mode.upper().replace("_", " ")
         if d.goal_reached:
-            mode_txt += " (GOAL REACHED)"
-        alive_txt = (
-            ""
-            if self.controller.is_alive()
-            else "  [controller thread died -- see console]"
+            mode_txt += " "  # Goal Reached!
+        self.mode_label.configure(
+            text=mode_txt, text_color=MODE_COLORS.get(d.mode, "#e5e7eb")
         )
-        self.status.configure(text=f"[{mode_txt}] {d.status_text}{alive_txt}")
+        self.detail_label.configure(text=d.status_text)
 
         pose_txt = (
             f"pose ({d.pose.x:.1f}, {d.pose.z:.1f}, yaw={math.degrees(d.pose.yaw):.0f}deg)"
@@ -262,12 +432,40 @@ class NavGuiApp:
             cbf_txt = "  CBF:orbit" if d.cbf_info.get("orbiting") else "  CBF:blocked"
         if d.cbf_info.get("hard_gate_fired"):
             cbf_txt += "  CBF:hard-gate"
-        self.info.configure(
-            text=f"{pose_txt}   step={d.step} "
+        self.telemetry_label.configure(
+            text=f"{pose_txt}   step={d.step}   "
             f"v=[{act.v_fwd:.2f},{act.v_lat:.2f}] yaw_rate={act.yaw_rate:+.2f}{cbf_txt}"
         )
 
+        alive = self.controller.is_alive()
+        if not alive and not self._alive_label_visible:
+            self.alive_label.pack(fill="x", padx=10, pady=(0, 8))
+            self._alive_label_visible = True
+        elif alive and self._alive_label_visible:
+            self.alive_label.pack_forget()
+            self._alive_label_visible = False
+
         self.root.after(REFRESH_MS, self.refresh)
+
+    def _sync_seg_panel(self, d) -> None:
+        in_review = d.mode == MODE_REVIEW_SEGMENTATION
+        if in_review and not self._seg_panel_visible:
+            self.seg_panel.pack(fill="x", padx=10, pady=4)
+            self._seg_panel_visible = True
+        elif not in_review and self._seg_panel_visible:
+            self.seg_panel.pack_forget()
+            self._seg_panel_visible = False
+        if in_review:
+            self.seg_desc_label.configure(text=d.status_text)
+
+    def _sync_click_panel(self) -> None:
+        pending = self._pending_click_norm is not None
+        if pending and not self._click_panel_visible:
+            self.click_panel.pack(fill="x", padx=10, pady=4)
+            self._click_panel_visible = True
+        elif not pending and self._click_panel_visible:
+            self.click_panel.pack_forget()
+            self._click_panel_visible = False
 
     def _draw_pending_click(self, img: Image.Image) -> Image.Image:
         # Not-yet-confirmed marker at the last click, cyan to read as distinct
@@ -292,25 +490,27 @@ class NavGuiApp:
         ):  # body frame (fwd, left) -> canvas (origin at rover, facing up)
             return S / 2 - (left / R) * (S / 2), S - (forward / R) * S * 0.92 - 20
 
-        self.plot.create_line(0, S - 20, S, S - 20, fill="#ddd")
+        self.plot.create_line(0, S - 20, S, S - 20, fill=PLOT_AXIS)
         self.plot.create_oval(
-            S / 2 - 5, S - 25, S / 2 + 5, S - 15, fill="black"
+            S / 2 - 5, S - 25, S / 2 + 5, S - 15, fill=PLOT_ROVER, outline=""
         )  # rover
 
         if d.obstacle_point is not None:
             ox, oy = to_px(d.obstacle_point[0], d.obstacle_point[1])
             self.plot.create_oval(
-                ox - 5, oy - 5, ox + 5, oy + 5, outline="#c0392b", width=2
+                ox - 5, oy - 5, ox + 5, oy + 5, outline=PLOT_OBSTACLE, width=2
             )
 
         if d.trajectory is not None and len(d.trajectory) > 1:
             pts = [to_px(float(p[0]), float(p[1])) for p in d.trajectory]
-            self.plot.create_line(*[c for xy in pts for c in xy], fill="red", width=3)
+            self.plot.create_line(
+                *[c for xy in pts for c in xy], fill=PLOT_TRAJECTORY, width=3
+            )
 
         if d.belief_g is not None:
             gx, gy = to_px(d.belief_g[0], d.belief_g[1])
             self.plot.create_text(
-                gx, gy, text="*", fill="#d4a017", font=("TkDefaultFont", 26)
+                gx, gy, text="*", fill=PLOT_GOAL, font=("TkDefaultFont", 26)
             )
 
     def tick_forever(self) -> None:
@@ -407,7 +607,9 @@ def main(argv=None) -> None:
     controller = build_controller(args)
     controller.start()
 
-    root = tk.Tk()
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("dark-blue")
+    root = ctk.CTk()
     app = NavGuiApp(
         root, controller, max_linear=args.max_linear, max_angular=args.max_angular
     )
