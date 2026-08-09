@@ -6,11 +6,13 @@ Convention (must match sam_vla.core.pose_integrator.integrate_mars and
 sam_vla.core.goal_geometry.bbox_to_world, both of which this module derives
 from independently rather than importing -- these are three-line pure
 functions, not worth adding a cross-module dependency for): world heading at
-yaw is (cos(yaw), sin(yaw)) in the (x, z) plane; "left" is the
-counter-clockwise perpendicular of heading, i.e. (-sin(yaw), cos(yaw)).
-Solving bbox_to_world's own (world_x, world_z) = pose + fwd*heading +
-right*rightward for (fwd, right) given a world point yields the formulas
-below (right = -left). Cross-checked numerically in this module's __main__.
+yaw is (-sin(yaw), -cos(yaw)) in the (x, z) plane -- matching habitat-sim's
+actual agent-forward direction (local -Z rotated by yaw about +Y), not the
+naive (cos(yaw), sin(yaw)) this module used before the front/back navigation
+bug fix; "left" is (-cos(yaw), sin(yaw)). Solving bbox_to_world's own
+(world_x, world_z) = pose + fwd*heading + right*rightward for (fwd, right)
+given a world point yields the formulas below (right = -left). Cross-checked
+numerically in this module's __main__.
 """
 
 from __future__ import annotations
@@ -27,8 +29,8 @@ def body_frame_goal(pose: Pose, world_xz: tuple[float, float]) -> tuple[float, f
     dx = gx - pose.x
     dz = gz - pose.z
     cos_yaw, sin_yaw = math.cos(pose.yaw), math.sin(pose.yaw)
-    forward = dx * cos_yaw + dz * sin_yaw
-    left = dz * cos_yaw - dx * sin_yaw
+    forward = -dx * sin_yaw - dz * cos_yaw
+    left = -dx * cos_yaw + dz * sin_yaw
     # print(f"body pose -> {forward}, {left} (from world {gx}, {gz})")
     return forward, left
 
@@ -52,8 +54,8 @@ def random_ahead_point(
     bearing = math.radians(float(rng.uniform(-bearing_range_deg, bearing_range_deg)))
     dist = float(rng.uniform(*dist_range))
     theta = pose.yaw + bearing
-    gx = pose.x + dist * math.cos(theta)
-    gz = pose.z + dist * math.sin(theta)
+    gx = pose.x - dist * math.sin(theta)
+    gz = pose.z - dist * math.cos(theta)
     if world_limit is not None:
         gx, gz = clamp_to_yard(gx, gz, world_limit)
     return gx, gz
@@ -70,8 +72,8 @@ if __name__ == "__main__":
         pose = Pose(x=1.5, y=0.0, z=-2.5, yaw=yaw)
         fwd_in, right_in = 4.0, 1.2
         cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
-        world_x = pose.x + fwd_in * cos_yaw + right_in * sin_yaw
-        world_z = pose.z + fwd_in * sin_yaw - right_in * cos_yaw
+        world_x = pose.x - fwd_in * sin_yaw + right_in * cos_yaw
+        world_z = pose.z - fwd_in * cos_yaw - right_in * sin_yaw
         fwd_out, left_out = body_frame_goal(pose, (world_x, world_z))
         assert math.isclose(fwd_out, fwd_in, abs_tol=1e-6), (yaw_deg, fwd_out, fwd_in)
         assert math.isclose(left_out, -right_in, abs_tol=1e-6), (

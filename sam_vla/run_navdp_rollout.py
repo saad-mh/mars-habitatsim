@@ -135,8 +135,8 @@ def _body_odom_from_poses(prev_pose, cur_pose):
     dx_world = x1 - x0
     dz_world = z1 - z0
     cos_yaw, sin_yaw = math.cos(yaw0), math.sin(yaw0)
-    forward = dx_world * cos_yaw + dz_world * sin_yaw
-    right = dx_world * sin_yaw - dz_world * cos_yaw
+    forward = -dx_world * sin_yaw - dz_world * cos_yaw
+    right = dx_world * cos_yaw - dz_world * sin_yaw
     dtheta = (yaw1 - yaw0 + math.pi) % (2.0 * math.pi) - math.pi
     return [forward, -right, dtheta]
 

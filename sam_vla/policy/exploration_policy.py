@@ -35,9 +35,9 @@ def _wrap_rad(angle: float) -> float:
 
 def _project_ahead(pose: Pose, distance: float) -> tuple[float, float]:
     """Point `distance` ahead of pose along its heading, in pose_integrator's
-    forward-direction convention (cos(yaw), sin(yaw)) -- used only to decide
+    forward-direction convention (-sin(yaw), -cos(yaw)) -- used only to decide
     whether the ground the rover is about to enter is already marked explored."""
-    return pose.x + distance * math.cos(pose.yaw), pose.z + distance * math.sin(pose.yaw)
+    return pose.x - distance * math.sin(pose.yaw), pose.z - distance * math.cos(pose.yaw)
 
 
 @dataclass

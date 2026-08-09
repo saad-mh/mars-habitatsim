@@ -5,7 +5,10 @@ GoalSpec only ever carries a normalized bbox in the frame it was resolved from â
 there is no separate goal actor in the sim to query a world position from. This
 module anchors one by backprojecting the bbox center through the depth map of
 that same frame, using the pinhole model and the yaw convention pose_integrator
-already commits to (heading = (cos_yaw, sin_yaw) in the x-z plane).
+already commits to (heading = (-sin_yaw, -cos_yaw) in the x-z plane --
+habitat-sim's actual agent-forward direction, verified against
+kb_teleop.py; see pose_integrator.py's docstring for the front/back
+navigation bug this convention fixes).
 """
 
 from __future__ import annotations
@@ -91,8 +94,8 @@ def bbox_to_world(
     cos_yaw = math.cos(pose.yaw)
     sin_yaw = math.sin(pose.yaw)
 
-    world_x = pose.x + z_cam * cos_yaw + x_cam * sin_yaw
-    world_z = pose.z + z_cam * sin_yaw - x_cam * cos_yaw
+    world_x = pose.x - z_cam * sin_yaw + x_cam * cos_yaw
+    world_z = pose.z - z_cam * cos_yaw - x_cam * sin_yaw
     world_y = pose.y - y_cam
 
     return (world_x, world_y, world_z)
@@ -119,10 +122,10 @@ def project_world_to_pixel(
     dx = wx - pose.x
     dz = wz - pose.z
     cos_yaw, sin_yaw = math.cos(pose.yaw), math.sin(pose.yaw)
-    z_cam = dx * cos_yaw + dz * sin_yaw
+    z_cam = -dx * sin_yaw - dz * cos_yaw
     if z_cam <= 1e-3:
         return None
-    x_cam = dx * sin_yaw - dz * cos_yaw
+    x_cam = dx * cos_yaw - dz * sin_yaw
     y_cam = pose.y - wy
 
     fx = (width / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
