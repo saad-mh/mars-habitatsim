@@ -1000,7 +1000,7 @@ class RoverController:
         # and what the GUI/backprojection use, unmodified.
         detect_rgb = env.get_mesh_overlay_rgb() if self.seg_overlay == "mesh" else None
         try:
-            goal_spec_r, _vlm_result, _dets = first_frame_resolver.resolve_verbose(
+            goal_spec_r, vlm_result, dets = first_frame_resolver.resolve_verbose(
                 obs_r.rgb,
                 detect_rgb=detect_rgb,
                 backend=self.seg_backend,
@@ -1013,20 +1013,98 @@ class RoverController:
             # resolve shouldn't clobber whatever was previously resolved.
             return goal_objects, obstacle_objects, current_goal_spec
 
+        # resolve_verbose's raw VLM result/detections were previously discarded
+        # here -- surfaced now so a resolve can actually be audited from the
+        # terminal (which detection the VLM picked as goal_index, and whether
+        # that specific bbox's depth backprojection is what silently dropped
+        # the goal mask below, as opposed to the VLM never picking one).
+        print(
+            f"[nav resolve] {len(dets)} detection(s), "
+            f"goal_index={vlm_result.get('goal_index')}, "
+            f"reasoning={vlm_result.get('reasoning', '')!r}"
+        )
+
         goal_position = backproject_goal_position(obs_r, goal_spec_r, hfov_deg=HFOV_DEG)
+        goal_bbox_norm = goal_spec_r.goal_bbox_norm
+        obstacle_bboxes_norm = list(goal_spec_r.obstacle_bboxes_norm)
+        used_fallback = False
+        if goal_position is None:
+            # bbox_to_world only returns None when literally every pixel in
+            # the *padded* interior patch is non-finite or <= 0 -- dump those
+            # same patch stats so a "bad depth" print above is diagnosable
+            # (void/sky hit vs. NaN vs. a degenerate 0-area bbox) instead of
+            # a bare yes/no. pad_px must match bbox_to_world's own default.
+            pad_px = 6
+            depth = np.asarray(obs_r.depth)
+            h, w = depth.shape[:2]
+            x0, y0, x1, y1 = goal_bbox_norm
+            ix0, ix1 = sorted(
+                (min(max(int(x0 * w), 0), w - 1), min(max(int(x1 * w), 0), w - 1))
+            )
+            iy0, iy1 = sorted(
+                (min(max(int(y0 * h), 0), h - 1), min(max(int(y1 * h), 0), h - 1))
+            )
+            ix0, ix1 = max(ix0 - pad_px, 0), min(ix1 + pad_px, w - 1)
+            iy0, iy1 = max(iy0 - pad_px, 0), min(iy1 + pad_px, h - 1)
+            patch = depth[iy0 : iy1 + 1, ix0 : ix1 + 1]
+            print(
+                f"[nav resolve] goal bbox_norm={goal_bbox_norm} -> "
+                f"pixels x[{ix0}:{ix1}] y[{iy0}:{iy1}] of {w}x{h}, "
+                f"depth patch min={np.nanmin(patch):.4f} max={np.nanmax(patch):.4f} "
+                f"nonfinite={int((~np.isfinite(patch)).sum())}/{patch.size} "
+                f"zero_or_neg={int((patch <= 0.0).sum())}/{patch.size}"
+            )
+            # A whole padded neighborhood reading uniformly invalid means
+            # this specific detection isn't backed by real geometry at all
+            # (see CLAUDE.md's "Annotation masks are thin silhouette
+            # slivers" known issue -- these checkpoints predict artifact
+            # detections, not just imprecise ones) -- no amount of local
+            # padding fixes that. Rather than leaving the episode with
+            # obstacles and no goal, fall through the VLM's other ranked
+            # detections (in the order it returned them) and promote the
+            # first one that actually backprojects. Only if none of them do
+            # does this genuinely have no usable goal this resolve.
+            for i, candidate_bbox in enumerate(obstacle_bboxes_norm):
+                candidate_position = bbox_to_world(
+                    obs_r, candidate_bbox, hfov_deg=HFOV_DEG
+                )
+                if candidate_position is not None:
+                    print(
+                        f"[nav resolve] falling back to candidate {i} "
+                        "(top pick had no valid depth) as goal"
+                    )
+                    goal_position = candidate_position
+                    goal_bbox_norm = candidate_bbox
+                    del obstacle_bboxes_norm[i]
+                    obstacle_bboxes_norm.append(goal_spec_r.goal_bbox_norm)
+                    used_fallback = True
+                    break
+
         goal_objects, obstacle_objects = self._clear_masks(
             env, goal_objects, obstacle_objects
         )
         new_goal_objects: list = []
         new_obstacle_objects: list = []
+        goal_mask_warning = ""
         if goal_position is not None:
             new_goal_objects.append(
                 env.register_object_mask(
                     goal_position, MESH_GOAL_ID, self.obj_mask_radius, mask_dir, "goal"
                 )
             )
+            # goal_spec_r.instruction_text still describes the VLM's original
+            # top pick (its reasoning references that specific detection) --
+            # note the substitution explicitly rather than let the sidebar
+            # imply the reasoning still matches whichever bbox actually got
+            # registered as the goal.
+            instruction = goal_spec_r.instruction_text
+            if used_fallback:
+                instruction += (
+                    " [top pick had no valid depth -- fell back to another "
+                    "detection as the actual goal]"
+                )
             status_msg = (
-                f"reviewing resolved goal: '{goal_spec_r.instruction_text}' -- "
+                f"reviewing resolved goal: '{instruction}' -- "
                 "Confirm to drive, Rerun to retry, or Pick Manually"
             )
         else:
@@ -1034,7 +1112,20 @@ class RoverController:
                 "resolved goal has no valid depth -- skipping mask "
                 "(Rerun or Pick Manually)"
             )
-        for i, obstacle_bbox in enumerate(goal_spec_r.obstacle_bboxes_norm):
+            # This is the case the user needs to actually see: the VLM did
+            # pick a goal (goal_spec_r.instruction_text above reflects it),
+            # but neither its bbox nor any fallback candidate got a mask in
+            # the scene, so the rover has only obstacles registered and
+            # nothing to drive toward. The per-tick `d.status_text = status`
+            # in _env_loop overwrites display.status_text with the generic
+            # mode banner on the very next frame, which would otherwise
+            # erase this warning before it's ever seen -- click_status
+            # isn't touched every tick, so park it there instead.
+            goal_mask_warning = (
+                "resolve: no detection had valid depth, only obstacle "
+                "mask(s) registered -- Rerun or Pick Manually"
+            )
+        for i, obstacle_bbox in enumerate(obstacle_bboxes_norm):
             obstacle_position = bbox_to_world(obs_r, obstacle_bbox, hfov_deg=HFOV_DEG)
             if obstacle_position is None:
                 continue
@@ -1047,11 +1138,16 @@ class RoverController:
                     f"obstacle_{i}",
                 )
             )
+        print(
+            f"[nav resolve] goal_mask={'registered' if new_goal_objects else 'MISSING (bad depth)'}, "
+            f"obstacle_masks={len(new_obstacle_objects)}/{len(goal_spec_r.obstacle_bboxes_norm)} registered"
+        )
 
         with self._lock:
             self._mode = MODE_REVIEW_SEGMENTATION
             self._world_goal = None
             self.display.status_text = status_msg
+            self.display.click_status = goal_mask_warning
             self.display.goal_reached = False
         return new_goal_objects, new_obstacle_objects, goal_spec_r
 

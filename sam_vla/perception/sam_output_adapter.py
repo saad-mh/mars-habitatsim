@@ -10,9 +10,31 @@ from sam_vla.core.types import Detection
 # can span most of the frame), not a candidate rock - surfacing it here lets
 # the VLM pick a bedrock region as the "goal" or "obstacle", which is wrong.
 # Any class not in this map (bedrock included) is dropped in to_detections.
+#
+# The mapped value is a neutral role-free label, not "obstacle" -- it flows
+# straight into qwen_prompts.build_select_goal_prompt's per-detection
+# `class="..."` line and qwen_client's instruction_text ("Navigate to the
+# {class_name} target..."), both *before* goal_index picks which detection
+# is actually the goal. Mapping to "obstacle" here pre-labels every
+# candidate (including whichever one ends up chosen as the goal) as an
+# obstacle in the VLM's own prompt/output, which both biases the selection
+# and makes the resolved goal's status text misleadingly read "Navigate to
+# the obstacle target".
 _CLASS_MAP = {
-    "bigrock": "obstacle",
+    "bigrock": "rock",
 }
+
+# NOTE: the LoRA checkpoints trained on mesh_annotation_tool's hull masks
+# predict thin silhouette-line masks rather than filled rock regions (see
+# CLAUDE.md's "Annotation masks are thin silhouette slivers" known issue),
+# so bounding rectangles here are routinely just 1-3px tall regardless of
+# whether depth backprojection later succeeds or fails for that particular
+# box -- a min-size filter was tried here and reverted, since it rejected
+# the *same shape* of box that succeeds as often as it rejects ones that
+# fail (bbox size isn't what predicts a bad depth sample; see
+# goal_geometry.bbox_to_world's padding instead, which is where this is
+# actually handled). Don't reintroduce a size floor here without evidence
+# it's not just discarding real detections wholesale.
 
 
 def to_detections(

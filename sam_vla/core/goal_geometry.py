@@ -44,18 +44,32 @@ def intrinsics_from_hfov(height: int, width: int, hfov_deg: float) -> dict[str, 
 
 
 def bbox_to_world(
-    obs: Observation, bbox_norm: tuple[float, float, float, float], hfov_deg: float
+    obs: Observation,
+    bbox_norm: tuple[float, float, float, float],
+    hfov_deg: float,
+    pad_px: int = 6,
 ) -> GoalPosition | None:
     """Backproject a normalized bbox into a world-frame (x, y, z) point.
 
     Bearing/elevation come from the bbox's center pixel; range comes from the
-    MEDIAN depth over the bbox's interior, mirroring rollout_navdp_policy's
-    bbox_to_body robustness -- a single center pixel can land on a depth
-    discontinuity (a rock's silhouette edge, a gap between the object and the
-    background behind it) and seed a badly wrong range.
+    MEDIAN depth over the bbox's interior (expanded by `pad_px` on every
+    side), mirroring rollout_navdp_policy's bbox_to_body robustness -- a
+    single center pixel can land on a depth discontinuity (a rock's
+    silhouette edge, a gap between the object and the background behind it)
+    and seed a badly wrong range.
 
-    Returns None if depth is unavailable, or no pixel in the bbox has valid
-    depth (e.g. the bbox is entirely a sky/void hit).
+    The padding matters in practice: the current segmentation checkpoints
+    (see CLAUDE.md's "Annotation masks are thin silhouette slivers" known
+    issue) routinely predict masks -- and therefore bboxes -- just 1-3px
+    tall, whose *unpadded* interior can land squarely on a depth seam even
+    though it's centered on real rock (bbox size alone doesn't predict this;
+    same-shaped slivers have been observed to both succeed and fail
+    unpadded, see nav/rover_controller.py's goal-resolve depth-patch
+    logging). Padding trades a little precision for a wider, more robust
+    depth sample around that center.
+
+    Returns None if depth is unavailable, or no pixel in the (padded) patch
+    has valid depth (e.g. the bbox is entirely a sky/void hit).
     """
     if obs.depth is None:
         return None
@@ -70,6 +84,8 @@ def bbox_to_world(
     iy0, iy1 = sorted(
         (min(max(int(fy0), 0), height - 1), min(max(int(fy1), 0), height - 1))
     )
+    ix0, ix1 = max(ix0 - pad_px, 0), min(ix1 + pad_px, width - 1)
+    iy0, iy1 = max(iy0 - pad_px, 0), min(iy1 + pad_px, height - 1)
 
     patch = np.asarray(obs.depth)[iy0 : iy1 + 1, ix0 : ix1 + 1]
     valid = patch[np.isfinite(patch) & (patch > 0.0)]
