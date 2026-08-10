@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Edit these paths once, or override any of them as environment variables.
+# Complete NavDP/HLC-S2Diff ablation for the Mars Habitat rollout.
+# Default: pure NavDP, base S2Diff, full HLC, component removals, and a
+# K={1,2,4,8,16} candidate-count sweep.
+# The critic remains loaded in every default run. HLC-S2Diff does not call it.
+
 HABITAT_PYTHON="${HABITAT_PYTHON:-/home/gpu/miniconda3/envs/habitat/bin/python}"
 MARS_ROOT="${MARS_ROOT:-/home/gpu/Desktop/pineapple/mars-habitatsim}"
 NAVDP_ROOT="${NAVDP_ROOT:-/home/gpu/Desktop/pineapple/navdp_upstream}"
@@ -10,18 +14,27 @@ SCENE="${SCENE:-${MARS_ROOT}/assets/marsyard2022.glb}"
 TERRAIN_OBJ="${TERRAIN_OBJ:-${MARS_ROOT}/assets/marsyard2022.obj}"
 ROLLOUT_SCRIPT="${ROLLOUT_SCRIPT:-${MARS_ROOT}/scripts/vlm_nav_tests/rollout_s2dn_policy.py}"
 ANALYZER_SCRIPT="${ANALYZER_SCRIPT:-${MARS_ROOT}/scripts/vlm_nav_tests/analyze_navdp_ablation.py}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${MARS_ROOT}/runs/navdp_ablation}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${MARS_ROOT}/runs/navdp_ablation_complete}"
 
-# Space-separated seeds. Use at least 30 seeds for paper results.
+# Three seeds are a smoke test. Use at least 30 for paper results and repeat
+# over multiple start/goal/obstacle layouts.
 SEEDS="${SEEDS:-7 8 9}"
-RUN_COMPONENTS="${RUN_COMPONENTS:-0}"
+MAX_STEPS="${MAX_STEPS:-800}"
+RUN_COMPONENTS="${RUN_COMPONENTS:-1}"
+RUN_CANDIDATE_SWEEP="${RUN_CANDIDATE_SWEEP:-1}"
+RUN_CRITIC_CONTROL="${RUN_CRITIC_CONTROL:-0}"
+SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 
-START_X="${START_X:-8}"
-START_Z="${START_Z:-10}"
+START_X="${START_X:-0}"
+START_Z="${START_Z:-8}"
 START_YAW_DEG="${START_YAW_DEG:-0}"
 GOAL_X="${GOAL_X:-8}"
 GOAL_Z="${GOAL_Z:--8}"
 OBSTACLE_UV="${OBSTACLE_UV:-0.50,0.68}"
+
+# K=4 preserves both circulation directions while being cheaper than K=16/24.
+MAIN_CANDIDATES="${MAIN_CANDIDATES:-4}"
+PARTICLES="${PARTICLES:-8}"
 
 for required_file in \
     "${HABITAT_PYTHON}" \
@@ -36,11 +49,17 @@ for required_file in \
     fi
 done
 
+if [[ ! -d "${NAVDP_ROOT}" ]]; then
+    echo "Missing NavDP root: ${NAVDP_ROOT}" >&2
+    exit 1
+fi
+
 COMMON=(
     --navdp-root "${NAVDP_ROOT}"
     --navdp-checkpoint "${CHECKPOINT}"
     --navdp-python "${HABITAT_PYTHON}"
     --navdp-device cuda:0
+    --no-remove-critic
     --scene "${SCENE}"
     --terrain-obj "${TERRAIN_OBJ}"
     --start-x "${START_X}"
@@ -58,8 +77,8 @@ COMMON=(
     --guidance-strength 1.0
     --temperature 0.25
     --particle-std 0.28
-    --candidates 24
-    --particles 12
+    --particles "${PARTICLES}"
+    --max-steps "${MAX_STEPS}"
 )
 
 HLC=(
@@ -81,83 +100,117 @@ BASE_S2DIFF=(
     --escape-lateral-target 0
 )
 
+LABELS=()
+
+remember_label() {
+    local requested="$1"
+    local existing
+    for existing in "${LABELS[@]-}"; do
+        [[ "${existing}" == "${requested}" ]] && return
+    done
+    LABELS+=("${requested}")
+}
+
 run_episode() {
     local label="$1"
     local seed="$2"
     shift 2
     local output="${OUTPUT_ROOT}/${label}/seed_${seed}"
+    local archive="${output}/rollout.npz"
+    remember_label "${label}"
+
+    if [[ "${SKIP_COMPLETED}" == "1" && -f "${archive}" ]]; then
+        echo "=== SKIP completed: ${label}, seed=${seed} ==="
+        return
+    fi
+
+    mkdir -p "${output}"
+    local command=(
+        "${HABITAT_PYTHON}" "${ROLLOUT_SCRIPT}"
+        "${COMMON[@]}"
+        --seed "${seed}"
+        --output "${output}"
+        "$@"
+    )
+    printf '%q ' "${command[@]}" > "${output}/command.txt"
+    printf '\n' >> "${output}/command.txt"
+
     echo
     echo "=== ${label}, seed=${seed} ==="
-    "${HABITAT_PYTHON}" "${ROLLOUT_SCRIPT}" \
-        "${COMMON[@]}" \
-        --seed "${seed}" \
-        --output "${output}" \
-        "$@"
+    "${command[@]}"
+
+    if [[ ! -f "${archive}" ]]; then
+        echo "Rollout completed without producing ${archive}" >&2
+        exit 1
+    fi
 }
 
 for seed in ${SEEDS}; do
-    # Released NavDP denoising and learned critic selection.
+    # A: released NavDP denoising plus learned-critic selection.
     run_episode pure_navdp "${seed}" \
-        --planner-mode pure-navdp
+        --planner-mode pure-navdp \
+        --candidates "${MAIN_CANDIDATES}"
 
-    # S2Diff energy without the proposed barrier/circulation/latch/escape package.
-    run_episode s2diff_base "${seed}" \
+    # B: in-denoising S2Diff, without the proposed HLC package.
+    run_episode s2diff_base_k4 "${seed}" \
         --planner-mode s2diff \
-        --remove-critic \
+        --candidates "${MAIN_CANDIDATES}" \
         "${BASE_S2DIFF[@]}"
 
-    # Full method, but retain the unused critic head as the critic-removal control.
-    run_episode hlc_keep_critic "${seed}" \
+    # C: complete proposed method. Critic is loaded but never called here.
+    run_episode hlc_full_k4 "${seed}" \
         --planner-mode s2diff \
-        --no-remove-critic \
-        "${HLC[@]}"
-
-    # Full proposed model.
-    run_episode hlc_no_critic "${seed}" \
-        --planner-mode s2diff \
-        --remove-critic \
+        --candidates "${MAIN_CANDIDATES}" \
         "${HLC[@]}"
 
     if [[ "${RUN_COMPONENTS}" == "1" ]]; then
-        run_episode barrier_only "${seed}" \
-            --planner-mode s2diff --remove-critic \
-            --barrier-weight 30 \
-            --circulation-weight 0 \
-            --circulation-switch-weight 0 \
-            --escape-lateral-target 0
+        run_episode hlc_no_barrier "${seed}" \
+            --planner-mode s2diff --candidates "${MAIN_CANDIDATES}" \
+            "${HLC[@]}" --barrier-weight 0
 
-        run_episode circulation_only "${seed}" \
-            --planner-mode s2diff --remove-critic \
-            --barrier-weight 0 \
-            --circulation-weight 25 \
-            --circulation-activation-distance 2.0 \
-            --minimum-circulation-progress 0.035 \
-            --circulation-switch-weight 0 \
-            --escape-lateral-target 0
+        # Emergency escape remains enabled; this isolates planned circulation.
+        run_episode hlc_no_circulation "${seed}" \
+            --planner-mode s2diff --candidates "${MAIN_CANDIDATES}" \
+            "${HLC[@]}" --circulation-weight 0 --circulation-switch-weight 0
 
         run_episode hlc_no_latch "${seed}" \
-            --planner-mode s2diff --remove-critic \
-            "${HLC[@]}" \
-            --circulation-switch-weight 0
+            --planner-mode s2diff --candidates "${MAIN_CANDIDATES}" \
+            "${HLC[@]}" --circulation-switch-weight 0
 
         run_episode hlc_no_escape "${seed}" \
-            --planner-mode s2diff --remove-critic \
-            "${HLC[@]}" \
-            --escape-lateral-target 0
+            --planner-mode s2diff --candidates "${MAIN_CANDIDATES}" \
+            "${HLC[@]}" --escape-lateral-target 0
+    fi
+
+    if [[ "${RUN_CANDIDATE_SWEEP}" == "1" ]]; then
+        # hlc_full_k4 above supplies K=4 without running it twice.
+        for candidates in 1 2 8 16; do
+            run_episode "hlc_full_k${candidates}" "${seed}" \
+                --planner-mode s2diff \
+                --candidates "${candidates}" \
+                "${HLC[@]}"
+        done
+    fi
+
+    if [[ "${RUN_CRITIC_CONTROL}" == "1" ]]; then
+        # Optional memory-only control; this should not change HLC actions.
+        run_episode hlc_full_k4_critic_removed "${seed}" \
+            --planner-mode s2diff \
+            --remove-critic \
+            --candidates "${MAIN_CANDIDATES}" \
+            "${HLC[@]}"
     fi
 done
 
 ANALYZER_ARGS=()
-LABELS=(pure_navdp s2diff_base hlc_keep_critic hlc_no_critic)
-if [[ "${RUN_COMPONENTS}" == "1" ]]; then
-    LABELS+=(barrier_only circulation_only hlc_no_latch hlc_no_escape)
-fi
-
 for label in "${LABELS[@]}"; do
     for seed in ${SEEDS}; do
-        ANALYZER_ARGS+=(
-            --run "${label}=${OUTPUT_ROOT}/${label}/seed_${seed}/rollout.npz"
-        )
+        archive="${OUTPUT_ROOT}/${label}/seed_${seed}/rollout.npz"
+        if [[ ! -f "${archive}" ]]; then
+            echo "Missing expected archive: ${archive}" >&2
+            exit 1
+        fi
+        ANALYZER_ARGS+=(--run "${label}=${archive}")
     done
 done
 
@@ -169,3 +222,9 @@ echo
 echo "Finished. Summary:"
 echo "  ${OUTPUT_ROOT}/comparison.csv"
 echo "  ${OUTPUT_ROOT}/comparison.json"
+echo
+echo "Main comparisons:"
+echo "  pure_navdp      vs hlc_full_k4 : complete method vs released policy"
+echo "  s2diff_base_k4  vs hlc_full_k4 : total HLC novelty contribution"
+echo "  hlc_no_*        vs hlc_full_k4 : individual component contribution"
+echo "  hlc_full_k1/2/4/8/16           : candidate-count/latency tradeoff"

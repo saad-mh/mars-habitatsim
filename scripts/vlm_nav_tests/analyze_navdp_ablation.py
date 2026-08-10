@@ -106,8 +106,15 @@ def aggregate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if key in {"label", "path"}:
                 continue
             values = np.asarray([item[key] for item in group], dtype=np.float64)
-            combined[f"{key}_mean"] = float(np.nanmean(values))
-            combined[f"{key}_std"] = float(np.nanstd(values, ddof=1)) if len(values) > 1 else 0.0
+            finite = values[np.isfinite(values)]
+            if finite.size == 0:
+                combined[f"{key}_mean"] = np.nan
+                combined[f"{key}_std"] = np.nan
+            else:
+                combined[f"{key}_mean"] = float(finite.mean())
+                combined[f"{key}_std"] = (
+                    float(finite.std(ddof=1)) if finite.size > 1 else 0.0
+                )
         output.append(combined)
     return output
 

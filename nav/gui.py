@@ -84,11 +84,24 @@ class NavGuiApp:
         root.title("mars-habitatsim/nav")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        # The packed content (camera/plot row + all panels, with both
+        # state-only panels visible at once) is taller than a lot of
+        # monitors -- cap the window to the screen and let this scrollable
+        # frame carry the overflow instead of the window growing off-screen
+        # with no way to reach the bottom row of buttons.
+        screen_h = root.winfo_screenheight()
+        window_h = min(int(screen_h * 0.9), 1000)
+        root.geometry(f"1000x{window_h}")
+        root.minsize(760, 480)
+
+        content = ctk.CTkScrollableFrame(root, fg_color="transparent")
+        content.pack(fill="both", expand=True)
+
         mono_font = ctk.CTkFont(family="Consolas", size=12)
         mode_font = ctk.CTkFont(size=17, weight="bold")
 
         # -- camera view + body-frame plot, side by side -- #
-        top_row = ctk.CTkFrame(root, fg_color="transparent")
+        top_row = ctk.CTkFrame(content, fg_color="transparent")
         top_row.pack(padx=10, pady=(10, 4))
 
         cam_frame = ctk.CTkFrame(top_row)
@@ -125,7 +138,7 @@ class NavGuiApp:
         self.plot.pack(padx=4, pady=(2, 4))
 
         # -- status panel: mode + detail + telemetry, always visible -- #
-        self.status_panel = ctk.CTkFrame(root)
+        self.status_panel = ctk.CTkFrame(content)
         self.status_panel.pack(fill="x", padx=10, pady=4)
         self.mode_label = ctk.CTkLabel(
             self.status_panel, text="", anchor="w", justify="left", font=mode_font
@@ -160,7 +173,7 @@ class NavGuiApp:
         self._alive_label_visible = False
 
         # -- primary action bar -- #
-        actions = ctk.CTkFrame(root)
+        actions = ctk.CTkFrame(content)
         actions.pack(fill="x", padx=10, pady=4)
         ctk.CTkLabel(
             actions, text="Goal", font=ctk.CTkFont(size=12, weight="bold")
@@ -192,7 +205,7 @@ class NavGuiApp:
         ).grid(row=0, column=5, padx=(4, 10), pady=8)
 
         # -- manual drive: D-pad, always visible -- #
-        drive = ctk.CTkFrame(root)
+        drive = ctk.CTkFrame(content)
         drive.pack(fill="x", padx=10, pady=4)
         ctk.CTkLabel(
             drive,
@@ -235,7 +248,7 @@ class NavGuiApp:
         # reviewing (Goal 1) -- bordered like kb_teleop_vl's uncertainty
         # halt panel so it reads as "action needed", not a fourth static
         # button row. -- #
-        self.seg_panel = ctk.CTkFrame(root, border_width=2, border_color="#f59e0b")
+        self.seg_panel = ctk.CTkFrame(content, border_width=2, border_color="#f59e0b")
         ctk.CTkLabel(
             self.seg_panel,
             text="REVIEWING RESOLVED GOAL",
@@ -273,7 +286,7 @@ class NavGuiApp:
 
         # -- click-to-goal confirm panel: only packed while a click is
         # pending confirmation. -- #
-        self.click_panel = ctk.CTkFrame(root, border_width=2, border_color="#00b8d4")
+        self.click_panel = ctk.CTkFrame(content, border_width=2, border_color="#00b8d4")
         self.click_desc_label = ctk.CTkLabel(
             self.click_panel,
             text="Set the goal at the point you clicked?",
@@ -304,7 +317,7 @@ class NavGuiApp:
         # goal set at world (x, z)" or "click ignored: no valid depth
         # there") -- stays visible after the confirm panel above closes. -- #
         self.click_status_label = ctk.CTkLabel(
-            root, text="", anchor="w", font=ctk.CTkFont(size=11), text_color="#9ca3af"
+            content, text="", anchor="w", font=ctk.CTkFont(size=11), text_color="#9ca3af"
         )
         self.click_status_label.pack(fill="x", padx=14, pady=(0, 8))
 

@@ -20,6 +20,7 @@ import requests
 from habitat_sim.agent import AgentConfiguration
 from PIL import Image, ImageDraw
 
+
 HERE = Path(__file__).resolve().parent
 SIZE_X = 50.0
 SIZE_Z = 50.0
@@ -94,9 +95,7 @@ class NavDPS2DiffClient:
         if depth.ndim == 3 and depth.shape[-1] == 1:
             depth = depth[..., 0]
         if depth.shape != rgb.shape[:2]:
-            raise ValueError(
-                f"depth/rgb shape mismatch: {depth.shape} vs {rgb.shape[:2]}"
-            )
+            raise ValueError(f"depth/rgb shape mismatch: {depth.shape} vs {rgb.shape[:2]}")
 
         pixels = np.asarray(obstacle_pixels)
         if pixels.size == 0:
@@ -324,10 +323,8 @@ class TerrainHeight:
         swap_xz: bool,
     ):
         if mode == "auto":
-            mode = (
-                "heightmap"
-                if heightmap and heightmap.exists()
-                else ("obj" if obj and obj.exists() else "flat")
+            mode = "heightmap" if heightmap and heightmap.exists() else (
+                "obj" if obj and obj.exists() else "flat"
             )
         self.mode = mode
         self.flat_y = float(flat_y)
@@ -395,40 +392,22 @@ class TerrainHeight:
             assert self.height is not None
             u, v = self._map(x, z)
             return bilinear_grid(
-                self.height,
-                u * (self.height.shape[1] - 1),
-                v * (self.height.shape[0] - 1),
+                self.height, u * (self.height.shape[1] - 1), v * (self.height.shape[0] - 1)
             )
-        assert (
-            self.obj_xs is not None
-            and self.obj_zs is not None
-            and self.obj_h is not None
-        )
+        assert self.obj_xs is not None and self.obj_zs is not None and self.obj_h is not None
         xx = float(np.clip(x, self.obj_xs[0], self.obj_xs[-1]))
         zz = float(np.clip(z, self.obj_zs[0], self.obj_zs[-1]))
-        column = int(
-            np.clip(np.searchsorted(self.obj_xs, xx) - 1, 0, len(self.obj_xs) - 2)
-        )
-        row = int(
-            np.clip(np.searchsorted(self.obj_zs, zz) - 1, 0, len(self.obj_zs) - 2)
-        )
+        column = int(np.clip(np.searchsorted(self.obj_xs, xx) - 1, 0, len(self.obj_xs) - 2))
+        row = int(np.clip(np.searchsorted(self.obj_zs, zz) - 1, 0, len(self.obj_zs) - 2))
         x0, x1 = float(self.obj_xs[column]), float(self.obj_xs[column + 1])
         z0, z1 = float(self.obj_zs[row]), float(self.obj_zs[row + 1])
         tx = 0.0 if abs(x1 - x0) < 1e-8 else (xx - x0) / (x1 - x0)
         tz = 0.0 if abs(z1 - z0) < 1e-8 else (zz - z0) / (z1 - z0)
-        top = (
-            float(self.obj_h[row, column]) * (1.0 - tx)
-            + float(self.obj_h[row, column + 1]) * tx
-        )
-        bottom = (
-            float(self.obj_h[row + 1, column]) * (1.0 - tx)
-            + float(self.obj_h[row + 1, column + 1]) * tx
-        )
+        top = float(self.obj_h[row, column]) * (1.0 - tx) + float(self.obj_h[row, column + 1]) * tx
+        bottom = float(self.obj_h[row + 1, column]) * (1.0 - tx) + float(self.obj_h[row + 1, column + 1]) * tx
         return top * (1.0 - tz) + bottom * tz
 
-    def local_height_max(
-        self, x: float, z: float, radius: float, samples: int = 5
-    ) -> float:
+    def local_height_max(self, x: float, z: float, radius: float, samples: int = 5) -> float:
         if radius <= 1e-6:
             return float(self(x, z))
         values = [
@@ -479,7 +458,6 @@ def make_simulator(
     return habitat_sim.Simulator(
         habitat_sim.Configuration(simulator_configuration, [agent_configuration])
     )
-
 
 def set_agent_pose(agent: Any, position: np.ndarray, yaw: float) -> None:
     state = agent.get_state()
@@ -598,7 +576,9 @@ def save_obj(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
             file.write(f"f {a + 1} {b + 1} {c + 1}\n")
 
 
-def register_semantic_mesh(simulator: Any, mesh_path: Path, semantic_id: int) -> Any:
+def register_semantic_mesh(
+    simulator: Any, mesh_path: Path, semantic_id: int
+) -> Any:
     template_manager = simulator.get_object_template_manager()
     object_manager = simulator.get_rigid_object_manager()
     template = template_manager.create_new_template(str(mesh_path))
@@ -616,12 +596,14 @@ def register_semantic_mesh(simulator: Any, mesh_path: Path, semantic_id: int) ->
     return obstacle
 
 
-def parse_uv_fraction(
-    specification: str, width: int, height: int
-) -> tuple[float, float]:
-    u_fraction, v_fraction = (float(value) for value in str(specification).split(","))
+def parse_uv_fraction(specification: str, width: int, height: int) -> tuple[float, float]:
+    u_fraction, v_fraction = (
+        float(value) for value in str(specification).split(",")
+    )
     if not (0.0 <= u_fraction <= 1.0 and 0.0 <= v_fraction <= 1.0):
-        raise ValueError(f"mesh pixel fraction must be in [0,1], got {specification!r}")
+        raise ValueError(
+            f"mesh pixel fraction must be in [0,1], got {specification!r}"
+        )
     return u_fraction * width, v_fraction * height
 
 
@@ -672,7 +654,6 @@ def place_obstacle_meshes(
             flush=True,
         )
     return objects, centroids
-
 
 def camera_coordinates(
     point: np.ndarray, position: np.ndarray, yaw: float
@@ -928,9 +909,7 @@ def main() -> None:
     if args.obstacle_mode == "ghost" and (
         args.ghost_obstacle_x is None or args.ghost_obstacle_z is None
     ):
-        raise ValueError(
-            "ghost mode requires --ghost-obstacle-x and --ghost-obstacle-z"
-        )
+        raise ValueError("ghost mode requires --ghost-obstacle-x and --ghost-obstacle-z")
     if args.obstacle_mode == "mesh" and not args.obstacle_mesh_uv:
         raise ValueError("mesh mode requires --obstacle-mesh-uv u,v [u,v ...]")
 
@@ -956,14 +935,8 @@ def main() -> None:
 
         terrain = TerrainHeight(
             mode=args.terrain_height_mode,
-            heightmap=(
-                Path(args.heightmap).expanduser().resolve() if args.heightmap else None
-            ),
-            obj=(
-                Path(args.terrain_obj).expanduser().resolve()
-                if args.terrain_obj
-                else None
-            ),
+            heightmap=Path(args.heightmap).expanduser().resolve() if args.heightmap else None,
+            obj=Path(args.terrain_obj).expanduser().resolve() if args.terrain_obj else None,
             flat_y=args.flat_y,
             size_x=args.size_x,
             size_z=args.size_z,
@@ -991,27 +964,18 @@ def main() -> None:
 
         goal_y = args.goal_y
         if goal_y is None:
-            goal_y = (
-                terrain.local_height_max(args.goal_x, args.goal_z, 0.8)
-                + args.goal_height
-            )
+            goal_y = terrain.local_height_max(args.goal_x, args.goal_z, 0.8) + args.goal_height
         goal = np.asarray([args.goal_x, goal_y, args.goal_z], dtype=np.float32)
 
         ghost = None
         if args.obstacle_mode == "ghost":
             ghost_y = args.ghost_obstacle_y
             if ghost_y is None:
-                ghost_y = (
-                    terrain.local_height_max(
-                        args.ghost_obstacle_x,
-                        args.ghost_obstacle_z,
-                        args.pose_terrain_radius,
-                    )
-                    + args.ghost_obstacle_height
-                )
+                ghost_y = terrain.local_height_max(
+                    args.ghost_obstacle_x, args.ghost_obstacle_z, args.pose_terrain_radius
+                ) + args.ghost_obstacle_height
             ghost = np.asarray(
-                [args.ghost_obstacle_x, ghost_y, args.ghost_obstacle_z],
-                dtype=np.float32,
+                [args.ghost_obstacle_x, ghost_y, args.ghost_obstacle_z], dtype=np.float32
             )
 
         mesh_objects: list[Any] = []
@@ -1050,10 +1014,7 @@ def main() -> None:
         success = False
 
         for step in range(int(args.max_steps)):
-            y = (
-                terrain.local_height_max(x, z, args.pose_terrain_radius)
-                + args.clearance
-            )
+            y = terrain.local_height_max(x, z, args.pose_terrain_radius) + args.clearance
             position = np.asarray([x, y, z], dtype=np.float32)
             set_agent_pose(agent, position, yaw)
             observation = simulator.get_sensor_observations()
@@ -1076,17 +1037,9 @@ def main() -> None:
                 rgb, depth = rgb_depth(observation)
 
             goal_right, _goal_up, goal_forward = camera_coordinates(goal, position, yaw)
-            point_goal = np.asarray(
-                [max(goal_forward, 0.0), -goal_right], dtype=np.float32
-            )
+            point_goal = np.asarray([max(goal_forward, 0.0), -goal_right], dtype=np.float32)
             goal_mask, _ = project_world_mask(
-                goal,
-                position,
-                yaw,
-                intrinsic,
-                args.height,
-                args.width,
-                args.goal_radius,
+                goal, position, yaw, intrinsic, args.height, args.width, args.goal_radius
             )
 
             guidance_depth = depth.copy()
@@ -1147,22 +1100,13 @@ def main() -> None:
             )
 
             next_position, next_yaw = integrate_mars(position, yaw, action, dt)
-            x = float(
-                np.clip(
-                    next_position[0], -args.size_x / 2.0 + 0.5, args.size_x / 2.0 - 0.5
-                )
-            )
-            z = float(
-                np.clip(
-                    next_position[2], -args.size_z / 2.0 + 0.5, args.size_z / 2.0 - 0.5
-                )
-            )
+            x = float(np.clip(next_position[0], -args.size_x / 2.0 + 0.5, args.size_x / 2.0 - 0.5))
+            z = float(np.clip(next_position[2], -args.size_z / 2.0 + 0.5, args.size_z / 2.0 - 0.5))
             yaw = wrap_angle(next_yaw)
             goal_distance = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z])))
             rotation = quaternion.from_rotation_vector(np.asarray([0.0, yaw, 0.0]))
             pose = np.asarray(
-                [x, y, z, rotation.x, rotation.y, rotation.z, rotation.w],
-                dtype=np.float32,
+                [x, y, z, rotation.x, rotation.y, rotation.z, rotation.w], dtype=np.float32
             )
 
             rows["rgb"].append(rgb)
@@ -1233,11 +1177,9 @@ def main() -> None:
         np.savez_compressed(
             rollout_path,
             **{
-                key: (
-                    np.stack(values)
-                    if isinstance(values[0], np.ndarray)
-                    else np.asarray(values)
-                )
+                key: np.stack(values)
+                if isinstance(values[0], np.ndarray)
+                else np.asarray(values)
                 for key, values in rows.items()
             },
             goal_position=goal,
