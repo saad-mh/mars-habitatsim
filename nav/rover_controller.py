@@ -88,7 +88,21 @@ from sam_vla.policy.navdp_upstream_policy import NavdpUpstreamPolicy
 from sam_vla.safety.cbf_avoidance import CbfObstacleAvoidance
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
 
-from nav.goal_math import body_frame_goal, random_ahead_point
+from nav.goal_math import body_frame_goal, heading_ahead_point, random_ahead_point
+
+# Uncertainty-halt: reuses vl_direction's own "uncertainty" prompt/session
+# machinery (its documented sole integration point, see vl_direction's module
+# docstring) against the real BeliefGoalTracker.uncertainty_value() computed
+# below -- not scripts/habitat_tests/kb_teleop_vl.py's synthetic covariance
+# proxy, and not imported from that script, to keep nav/ decoupled from it.
+# vl_direction spins up its own Qwen subprocess (distinct port from
+# sam_vla.vlm's, see vl_direction/config.py), independent of --seg-backend's.
+from vl_direction import config as vl_dir_config
+from vl_direction.client import get_client as get_vl_direction_client
+from vl_direction.qwen_server_manager import (
+    QwenServerManager as VlDirectionQwenServerManager,
+)
+from vl_direction.uncertainty_session import UncertaintySession
 
 MODE_IDLE = "idle"
 MODE_POINT = "point"
@@ -135,6 +149,17 @@ class DisplayState:
     goal_reached: bool = False
     error_text: str = ""
     click_status: str = ""
+    # Uncertainty-halt (vl_direction's "uncertainty" prompt against the real
+    # BeliefGoalTracker, see this module's imports): uncertainty_value grows
+    # while a MODE_RESOLVE goal mask stays unseen; once it reaches
+    # uncertainty_threshold, driving halts and a heading is requested.
+    uncertainty_enabled: bool = False
+    uncertainty_value: float = 0.0
+    uncertainty_threshold: float = 0.0
+    uncertainty_halted: bool = False
+    uncertainty_request_in_flight: bool = False
+    uncertainty_searching: bool = False
+    uncertainty_line: str = ""
 
 
 class RoverController:
@@ -180,6 +205,11 @@ class RoverController:
         seg_overlay: str = "mesh",
         annotations_dir: Optional[str] = DEFAULT_ANNOTATIONS_DIR,
         annotation_categories: Optional[Sequence[str]] = None,
+        uncertainty_enabled: bool = True,
+        uncertainty_cov_threshold: float = vl_dir_config.DEFAULT_COVARIANCE_THRESHOLD,
+        uncertainty_cov_growth: float = 0.01,
+        uncertainty_cov_growth_rate: float = 0.0,
+        uncertainty_search_dist: float = 4.0,
     ):
         self.scene_path = scene_path
         self.heightmap_path = heightmap_path
@@ -231,6 +261,12 @@ class RoverController:
         self.annotations_dir = annotations_dir if self.seg_overlay == "mesh" else None
         self.annotation_categories = annotation_categories
 
+        self.uncertainty_enabled = bool(uncertainty_enabled)
+        self.uncertainty_cov_threshold = float(uncertainty_cov_threshold)
+        self.uncertainty_cov_growth = float(uncertainty_cov_growth)
+        self.uncertainty_cov_growth_rate = float(uncertainty_cov_growth_rate)
+        self.uncertainty_search_dist = float(uncertainty_search_dist)
+
         self._lock = threading.RLock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -244,8 +280,18 @@ class RoverController:
         self._pending_confirm_segmentation = False
         self._pending_rerun_segmentation = False
         self._pending_pick_manually = False
+        self._pending_uncertainty_heading: Optional[float] = None
+        self._pending_uncertainty_retry = False
+
+        # Only ever touched inside self._lock (read/written from both the
+        # controller thread and the uncertainty-request background thread).
+        self._uncertainty_halted = False
+        self._uncertainty_request_in_flight = False
+        self._uncertainty_search_goal: Optional[tuple] = None
 
         self.display = DisplayState()
+        self.display.uncertainty_enabled = self.uncertainty_enabled
+        self.display.uncertainty_threshold = self.uncertainty_cov_threshold
         self._rng = np.random.default_rng()
 
     # ------------------------------------------------------------------ #
@@ -332,6 +378,22 @@ class RoverController:
         with self._lock:
             self._pending_reset = True
 
+    def submit_uncertainty_heading(self, angle_deg: float) -> None:
+        """Answer an active uncertainty halt with a rover-front-relative
+        heading (degrees, same convention as heading_ahead_point/nav/gui.py's
+        numpad panel). No-op (consumed and dropped) if not currently
+        halted -- guards a stale click racing a halt that's already resolved
+        by a fresh sighting."""
+        with self._lock:
+            self._pending_uncertainty_heading = float(angle_deg)
+
+    def retry_uncertainty_request(self) -> None:
+        """Re-request the VLM sweep description for an active uncertainty
+        halt. No-op if not currently halted or a request is already in
+        flight."""
+        with self._lock:
+            self._pending_uncertainty_retry = True
+
     def stop_driving(self) -> None:
         with self._lock:
             self._mode = MODE_IDLE
@@ -353,11 +415,20 @@ class RoverController:
         _add_navdp_to_path(_resolve_navdp_root(self.navdp_root))
 
         qwen_manager = QwenServerManager()
+        services = [qwen_manager]
+        # vl_direction's own Qwen subprocess (distinct port, see this
+        # module's import comment) -- only spun up if the uncertainty halt
+        # is actually enabled, since it's an extra GPU-resident server.
+        uncertainty_client = None
+        if self.uncertainty_enabled:
+            vl_direction_qwen_manager = VlDirectionQwenServerManager()
+            services.append(vl_direction_qwen_manager)
+            uncertainty_client = get_vl_direction_client("qwen")
         try:
             with MarsHabitatEnv(
                 self.scene_path,
                 self.heightmap_path,
-                services=[qwen_manager],
+                services=services,
                 start_x=self.start_x,
                 start_z=self.start_z,
                 start_yaw=math.radians(self.start_yaw_deg),
@@ -366,16 +437,27 @@ class RoverController:
                 annotations_dir=self.annotations_dir,
                 annotation_categories=self.annotation_categories,
             ) as env:
-                self._env_loop(env)
+                self._env_loop(env, uncertainty_client)
         except Exception as exc:  # pragma: no cover - surfaced to the GUI, not raised
             traceback.print_exc()
             with self._lock:
                 self.display.status_text = f"FATAL: {exc}"
                 self.display.error_text = str(exc)
 
-    def _env_loop(self, env: MarsHabitatEnv) -> None:
+    def _env_loop(
+        self, env: MarsHabitatEnv, uncertainty_client=None
+    ) -> None:
         mask_dir = tempfile.mkdtemp(prefix="mars_nav_masks_")
         obs0 = env.get_observation(frame_idx=0)
+
+        uncertainty_session: Optional[UncertaintySession] = None
+        if self.uncertainty_enabled:
+            uncertainty_session = UncertaintySession(
+                episode_id=f"nav-gui-{int(time.time())}",
+                covariance_threshold=self.uncertainty_cov_threshold,
+                covariance_value=0.0,
+                client=uncertainty_client,
+            )
 
         policy = NavdpUpstreamPolicy(
             checkpoint_path=self.navdp_upstream_ckpt,
@@ -427,6 +509,8 @@ class RoverController:
                     do_confirm_seg,
                     do_rerun_seg,
                     do_pick_manual,
+                    uncertainty_heading,
+                    do_uncertainty_retry,
                 ) = self._consume_pending()
 
                 if do_reset:
@@ -449,15 +533,25 @@ class RoverController:
                         self._mode = MODE_IDLE
                         self._world_goal = None
                         self._manual_action = Action(0.0, 0.0, 0.0)
+                        self._uncertainty_halted = False
+                        self._uncertainty_search_goal = None
                         self.display.status_text = "reset to spawn"
                         self.display.goal_reached = False
                         self.display.click_status = ""
+                        self.display.uncertainty_halted = False
+                        self.display.uncertainty_searching = False
+                        self.display.uncertainty_line = ""
 
                 if do_resolve or do_rerun_seg:
                     goal_objects, obstacle_objects, goal_spec = self._do_resolve(
                         env, step, mask_dir, goal_objects, obstacle_objects, goal_spec
                     )
                     belief_tracker.belief_g = None
+                    with self._lock:
+                        self._uncertainty_halted = False
+                        self._uncertainty_search_goal = None
+                        self.display.uncertainty_halted = False
+                        self.display.uncertainty_searching = False
 
                 if do_confirm_seg:
                     with self._lock:
@@ -493,10 +587,27 @@ class RoverController:
                 if pixel_click is not None:
                     self._handle_pixel_click(obs, pixel_click)
 
+                if uncertainty_session is not None:
+                    self._handle_uncertainty_commands(
+                        uncertainty_session,
+                        belief_tracker,
+                        obs,
+                        uncertainty_heading,
+                        do_uncertainty_retry,
+                    )
+
                 with self._lock:
                     mode = self._mode
                     manual_action = self._manual_action
                     world_goal = self._world_goal
+
+                if mode != MODE_RESOLVE:
+                    with self._lock:
+                        if self._uncertainty_halted or self._uncertainty_search_goal is not None:
+                            self._uncertainty_halted = False
+                            self._uncertainty_search_goal = None
+                            self.display.uncertainty_halted = False
+                            self.display.uncertainty_searching = False
 
                 if was_reviewing and mode not in (
                     MODE_REVIEW_SEGMENTATION,
@@ -518,7 +629,13 @@ class RoverController:
                 unresolved = False
                 dist_to_goal: Optional[float] = None
 
-                if mode == MODE_MANUAL:
+                if self._uncertainty_halted:
+                    # Frozen awaiting a human heading -- same "ignore drive
+                    # commands while halted" contract kb_teleop_vl.py's
+                    # uncertainty halt uses, just enforced here instead of at
+                    # the input layer (nav/gui.py never blocks its own D-pad).
+                    goal_bearing = belief_tracker.bearing()
+                elif mode == MODE_MANUAL:
                     action = manual_action
                 elif mode == MODE_POINT and world_goal is not None:
                     forward, left = body_frame_goal(obs.pose, world_goal)
@@ -537,10 +654,36 @@ class RoverController:
                         )
                         trajectory = getattr(policy, "_last_trajectory", None)
                 elif mode == MODE_RESOLVE:
-                    belief_tracker.observe(goal_mask, obs.depth)
+                    seen = belief_tracker.observe(goal_mask, obs.depth)
+                    if seen and self._uncertainty_search_goal is not None:
+                        # Goal re-sighted mid-search -- observe() above
+                        # already reset uncertainty_value() to the sighted
+                        # floor, so abandon the human-chosen heading and
+                        # resume tracking the (now freshly re-anchored)
+                        # belief directly.
+                        self._uncertainty_search_goal = None
+                        with self._lock:
+                            self.display.uncertainty_searching = False
                     if belief_tracker.belief_g is not None:
                         forward, left = (float(v) for v in belief_tracker.belief_g)
-                        if math.hypot(forward, left) < POINT_GOAL_REACHED_M:
+                        searching = self._uncertainty_search_goal is not None
+                        if searching:
+                            search_forward, search_left = body_frame_goal(
+                                obs.pose, self._uncertainty_search_goal
+                            )
+                            if math.hypot(search_forward, search_left) < POINT_GOAL_REACHED_M:
+                                # Reached the searched heading without a
+                                # re-sighting -- fall back to the (still
+                                # uncertain) dead-reckoned belief; the halt
+                                # trigger below will ask again since
+                                # uncertainty_value() is still >= threshold.
+                                self._uncertainty_search_goal = None
+                                searching = False
+                                with self._lock:
+                                    self.display.uncertainty_searching = False
+                            else:
+                                forward, left = search_forward, search_left
+                        if not searching and math.hypot(forward, left) < POINT_GOAL_REACHED_M:
                             with self._lock:
                                 self._mode = MODE_IDLE
                                 self.display.goal_reached = True
@@ -554,7 +697,12 @@ class RoverController:
                                 obs, semantic, goal_spec, step
                             )
                             trajectory = getattr(policy, "_last_trajectory", None)
-                            goal_bearing = belief_tracker.bearing()
+                            # CBF's steering hint must track whichever target
+                            # is actually being driven to -- the searched
+                            # heading while searching, the dead-reckoned
+                            # belief otherwise -- not always belief_g's own
+                            # (possibly stale) bearing.
+                            goal_bearing = math.atan2(left, forward)
                     else:
                         # Never sighted the goal mask yet this episode -- hold
                         # rather than drive on NavdpUpstreamPolicy's hidden
@@ -564,7 +712,11 @@ class RoverController:
 
                 obstacle_point = None
                 cbf_info: dict = {}
-                if avoidance is not None and mode != MODE_MANUAL:
+                if (
+                    avoidance is not None
+                    and mode != MODE_MANUAL
+                    and not self._uncertainty_halted
+                ):
                     height, width = obs.depth.shape[:2]
                     intr = intrinsics_from_hfov(height, width, HFOV_DEG)
                     obstacle_point = avoidance.nearest_obstacle(
@@ -579,6 +731,23 @@ class RoverController:
 
                 if mode in (MODE_POINT, MODE_RESOLVE):
                     belief_tracker.propagate(action, self.dt)
+
+                if (
+                    uncertainty_session is not None
+                    and mode == MODE_RESOLVE
+                    and not self._uncertainty_halted
+                    and not self._uncertainty_request_in_flight
+                    and self._uncertainty_search_goal is None
+                    and belief_tracker.belief_g is not None
+                    and belief_tracker.uncertainty_value() >= self.uncertainty_cov_threshold
+                ):
+                    self._uncertainty_halted = True
+                    with self._lock:
+                        self.display.uncertainty_halted = True
+                    self._dispatch_uncertainty_request(
+                        uncertainty_session, belief_tracker, obs.rgb, retry=False
+                    )
+
                 if mode == MODE_POINT and world_goal is not None:
                     dist_to_goal = math.hypot(
                         world_goal[0] - new_pose.x, world_goal[1] - new_pose.z
@@ -625,6 +794,7 @@ class RoverController:
                     d.cbf_info = cbf_info
                     d.step = step
                     d.frame_count += 1
+                    d.uncertainty_value = belief_tracker.uncertainty_value()
 
                 step += 1
                 remaining = period - (time.time() - t0)
@@ -638,7 +808,7 @@ class RoverController:
     # ------------------------------------------------------------------ #
     def _consume_pending(
         self,
-    ) -> tuple[bool, bool, Optional[tuple], bool, bool, bool]:
+    ) -> tuple[bool, bool, Optional[tuple], bool, bool, bool, Optional[float], bool]:
         with self._lock:
             do_resolve = self._pending_resolve
             do_reset = self._pending_reset
@@ -646,12 +816,16 @@ class RoverController:
             do_confirm_seg = self._pending_confirm_segmentation
             do_rerun_seg = self._pending_rerun_segmentation
             do_pick_manual = self._pending_pick_manually
+            uncertainty_heading = self._pending_uncertainty_heading
+            do_uncertainty_retry = self._pending_uncertainty_retry
             self._pending_resolve = False
             self._pending_reset = False
             self._pending_pixel_click = None
             self._pending_confirm_segmentation = False
             self._pending_rerun_segmentation = False
             self._pending_pick_manually = False
+            self._pending_uncertainty_heading = None
+            self._pending_uncertainty_retry = False
         return (
             do_resolve,
             do_reset,
@@ -659,6 +833,8 @@ class RoverController:
             do_confirm_seg,
             do_rerun_seg,
             do_pick_manual,
+            uncertainty_heading,
+            do_uncertainty_retry,
         )
 
     def _handle_pixel_click(self, obs, pixel_click: tuple) -> None:
@@ -693,11 +869,113 @@ class RoverController:
             self.display.goal_reached = False
             self.display.click_status = f"point goal set at world ({gx:.1f}, {gz:.1f})"
 
+    def _handle_uncertainty_commands(
+        self,
+        session: UncertaintySession,
+        belief_tracker: BeliefGoalTracker,
+        obs,
+        heading_deg: Optional[float],
+        do_retry: bool,
+    ) -> None:
+        """Applies a queued retry/heading-submit command against an active
+        uncertainty halt (see _env_loop's halt-trigger block). Both are
+        no-ops if not currently halted, or a request is already in flight --
+        guards a stale GUI click racing a halt that's since been cleared by
+        a fresh sighting or a mode switch (see the `mode != MODE_RESOLVE`
+        cleanup in _env_loop)."""
+        if do_retry and self._uncertainty_halted and not self._uncertainty_request_in_flight:
+            self._dispatch_uncertainty_request(
+                session, belief_tracker, obs.rgb, retry=True
+            )
+
+        if (
+            heading_deg is None
+            or not self._uncertainty_halted
+            or self._uncertainty_request_in_flight
+        ):
+            return
+
+        # Pure local packaging, no VLM call (directive_engine._query_uncertainty's
+        # "submit phase") -- safe to resolve synchronously on this thread.
+        result = session.submit_heading(angle_deg=heading_deg)
+        payload = result.uncertainty_payload
+        self._uncertainty_search_goal = heading_ahead_point(
+            obs.pose, heading_deg, self.uncertainty_search_dist, self.world_limit
+        )
+        self._uncertainty_halted = False
+        with self._lock:
+            self.display.uncertainty_halted = False
+            self.display.uncertainty_searching = True
+            self.display.uncertainty_line = (
+                f"heading {heading_deg:+.0f}deg -> traverse up to "
+                f"{payload.max_units:.1f} units, or until the goal is re-sighted"
+            )
+
+    def _dispatch_uncertainty_request(
+        self,
+        session: UncertaintySession,
+        belief_tracker: BeliefGoalTracker,
+        frame: np.ndarray,
+        retry: bool,
+    ) -> None:
+        """Kicks off the (slow) VLM sweep-description call on a background
+        thread -- the control loop above must keep ticking at self.hz
+        regardless of inference latency, same reasoning as
+        NavdpUpstreamPolicy's own async replanning. session.covariance_value
+        is refreshed here (kb_teleop_vl.py's version leaves it fixed at
+        construction) so the sweep-description prompt reflects the actual
+        uncertainty that crossed the threshold, not a stale value."""
+        session.covariance_value = belief_tracker.uncertainty_value()
+        self._uncertainty_request_in_flight = True
+        with self._lock:
+            self.display.uncertainty_request_in_flight = True
+            self.display.uncertainty_line = (
+                "retrying VLM sweep description..."
+                if retry
+                else "requesting VLM sweep description..."
+            )
+        target = session.retry if retry else session.request_human_heading
+        thread = threading.Thread(
+            target=self._uncertainty_worker, args=(target, frame), daemon=True
+        )
+        thread.start()
+
+    def _uncertainty_worker(self, session_method, frame: np.ndarray) -> None:
+        """Runs on a background thread -- the actual sweep-description VLM
+        call. Never touches habitat-sim; only writes self.display under
+        self._lock, same cross-thread pattern the rest of this controller
+        uses for its snapshot() contract."""
+        try:
+            result = session_method(frame)
+            payload = result.uncertainty_payload
+            line = (
+                f"attempt {payload.attempt}: {result.raw_response!r} -- "
+                "pick a heading, or Retry"
+            )
+        except Exception as exc:
+            line = f"uncertainty request failed: {exc}"
+        with self._lock:
+            self._uncertainty_request_in_flight = False
+            self.display.uncertainty_request_in_flight = False
+            self.display.uncertainty_line = line
+
     def _new_belief_tracker(self) -> BeliefGoalTracker:
+        # odom_noise/odom_noise_growth_rate drive uncertainty_value()'s real
+        # growth while the goal mask is unseen (sam_vla.core.belief_tracking's
+        # accelerating-drift formula) -- what the uncertainty halt below
+        # compares against uncertainty_cov_threshold. Zero unless the halt is
+        # enabled, so a disabled run doesn't silently start dead-reckoning
+        # noisier than before.
+        odom_noise = self.uncertainty_cov_growth if self.uncertainty_enabled else 0.0
+        odom_noise_growth_rate = (
+            self.uncertainty_cov_growth_rate if self.uncertainty_enabled else 0.0
+        )
         return BeliefGoalTracker(
             hfov_deg=HFOV_DEG,
             goal_range=self.belief_goal_range,
             min_px=self.lost_goal_min_px,
+            odom_noise=odom_noise,
+            odom_noise_growth_rate=odom_noise_growth_rate,
         )
 
     def _new_avoidance(self) -> CbfObstacleAvoidance:

@@ -39,6 +39,26 @@ def clamp_to_yard(x: float, z: float, limit: float) -> tuple[float, float]:
     return (max(-limit, min(limit, x)), max(-limit, min(limit, z)))
 
 
+def heading_ahead_point(
+    pose: Pose,
+    heading_deg: float,
+    dist: float,
+    world_limit: Optional[float] = None,
+) -> tuple[float, float]:
+    """A world (x, z) point `dist` meters ahead of `pose` along a fixed
+    bearing (degrees off current heading, same rotation sense as
+    random_ahead_point's sampled `bearing`) -- the deterministic counterpart
+    used to turn a human-chosen heading (e.g. nav/gui.py's uncertainty-halt
+    panel) into a drivable world point. Clamped into [-world_limit,
+    world_limit] on both axes if given."""
+    theta = pose.yaw + math.radians(float(heading_deg))
+    gx = pose.x - dist * math.sin(theta)
+    gz = pose.z - dist * math.cos(theta)
+    if world_limit is not None:
+        gx, gz = clamp_to_yard(gx, gz, world_limit)
+    return gx, gz
+
+
 def random_ahead_point(
     pose: Pose,
     rng,
@@ -51,14 +71,9 @@ def random_ahead_point(
     preset a human tester would want to poke the policy with, without needing
     any detection/VLM in the loop. Clamped into [-world_limit, world_limit]
     on both axes if given."""
-    bearing = math.radians(float(rng.uniform(-bearing_range_deg, bearing_range_deg)))
+    bearing_deg = float(rng.uniform(-bearing_range_deg, bearing_range_deg))
     dist = float(rng.uniform(*dist_range))
-    theta = pose.yaw + bearing
-    gx = pose.x - dist * math.sin(theta)
-    gz = pose.z - dist * math.cos(theta)
-    if world_limit is not None:
-        gx, gz = clamp_to_yard(gx, gz, world_limit)
-    return gx, gz
+    return heading_ahead_point(pose, bearing_deg, dist, world_limit)
 
 
 if __name__ == "__main__":

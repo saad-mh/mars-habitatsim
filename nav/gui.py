@@ -27,6 +27,8 @@ import tkinter as tk
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 
+from vl_direction import config as vl_dir_config
+
 from nav.rover_controller import MODE_REVIEW_SEGMENTATION, RoverController
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +50,34 @@ MODE_COLORS = {
     "point": "#4ade80",
     "resolve": "#c084fc",
     MODE_REVIEW_SEGMENTATION: "#f59e0b",
+}
+
+# Uncertainty-halt numpad panel: rover-front-relative headings (degrees,
+# same convention as nav/goal_math.heading_ahead_point -- 0=front,
+# positive=clockwise) bound to the same physical key layout
+# scripts/habitat_tests/kb_teleop_vl.py's uncertainty panel uses, redrawn
+# independently here rather than imported (nav/ stays decoupled from that
+# script). Grid position drives the heads-up panel's clickable button
+# layout, keys drive the numpad keyboard shortcuts.
+UNCERTAINTY_HEADING_KEYS = {
+    "8": 0.0,
+    "9": 45.0,
+    "6": 90.0,
+    "3": 135.0,
+    "2": 180.0,
+    "1": -135.0,
+    "4": -90.0,
+    "7": -45.0,
+}
+UNCERTAINTY_HEADING_GRID_POS = {
+    "7": (0, 0),
+    "8": (0, 1),
+    "9": (0, 2),
+    "4": (1, 0),
+    "6": (1, 2),
+    "1": (2, 0),
+    "2": (2, 1),
+    "3": (2, 2),
 }
 
 
@@ -280,6 +310,17 @@ class NavGuiApp:
             )
         root.bind("<Escape>", lambda e: self.cancel_pixel_click())
 
+        # Numpad heading shortcuts for the uncertainty-halt panel below --
+        # bound unconditionally (these digits aren't used elsewhere in this
+        # GUI); the controller itself drops a submission that isn't
+        # currently halted, so this is a no-op the rest of the time.
+        for key, angle in UNCERTAINTY_HEADING_KEYS.items():
+            root.bind(
+                f"<KeyPress-{key}>", lambda e, a=angle: self.submit_uncertainty_heading(a)
+            )
+        root.bind("<KeyPress-r>", lambda e: self.retry_uncertainty())
+        root.bind("<KeyPress-R>", lambda e: self.retry_uncertainty())
+
         # -- segmentation review panel: only gridded while actually
         # reviewing (Goal 1) -- bordered like kb_teleop_vl's uncertainty
         # halt panel so it reads as "action needed", not a permanent panel. -- #
@@ -354,6 +395,61 @@ class NavGuiApp:
             fg_color="#4b5563",
             hover_color="#374151",
         ).grid(row=1, column=0, sticky="ew", pady=3)
+
+        # -- uncertainty-halt panel: only gridded while
+        # RoverController.snapshot().uncertainty_halted -- driving freezes
+        # controller-side (nav/rover_controller.py's MODE_RESOLVE halt
+        # block) while a heading is requested from the goal's belief
+        # covariance (BeliefGoalTracker.uncertainty_value(), see
+        # --cov-threshold/--cov-growth) crossing its threshold. Same
+        # bordered/numbered-numpad shape as
+        # scripts/habitat_tests/kb_teleop_vl.py's uncertainty panel, redrawn
+        # independently here (no import from that script). -- #
+        self._uncertainty_row = row
+        row += 1
+        self.uncertainty_panel = ctk.CTkFrame(
+            sidebar, border_width=2, border_color="#38bdf8"
+        )
+        self.uncertainty_title = ctk.CTkLabel(
+            self.uncertainty_panel, text="", font=ctk.CTkFont(size=14, weight="bold")
+        )
+        self.uncertainty_title.pack(pady=(10, 2))
+        self.uncertainty_desc_label = ctk.CTkLabel(
+            self.uncertainty_panel,
+            text="",
+            wraplength=self.SIDEBAR_MIN_W - 40,
+            justify="left",
+        )
+        self.uncertainty_desc_label.pack(padx=12, pady=(0, 8), fill="x")
+        self.uncertainty_panel.bind(
+            "<Configure>",
+            lambda e: self.uncertainty_desc_label.configure(
+                wraplength=max(200, e.width - 24)
+            ),
+        )
+        uncertainty_grid = ctk.CTkFrame(self.uncertainty_panel, fg_color="transparent")
+        uncertainty_grid.pack(pady=(0, 6))
+        self.uncertainty_buttons: dict[str, ctk.CTkButton] = {}
+        for key, angle in UNCERTAINTY_HEADING_KEYS.items():
+            r, c = UNCERTAINTY_HEADING_GRID_POS[key]
+            btn = ctk.CTkButton(
+                uncertainty_grid,
+                text=f"{key}\n{angle:+.0f}°",
+                width=64,
+                height=46,
+                command=lambda a=angle: self.submit_uncertainty_heading(a),
+            )
+            btn.grid(row=r, column=c, padx=3, pady=3)
+            self.uncertainty_buttons[key] = btn
+        self.uncertainty_retry_button = ctk.CTkButton(
+            self.uncertainty_panel,
+            text="Retry (R)",
+            fg_color="#b45309",
+            hover_color="#92400e",
+            command=self.retry_uncertainty,
+        )
+        self.uncertainty_retry_button.pack(pady=(0, 12))
+        self._uncertainty_panel_visible = False
 
         # -- persistent click-result line (last click's outcome, e.g. "point
         # goal set at world (x, z)" or "click ignored: no valid depth
@@ -439,6 +535,13 @@ class NavGuiApp:
         self._manual_held.clear()
         self.controller.request_pick_manually()
 
+    # ---------------- uncertainty halt ---------------- #
+    def submit_uncertainty_heading(self, angle_deg: float) -> None:
+        self.controller.submit_uncertainty_heading(angle_deg)
+
+    def retry_uncertainty(self) -> None:
+        self.controller.retry_uncertainty_request()
+
     # ---------------- click-to-goal ---------------- #
     def on_cam_click(self, event) -> None:
         # The camera frame is letterboxed into cam_canvas (see _draw_camera),
@@ -505,6 +608,7 @@ class NavGuiApp:
         self._draw_plot(d)
         self._sync_seg_panel(d)
         self._sync_click_panel()
+        self._sync_uncertainty_panel(d)
         self.click_status_label.configure(text=d.click_status)
 
         mode_txt = d.mode.upper().replace("_", " ")
@@ -526,9 +630,14 @@ class NavGuiApp:
             cbf_txt = "  CBF:orbit" if d.cbf_info.get("orbiting") else "  CBF:blocked"
         if d.cbf_info.get("hard_gate_fired"):
             cbf_txt += "  CBF:hard-gate"
+        unc_txt = (
+            f"   unc={d.uncertainty_value:.2f}/{d.uncertainty_threshold:.2f}"
+            if d.uncertainty_enabled
+            else ""
+        )
         self.telemetry_label.configure(
             text=f"{pose_txt}   step={d.step}   "
-            f"v=[{act.v_fwd:.2f},{act.v_lat:.2f}] yaw_rate={act.yaw_rate:+.2f}{cbf_txt}"
+            f"v=[{act.v_fwd:.2f},{act.v_lat:.2f}] yaw_rate={act.yaw_rate:+.2f}{cbf_txt}{unc_txt}"
         )
 
         alive = self.controller.is_alive()
@@ -566,6 +675,41 @@ class NavGuiApp:
             self.click_panel.grid_forget()
             self._click_panel_visible = False
             self._scroll_sidebar_to_top()
+
+    def _sync_uncertainty_panel(self, d) -> None:
+        if not d.uncertainty_halted:
+            if self._uncertainty_panel_visible:
+                self.uncertainty_panel.grid_forget()
+                self._uncertainty_panel_visible = False
+                self._scroll_sidebar_to_top()
+            return
+
+        if not self._uncertainty_panel_visible:
+            self.uncertainty_panel.grid(
+                row=self._uncertainty_row, column=0, sticky="ew", pady=(8, 0)
+            )
+            self._uncertainty_panel_visible = True
+            self._scroll_sidebar_to_bottom()
+
+        in_flight = d.uncertainty_request_in_flight
+        button_state = "disabled" if in_flight else "normal"
+        for btn in self.uncertainty_buttons.values():
+            btn.configure(state=button_state)
+        self.uncertainty_retry_button.configure(state=button_state)
+
+        if in_flight:
+            self.uncertainty_panel.configure(border_color="#f59e0b")
+            self.uncertainty_title.configure(
+                text="REQUESTING VLM SWEEP...", text_color="#f59e0b"
+            )
+        else:
+            self.uncertainty_panel.configure(border_color="#38bdf8")
+            self.uncertainty_title.configure(
+                text="UNCERTAINTY HALT -- choose a heading", text_color="#38bdf8"
+            )
+        self.uncertainty_desc_label.configure(
+            text=d.uncertainty_line or "Waiting for VLM sweep description..."
+        )
 
     def _draw_camera(self, vis_rgb) -> None:
         # Letterbox the (possibly non-square) frame into whatever size the
@@ -675,6 +819,11 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         seg_overlay=args.seg_overlay,
         annotations_dir=args.annotations_dir,
         annotation_categories=args.annotation_categories,
+        uncertainty_enabled=not args.no_uncertainty_halt,
+        uncertainty_cov_threshold=args.cov_threshold,
+        uncertainty_cov_growth=args.cov_growth,
+        uncertainty_cov_growth_rate=args.cov_growth_rate,
+        uncertainty_search_dist=args.uncertainty_search_dist,
     )
 
 
@@ -763,6 +912,44 @@ def parse_args(argv=None) -> argparse.Namespace:
         nargs="+",
         default=None,
         help="restrict --seg-overlay=mesh to these hull categories (default: all)",
+    )
+    ap.add_argument(
+        "--no-uncertainty-halt",
+        action="store_true",
+        help="disable the uncertainty-halt heading-request prompt (vl_direction's "
+        "'uncertainty' mode against the resolved goal's real BeliefGoalTracker -- see "
+        "--cov-threshold/--cov-growth). Default on; only spins up its own Qwen VLM "
+        "subprocess (distinct from --seg-backend's) once this halt actually fires",
+    )
+    ap.add_argument(
+        "--cov-threshold",
+        type=float,
+        default=vl_dir_config.DEFAULT_COVARIANCE_THRESHOLD,
+        help="belief-uncertainty value (BeliefGoalTracker.uncertainty_value(), grows "
+        "while a resolved goal mask stays unseen) at which MODE_RESOLVE driving halts "
+        f"and a heading is requested (default {vl_dir_config.DEFAULT_COVARIANCE_THRESHOLD})",
+    )
+    ap.add_argument(
+        "--cov-growth",
+        type=float,
+        default=0.01,
+        help="base per-tick belief-uncertainty growth while the goal mask is unseen "
+        "(default 0.01); lower this to trigger the halt sooner for testing",
+    )
+    ap.add_argument(
+        "--cov-growth-rate",
+        type=float,
+        default=0.0,
+        help="accelerating-drift factor: growth speeds up the longer the goal has been "
+        "unseen (default 0.0, i.e. flat per-tick growth unless overridden)",
+    )
+    ap.add_argument(
+        "--uncertainty-search-dist",
+        type=float,
+        default=4.0,
+        help="meters driven along a human-submitted heading before falling back to the "
+        "(still-uncertain) dead-reckoned belief and, if still unseen, halting again "
+        "(default 4.0)",
     )
     return ap.parse_args(argv)
 
