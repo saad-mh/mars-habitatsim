@@ -228,9 +228,7 @@ class RoverController:
         self.seg_backend = seg_backend
         self.seg_checkpoint = seg_checkpoint
         self.seg_overlay = seg_overlay
-        self.annotations_dir = (
-            annotations_dir if self.seg_overlay == "mesh" else None
-        )
+        self.annotations_dir = annotations_dir if self.seg_overlay == "mesh" else None
         self.annotation_categories = annotation_categories
 
         self._lock = threading.RLock()
@@ -391,16 +389,18 @@ class RoverController:
             max_yaw_rate=self.max_yaw_rate,
         )
         with self._lock:
-            self.display.status_text = "loading NavDP upstream server..."
+            self.display.status_text = "NavDP policy is being loaded"
         policy.start()
 
         belief_tracker = self._new_belief_tracker()
         avoidance = self._new_avoidance() if self.cbf_enabled else None
-        # goal/obstacle mask objects registered by the last "resolve" -- kept
-        # around (rather than deleted, no handle for that without reaching
-        # into MarsHabitatEnv's private sim) and neutralised (semantic_id=0,
-        # the same "untag, don't remove" convention sam_vla.run_navdp_rollout
-        # already uses for its base-station marker) before the next batch.
+        # goal/obstacle mask objects registered by the last "resolve" --
+        # actually removed (env.remove_object_mask) rather than merely
+        # untagged whenever they stop being current: on the next
+        # resolve/rerun, on reset, on abandoning an unconfirmed review (Pick
+        # Manually or switching to another driving mode without Confirm), or
+        # on reaching a confirmed resolve goal -- see _clear_masks. Without
+        # this, every resolve within one run leaves its old mesh behind.
         goal_objects: list = []
         obstacle_objects: list = []
         goal_spec = GoalSpec(
@@ -415,6 +415,7 @@ class RoverController:
 
         step = 0
         period = 1.0 / self.hz
+        was_reviewing = False
         try:
             while self._running:
                 t0 = time.time()
@@ -429,9 +430,9 @@ class RoverController:
                 ) = self._consume_pending()
 
                 if do_reset:
-                    for obj in goal_objects + obstacle_objects:
-                        obj.semantic_id = 0
-                    goal_objects, obstacle_objects = [], []
+                    goal_objects, obstacle_objects = self._clear_masks(
+                        env, goal_objects, obstacle_objects
+                    )
                     belief_tracker = self._new_belief_tracker()
                     if avoidance is not None:
                         avoidance = self._new_avoidance()
@@ -469,18 +470,20 @@ class RoverController:
 
                 if do_pick_manual:
                     with self._lock:
-                        was_reviewing = self._mode == MODE_REVIEW_SEGMENTATION
-                        if was_reviewing:
+                        pick_manual_was_reviewing = (
+                            self._mode == MODE_REVIEW_SEGMENTATION
+                        )
+                        if pick_manual_was_reviewing:
                             self._mode = MODE_IDLE
                             self._world_goal = None
                             self.display.status_text = (
                                 "pick a goal point manually -- click the camera view"
                             )
                             self.display.goal_reached = False
-                    if was_reviewing:
-                        for obj in goal_objects + obstacle_objects:
-                            obj.semantic_id = 0
-                        goal_objects, obstacle_objects = [], []
+                    if pick_manual_was_reviewing:
+                        goal_objects, obstacle_objects = self._clear_masks(
+                            env, goal_objects, obstacle_objects
+                        )
 
                 obs = env.get_observation(frame_idx=step)
                 semantic = env.get_semantic_frame()
@@ -494,6 +497,20 @@ class RoverController:
                     mode = self._mode
                     manual_action = self._manual_action
                     world_goal = self._world_goal
+
+                if was_reviewing and mode not in (
+                    MODE_REVIEW_SEGMENTATION,
+                    MODE_RESOLVE,
+                ):
+                    # Review was abandoned by switching to another driving
+                    # mode directly (random goal / go home / manual drive /
+                    # click-to-goal / stop) instead of going through Confirm,
+                    # Rerun, or Pick Manually -- those already clear their own
+                    # masks, so this only fires for the remaining paths.
+                    goal_objects, obstacle_objects = self._clear_masks(
+                        env, goal_objects, obstacle_objects
+                    )
+                was_reviewing = mode == MODE_REVIEW_SEGMENTATION
 
                 action = Action(0.0, 0.0, 0.0)
                 trajectory = None
@@ -523,12 +540,21 @@ class RoverController:
                     belief_tracker.observe(goal_mask, obs.depth)
                     if belief_tracker.belief_g is not None:
                         forward, left = (float(v) for v in belief_tracker.belief_g)
-                        policy.set_goal_body(forward, left)
-                        action, _vla_result = policy.act_verbose(
-                            obs, semantic, goal_spec, step
-                        )
-                        trajectory = getattr(policy, "_last_trajectory", None)
-                        goal_bearing = belief_tracker.bearing()
+                        if math.hypot(forward, left) < POINT_GOAL_REACHED_M:
+                            with self._lock:
+                                self._mode = MODE_IDLE
+                                self.display.goal_reached = True
+                            mode = MODE_IDLE
+                            goal_objects, obstacle_objects = self._clear_masks(
+                                env, goal_objects, obstacle_objects
+                            )
+                        else:
+                            policy.set_goal_body(forward, left)
+                            action, _vla_result = policy.act_verbose(
+                                obs, semantic, goal_spec, step
+                            )
+                            trajectory = getattr(policy, "_last_trajectory", None)
+                            goal_bearing = belief_tracker.bearing()
                     else:
                         # Never sighted the goal mask yet this episode -- hold
                         # rather than drive on NavdpUpstreamPolicy's hidden
@@ -677,6 +703,15 @@ class RoverController:
     def _new_avoidance(self) -> CbfObstacleAvoidance:
         return CbfObstacleAvoidance(**self._cbf_kwargs)
 
+    @staticmethod
+    def _clear_masks(env, goal_objects: list, obstacle_objects: list) -> tuple:
+        """Actually remove every registered goal/obstacle mask mesh from the
+        scene (not just untag it) and return the emptied (goal, obstacle)
+        lists -- see _env_loop's goal_objects/obstacle_objects docstring."""
+        for obj in goal_objects + obstacle_objects:
+            env.remove_object_mask(obj)
+        return [], []
+
     def _do_resolve(
         self, env, step, mask_dir, goal_objects, obstacle_objects, current_goal_spec
     ):
@@ -701,8 +736,9 @@ class RoverController:
             return goal_objects, obstacle_objects, current_goal_spec
 
         goal_position = backproject_goal_position(obs_r, goal_spec_r, hfov_deg=HFOV_DEG)
-        for obj in goal_objects + obstacle_objects:
-            obj.semantic_id = 0
+        goal_objects, obstacle_objects = self._clear_masks(
+            env, goal_objects, obstacle_objects
+        )
         new_goal_objects: list = []
         new_obstacle_objects: list = []
         if goal_position is not None:

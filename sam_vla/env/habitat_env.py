@@ -29,7 +29,7 @@ RGB_WIDTH = 640
 HFOV_DEG = 90.0
 DEPTH_MAX_RANGE_M = 10.0
 
-SPAWN_CLEARANCE_M = 1.8
+SPAWN_CLEARANCE_M = 0.7
 SPAWN_TERRAIN_RADIUS_M = 0.8
 
 
@@ -320,6 +320,13 @@ class MarsHabitatEnv:
         mesh_path = str(mesh_dir / f"{name}.obj")
         save_obj(mesh_path, verts, faces)
         return register_semantic_mesh(self._sim, mesh_path, semantic_id)
+
+    def remove_object_mask(self, obj) -> None:
+        """Undo a prior register_object_mask outright (not just untag it via
+        semantic_id=0) -- callers that repeatedly resolve/rerun within one
+        run must actually delete the old mesh, or it keeps sitting in the
+        scene as dead render geometry forever."""
+        self._sim.get_rigid_object_manager().remove_object_by_id(obj.object_id)
 
 
 if __name__ == "__main__":

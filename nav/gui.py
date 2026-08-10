@@ -317,7 +317,11 @@ class NavGuiApp:
         # goal set at world (x, z)" or "click ignored: no valid depth
         # there") -- stays visible after the confirm panel above closes. -- #
         self.click_status_label = ctk.CTkLabel(
-            content, text="", anchor="w", font=ctk.CTkFont(size=11), text_color="#9ca3af"
+            content,
+            text="",
+            anchor="w",
+            font=ctk.CTkFont(size=11),
+            text_color="#9ca3af",
         )
         self.click_status_label.pack(fill="x", padx=14, pady=(0, 8))
 
@@ -601,9 +605,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         "needed for the CBF safety layer's generic obstacle/avoidance math, unrelated to which "
         "driving policy is active",
     )
-    ap.add_argument("--start-x", type=float, default=8.0)
-    ap.add_argument("--start-z", type=float, default=10.0)
-    ap.add_argument("--start-yaw", type=float, default=0.0, help="degrees")
+    ap.add_argument("--start-x", type=float, default=8.0)  # 7.1
+    ap.add_argument("--start-z", type=float, default=10.0)  # 7.7
+    ap.add_argument("--start-yaw", type=float, default=0.0, help="degrees")  # 34
     ap.add_argument("--dt", type=float, default=0.1)
     ap.add_argument("--hz", type=float, default=10.0, help="controller tick rate")
     ap.add_argument("--max-linear", type=float, default=0.6)

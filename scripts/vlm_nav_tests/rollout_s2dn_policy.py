@@ -618,12 +618,13 @@ def place_obstacle_meshes(
     *,
     mesh_half_pixels: int,
     mesh_lift: float,
-) -> tuple[list[Any], list[np.ndarray]]:
+) -> tuple[list[Any], list[np.ndarray], list[np.ndarray]]:
     mesh_directory = output_directory / "meshes"
     mesh_directory.mkdir(parents=True, exist_ok=True)
     height, width = depth.shape
     objects: list[Any] = []
     centroids: list[np.ndarray] = []
+    geometries: list[np.ndarray] = []
     for index, specification in enumerate(uv_specifications):
         u, v = parse_uv_fraction(specification, width, height)
         vertices, faces = depth_patch_mesh(
@@ -647,13 +648,104 @@ def place_obstacle_meshes(
         objects.append(register_semantic_mesh(simulator, mesh_path, semantic_id))
         centroid = vertices.mean(axis=0).astype(np.float32)
         centroids.append(centroid)
+        geometries.append(vertices[faces][:, :, [0, 2]].astype(np.float64))
         print(
             f"[mesh] obstacle={index} semantic_id={semantic_id} "
             f"pixels={specification} vertices={len(vertices)} "
             f"world={centroid.tolist()}",
             flush=True,
         )
-    return objects, centroids
+    return objects, centroids, geometries
+
+
+def planar_mesh_clearance(
+    point_xz: np.ndarray,
+    geometries: Sequence[np.ndarray],
+) -> float:
+    """Minimum 2-D distance from a robot center to projected mesh triangles."""
+    point = np.asarray(point_xz, dtype=np.float64)
+    best = float("inf")
+    for triangles in geometries:
+        triangles = np.asarray(triangles, dtype=np.float64)
+        if triangles.size == 0:
+            continue
+        a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+        v0, v1, v2 = b - a, c - a, point[None, :] - a
+        denominator = v0[:, 0] * v1[:, 1] - v1[:, 0] * v0[:, 1]
+        valid = np.abs(denominator) > 1.0e-12
+        safe_denominator = np.where(valid, denominator, 1.0)
+        u = (v2[:, 0] * v1[:, 1] - v1[:, 0] * v2[:, 1]) / safe_denominator
+        v = (v0[:, 0] * v2[:, 1] - v2[:, 0] * v0[:, 1]) / safe_denominator
+        if np.any(valid & (u >= 0.0) & (v >= 0.0) & (u + v <= 1.0)):
+            return 0.0
+
+        starts = np.concatenate((a, b, c), axis=0)
+        ends = np.concatenate((b, c, a), axis=0)
+        segments = ends - starts
+        squared_lengths = np.einsum("ij,ij->i", segments, segments)
+        numerators = np.einsum("ij,ij->i", point[None, :] - starts, segments)
+        fractions = np.divide(
+            numerators,
+            squared_lengths,
+            out=np.zeros_like(numerators),
+            where=squared_lengths > 1.0e-12,
+        )
+        fractions = np.clip(fractions, 0.0, 1.0)
+        closest = starts + fractions[:, None] * segments
+        best = min(best, float(np.linalg.norm(point[None, :] - closest, axis=1).min()))
+    return best
+
+
+def parse_xz_velocity(specification: str) -> np.ndarray:
+    values = [float(value) for value in str(specification).split(",")]
+    if len(values) != 2 or not np.all(np.isfinite(values)):
+        raise ValueError("obstacle velocity must be finite vx,vz")
+    return np.asarray(values, dtype=np.float64)
+
+
+def expand_obstacle_velocities(
+    specifications: Sequence[str], obstacle_count: int
+) -> np.ndarray:
+    if obstacle_count == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    if not specifications:
+        return np.zeros((obstacle_count, 2), dtype=np.float64)
+    velocities = np.stack([parse_xz_velocity(item) for item in specifications])
+    if len(velocities) == 1 and obstacle_count > 1:
+        velocities = np.repeat(velocities, obstacle_count, axis=0)
+    if len(velocities) != obstacle_count:
+        raise ValueError(
+            "provide one obstacle velocity to broadcast or one velocity per mesh"
+        )
+    return velocities
+
+
+def translated_mesh_geometry(
+    base_geometries: Sequence[np.ndarray],
+    base_centroids: Sequence[np.ndarray],
+    velocities_xz: np.ndarray,
+    elapsed_seconds: float,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    geometries: list[np.ndarray] = []
+    centroids: list[np.ndarray] = []
+    for geometry, centroid, velocity in zip(
+        base_geometries, base_centroids, velocities_xz
+    ):
+        offset_xz = np.asarray(velocity, dtype=np.float64) * elapsed_seconds
+        geometries.append(np.asarray(geometry) + offset_xz[None, None, :])
+        offset_xyz = np.asarray([offset_xz[0], 0.0, offset_xz[1]])
+        centroids.append(np.asarray(centroid, dtype=np.float64) + offset_xyz)
+    return geometries, centroids
+
+
+def move_mesh_objects(
+    objects: Sequence[Any], velocities_xz: np.ndarray, elapsed_seconds: float
+) -> None:
+    for obstacle, velocity in zip(objects, velocities_xz):
+        dx, dz = np.asarray(velocity, dtype=np.float64) * elapsed_seconds
+        vector_type = type(obstacle.translation)
+        obstacle.translation = vector_type(float(dx), 0.0, float(dz))
+
 
 def camera_coordinates(
     point: np.ndarray, position: np.ndarray, yaw: float
@@ -853,6 +945,17 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--swap-heightmap-xz", action="store_true")
     argument_parser.add_argument("--clearance", type=float, default=1.4)
     argument_parser.add_argument("--pose-terrain-radius", type=float, default=0.8)
+    argument_parser.add_argument(
+        "--robot-radius",
+        type=float,
+        default=0.24,
+        help="Planar robot footprint radius used only for method-independent evaluation.",
+    )
+    argument_parser.add_argument(
+        "--evaluation-layout",
+        default="default",
+        help="Stable layout identifier stored in the rollout archive.",
+    )
 
     argument_parser.add_argument("--height", type=int, default=720)
     argument_parser.add_argument("--width", type=int, default=720)
@@ -890,6 +993,16 @@ def parser() -> argparse.ArgumentParser:
     )
     argument_parser.add_argument("--mesh-half-pixels", type=int, default=26)
     argument_parser.add_argument("--mesh-obstacle-lift", type=float, default=0.50)
+    argument_parser.add_argument(
+        "--obstacle-velocity-xz",
+        nargs="*",
+        default=[],
+        metavar="VX,VZ",
+        help=(
+            "World-frame mesh velocities in m/s. Supply one value to broadcast "
+            "or one value per obstacle. Example: --obstacle-velocity-xz 0.30,0.0"
+        ),
+    )
 
     argument_parser.add_argument("--lookahead-index", type=int, default=4)
     argument_parser.add_argument("--maximum-forward-speed", type=float, default=0.5)
@@ -898,7 +1011,16 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--output", default="runs/navdp_s2diff_mars")
     argument_parser.add_argument("--save-every", type=int, default=1)
     argument_parser.add_argument(
+        "--save-frames", action=argparse.BooleanOptionalAction, default=True
+    )
+    argument_parser.add_argument(
         "--save-video", action=argparse.BooleanOptionalAction, default=True
+    )
+    argument_parser.add_argument(
+        "--archive-observations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store RGB/depth/masks in rollout.npz; disable for large evaluations.",
     )
     return argument_parser
 
@@ -906,6 +1028,10 @@ def parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = parser().parse_args()
     np.random.seed(args.seed)
+    if args.robot_radius < 0.0:
+        raise ValueError("robot-radius must be non-negative")
+    if args.obstacle_velocity_xz and args.obstacle_mode != "mesh":
+        raise ValueError("moving obstacle velocities require --obstacle-mode mesh")
     if args.obstacle_mode == "ghost" and (
         args.ghost_obstacle_x is None or args.ghost_obstacle_z is None
     ):
@@ -966,6 +1092,10 @@ def main() -> None:
         if goal_y is None:
             goal_y = terrain.local_height_max(args.goal_x, args.goal_z, 0.8) + args.goal_height
         goal = np.asarray([args.goal_x, goal_y, args.goal_z], dtype=np.float32)
+        start_position_xz = np.asarray([x, z], dtype=np.float64)
+        initial_goal_distance = float(
+            np.linalg.norm(goal[[0, 2]].astype(np.float64) - start_position_xz)
+        )
 
         ghost = None
         if args.obstacle_mode == "ghost":
@@ -980,15 +1110,13 @@ def main() -> None:
 
         mesh_objects: list[Any] = []
         mesh_centroids: list[np.ndarray] = []
+        mesh_current_centroids: list[np.ndarray] = []
+        mesh_base_geometries: list[np.ndarray] = []
+        mesh_geometries: list[np.ndarray] = []
+        mesh_velocities = np.zeros((0, 2), dtype=np.float64)
         mesh_placed = False
 
-        rows: dict[str, list[Any]] = {
-            key: []
-            for key in (
-                "rgb",
-                "depth",
-                "goal_mask",
-                "obstacle_mask",
+        row_keys = [
                 "pose",
                 "action_3d",
                 "point_goal",
@@ -1008,8 +1136,14 @@ def main() -> None:
                 "final_guidance_noise_correction",
                 "maximum_guidance_noise_correction",
                 "goal_distance",
-            )
-        }
+                "executed_center_clearance",
+                "executed_surface_clearance",
+                "geometric_collision",
+                "obstacle_positions_world",
+        ]
+        if args.archive_observations:
+            row_keys.extend(("rgb", "depth", "goal_mask", "obstacle_mask"))
+        rows: dict[str, list[Any]] = {key: [] for key in row_keys}
         video_frames: list[Image.Image] = []
         success = False
 
@@ -1017,11 +1151,20 @@ def main() -> None:
             y = terrain.local_height_max(x, z, args.pose_terrain_radius) + args.clearance
             position = np.asarray([x, y, z], dtype=np.float32)
             set_agent_pose(agent, position, yaw)
+            if mesh_placed:
+                elapsed_seconds = step * dt
+                move_mesh_objects(mesh_objects, mesh_velocities, elapsed_seconds)
+                mesh_geometries, mesh_current_centroids = translated_mesh_geometry(
+                    mesh_base_geometries,
+                    mesh_centroids,
+                    mesh_velocities,
+                    elapsed_seconds,
+                )
             observation = simulator.get_sensor_observations()
             rgb, depth = rgb_depth(observation)
 
             if args.obstacle_mode == "mesh" and not mesh_placed:
-                mesh_objects, mesh_centroids = place_obstacle_meshes(
+                mesh_objects, mesh_centroids, mesh_base_geometries = place_obstacle_meshes(
                     simulator,
                     depth,
                     position,
@@ -1031,6 +1174,12 @@ def main() -> None:
                     output_directory,
                     mesh_half_pixels=args.mesh_half_pixels,
                     mesh_lift=args.mesh_obstacle_lift,
+                )
+                mesh_velocities = expand_obstacle_velocities(
+                    args.obstacle_velocity_xz, len(mesh_objects)
+                )
+                mesh_geometries, mesh_current_centroids = translated_mesh_geometry(
+                    mesh_base_geometries, mesh_centroids, mesh_velocities, 0.0
                 )
                 mesh_placed = True
                 observation = simulator.get_sensor_observations()
@@ -1104,15 +1253,25 @@ def main() -> None:
             z = float(np.clip(next_position[2], -args.size_z / 2.0 + 0.5, args.size_z / 2.0 - 0.5))
             yaw = wrap_angle(next_yaw)
             goal_distance = float(np.linalg.norm(goal[[0, 2]] - np.asarray([x, z])))
+            center_clearance = planar_mesh_clearance(
+                np.asarray([x, z], dtype=np.float64), mesh_geometries
+            )
+            if np.isfinite(center_clearance):
+                surface_clearance = max(center_clearance - float(args.robot_radius), 0.0)
+                geometric_collision = center_clearance <= float(args.robot_radius)
+            else:
+                surface_clearance = float("nan")
+                geometric_collision = False
             rotation = quaternion.from_rotation_vector(np.asarray([0.0, yaw, 0.0]))
             pose = np.asarray(
                 [x, y, z, rotation.x, rotation.y, rotation.z, rotation.w], dtype=np.float32
             )
 
-            rows["rgb"].append(rgb)
-            rows["depth"].append(depth)
-            rows["goal_mask"].append(goal_mask)
-            rows["obstacle_mask"].append(obstacle_mask)
+            if args.archive_observations:
+                rows["rgb"].append(rgb)
+                rows["depth"].append(depth)
+                rows["goal_mask"].append(goal_mask)
+                rows["obstacle_mask"].append(obstacle_mask)
             rows["pose"].append(pose)
             rows["action_3d"].append(action)
             rows["point_goal"].append(point_goal)
@@ -1140,11 +1299,20 @@ def main() -> None:
                 result.maximum_guidance_noise_correction
             )
             rows["goal_distance"].append(goal_distance)
+            rows["executed_center_clearance"].append(center_clearance)
+            rows["executed_surface_clearance"].append(surface_clearance)
+            rows["geometric_collision"].append(geometric_collision)
+            rows["obstacle_positions_world"].append(
+                np.stack(mesh_current_centroids)
+                if mesh_current_centroids
+                else np.zeros((0, 3), dtype=np.float64)
+            )
 
-            if step % max(int(args.save_every), 1) == 0:
+            if args.save_frames and step % max(int(args.save_every), 1) == 0:
                 label = (
                     f"t={step} goal={goal_distance:.2f}m pixels={len(obstacle_pixels)} "
-                    f"clear={result.selected_minimum_clearance:.2f}m "
+                    f"pred={result.selected_minimum_clearance:.2f}m "
+                    f"actual={surface_clearance:.2f}m "
                     f"mode={result.selected_circulation_sign:+.0f} "
                     f"escape={int(result.escape_turn)} "
                     f"guide_rms={result.mean_guidance_noise_correction:.4f} "
@@ -1159,7 +1327,9 @@ def main() -> None:
                 f"pixels={len(obstacle_pixels)} valid={result.valid_obstacle_points} "
                 f"selected={result.selected_index} fallback={result.fallback_stop} "
                 f"escape={result.escape_turn} mode={result.selected_circulation_sign:+.0f} "
-                f"clear={result.selected_minimum_clearance:.3f}m "
+                f"pred_clear={result.selected_minimum_clearance:.3f}m "
+                f"actual_clear={surface_clearance:.3f}m "
+                f"collision={geometric_collision} "
                 f"barrier={result.selected_barrier_energy:.5f} "
                 f"circ={result.selected_circulation_energy:.5f} "
                 f"latency={planning_time * 1000.0:.1f}ms "
@@ -1171,8 +1341,8 @@ def main() -> None:
                 success = True
                 break
 
-        if not rows["rgb"]:
-            raise RuntimeError("rollout produced no frames")
+        if not rows["goal_distance"]:
+            raise RuntimeError("rollout produced no steps")
         rollout_path = output_directory / "rollout.npz"
         np.savez_compressed(
             rollout_path,
@@ -1197,20 +1367,41 @@ def main() -> None:
                 if mesh_centroids
                 else np.zeros((0, 3), dtype=np.float32)
             ),
+            obstacle_velocity_xz=mesh_velocities,
             success=np.asarray(success),
             hz=np.asarray(args.hz, dtype=np.float32),
+            start_position_xz=start_position_xz,
+            initial_goal_distance=np.asarray(initial_goal_distance, dtype=np.float64),
+            stop_distance=np.asarray(args.stop_distance, dtype=np.float64),
+            robot_radius=np.asarray(args.robot_radius, dtype=np.float64),
+            evaluation_layout=np.asarray(args.evaluation_layout),
+            seed=np.asarray(args.seed, dtype=np.int64),
         )
         with (output_directory / "manifest.json").open("w", encoding="utf-8") as file:
             json.dump(
                 {
                     "success": success,
-                    "frames": len(rows["rgb"]),
+                    "steps": len(rows["goal_distance"]),
+                    "archived_observations": args.archive_observations,
                     "final_goal_distance": float(rows["goal_distance"][-1]),
                     "planner": "released_navdp_s2diff_pixels",
                     "controller": "direct_waypoint_no_optimizer",
                     "uses_velocity_chunk": False,
                     "obstacle_mode": args.obstacle_mode,
                     "mesh_obstacle_count": len(mesh_centroids),
+                    "moving_obstacles": bool(np.any(np.abs(mesh_velocities) > 0.0)),
+                    "obstacle_velocity_xz": mesh_velocities.tolist(),
+                    "evaluation_layout": args.evaluation_layout,
+                    "seed": args.seed,
+                    "robot_radius": args.robot_radius,
+                    "minimum_executed_surface_clearance": (
+                        float(np.nanmin(rows["executed_surface_clearance"]))
+                        if np.any(np.isfinite(rows["executed_surface_clearance"]))
+                        else None
+                    ),
+                    "geometric_collision": bool(
+                        np.any(rows["geometric_collision"])
+                    ),
                     "rollout": str(rollout_path),
                 },
                 file,
