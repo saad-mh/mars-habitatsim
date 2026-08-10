@@ -60,8 +60,9 @@ def _default_navdp_upstream_ckpt() -> Optional[str]:
 
 
 class NavGuiApp:
-    CAM_SIZE = 480
-    PLOT_SIZE = 420
+    SIDEBAR_MIN_W = 340
+    PLOT_MIN = 200
+    PLOT_MAX = 480
     PLOT_RANGE = 6.0  # meters shown top-to-bottom of the body-frame plot
 
     def __init__(
@@ -80,79 +81,100 @@ class NavGuiApp:
         self._pending_click_norm: Optional[tuple[float, float]] = None
         self._seg_panel_visible = False
         self._click_panel_visible = False
+        self._cam_img_box: Optional[tuple[int, int, int, int]] = None
+        self._cam_photo = None
+        self._plot_size = self.PLOT_MIN
 
         root.title("mars-habitatsim/nav")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.minsize(900, 600)
 
-        # The packed content (camera/plot row + all panels, with both
-        # state-only panels visible at once) is taller than a lot of
-        # monitors -- cap the window to the screen and let this scrollable
-        # frame carry the overflow instead of the window growing off-screen
-        # with no way to reach the bottom row of buttons.
-        screen_h = root.winfo_screenheight()
-        window_h = min(int(screen_h * 0.9), 1000)
-        root.geometry(f"1000x{window_h}")
-        root.minsize(760, 480)
+        # Start maximized so the layout below (sized entirely off grid
+        # weights, not fixed pixel panels) actually gets the whole screen to
+        # lay out into -- fall back by platform since "zoomed" and the
+        # "-zoomed" attribute aren't both supported everywhere.
+        try:
+            root.state("zoomed")
+        except tk.TclError:
+            try:
+                root.attributes("-zoomed", True)
+            except tk.TclError:
+                sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+                root.geometry(f"{int(sw * 0.95)}x{int(sh * 0.9)}")
 
-        content = ctk.CTkScrollableFrame(root, fg_color="transparent")
-        content.pack(fill="both", expand=True)
+        # Single root-level grid: a hero camera column that soaks up most of
+        # the width/height, and a sidebar column that stacks every control
+        # panel vertically instead of each panel being its own half-empty
+        # full-width row.
+        root.grid_rowconfigure(0, weight=1)
+        root.grid_columnconfigure(0, weight=3)
+        root.grid_columnconfigure(1, weight=1, minsize=self.SIDEBAR_MIN_W)
 
         mono_font = ctk.CTkFont(family="Consolas", size=12)
         mode_font = ctk.CTkFont(size=17, weight="bold")
 
-        # -- camera view + body-frame plot, side by side -- #
-        top_row = ctk.CTkFrame(content, fg_color="transparent")
-        top_row.pack(padx=10, pady=(10, 4))
+        # -- camera hero panel: fills all left-column space, image is
+        # letterboxed into it on every refresh so it tracks window size -- #
+        cam_frame = ctk.CTkFrame(root)
+        cam_frame.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        cam_frame.grid_rowconfigure(0, weight=1)
+        cam_frame.grid_columnconfigure(0, weight=1)
 
-        cam_frame = ctk.CTkFrame(top_row)
-        cam_frame.pack(side="left", padx=(0, 4))
-        # Plain tk.Label (not CTkLabel) for the per-frame video blit, same
-        # reasoning as kb_teleop_vl.py: a raw PhotoImage swap every refresh
-        # is cheaper than rebuilding a CTkImage each time.
-        self.cam_label = tk.Label(cam_frame, bd=0)
-        self.cam_label.pack(padx=4, pady=(4, 2))
-        self._blank_photo = ImageTk.PhotoImage(
-            Image.new("RGB", (self.CAM_SIZE, self.CAM_SIZE), "#222")
-        )
-        self.cam_label.configure(image=self._blank_photo)
-        self.cam_label.bind("<Button-1>", self.on_cam_click)
+        self.cam_canvas = tk.Canvas(cam_frame, bg="#111111", highlightthickness=0)
+        self.cam_canvas.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 2))
+        self.cam_canvas.bind("<Button-1>", self.on_cam_click)
         ctk.CTkLabel(
             cam_frame,
             text="click the view to set a goal point",
             font=ctk.CTkFont(size=11),
             text_color="#9ca3af",
-        ).pack(pady=(0, 4))
+        ).grid(row=1, column=0, pady=(0, 6))
 
-        plot_frame = ctk.CTkFrame(top_row)
-        plot_frame.pack(side="left", padx=(4, 0))
+        # -- sidebar: body-frame plot, status, actions, drive and the
+        # state-only review panels stacked in one column so no section sits
+        # next to unused horizontal space. Footer row absorbs any leftover
+        # vertical space instead of the panels floating in a tall empty
+        # window. -- #
+        sidebar = ctk.CTkFrame(root, fg_color="transparent")
+        sidebar.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+        sidebar.grid_columnconfigure(0, weight=1)
+
+        row = 0
+
+        plot_frame = ctk.CTkFrame(sidebar)
+        plot_frame.grid(row=row, column=0, sticky="ew")
+        row += 1
+        plot_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             plot_frame, text="body-frame view", font=ctk.CTkFont(size=11)
-        ).pack(pady=(4, 0))
+        ).grid(row=0, column=0, pady=(4, 0))
         self.plot = tk.Canvas(
-            plot_frame,
-            width=self.PLOT_SIZE,
-            height=self.PLOT_SIZE,
-            bg=PLOT_BG,
-            highlightthickness=0,
+            plot_frame, height=self.PLOT_MIN, bg=PLOT_BG, highlightthickness=0
         )
-        self.plot.pack(padx=4, pady=(2, 4))
+        self.plot.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
+        self.plot.bind("<Configure>", self._on_plot_configure)
 
-        # -- status panel: mode + detail + telemetry, always visible -- #
-        self.status_panel = ctk.CTkFrame(content)
-        self.status_panel.pack(fill="x", padx=10, pady=4)
+        self.status_panel = ctk.CTkFrame(sidebar)
+        self.status_panel.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        row += 1
+        self.status_panel.grid_columnconfigure(0, weight=1)
         self.mode_label = ctk.CTkLabel(
             self.status_panel, text="", anchor="w", justify="left", font=mode_font
         )
-        self.mode_label.pack(fill="x", padx=10, pady=(8, 0))
+        self.mode_label.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 0))
         self.detail_label = ctk.CTkLabel(
             self.status_panel,
             text="",
             anchor="w",
             justify="left",
-            wraplength=860,
+            wraplength=self.SIDEBAR_MIN_W - 40,
             font=ctk.CTkFont(size=12),
         )
-        self.detail_label.pack(fill="x", padx=10, pady=(2, 2))
+        self.detail_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 2))
+        self.status_panel.bind(
+            "<Configure>",
+            lambda e: self.detail_label.configure(wraplength=max(200, e.width - 20)),
+        )
         self.telemetry_label = ctk.CTkLabel(
             self.status_panel,
             text="",
@@ -161,7 +183,7 @@ class NavGuiApp:
             font=mono_font,
             text_color="#9ca3af",
         )
-        self.telemetry_label.pack(fill="x", padx=10, pady=(0, 2))
+        self.telemetry_label.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
         self.alive_label = ctk.CTkLabel(
             self.status_panel,
             text="controller thread died -- see console",
@@ -172,48 +194,51 @@ class NavGuiApp:
         )
         self._alive_label_visible = False
 
-        # -- primary action bar -- #
-        actions = ctk.CTkFrame(content)
-        actions.pack(fill="x", padx=10, pady=4)
+        # -- goal actions: 2-column button grid that stretches to fill the
+        # sidebar's width instead of a 1-row button strip trailing off into
+        # empty space -- #
+        actions = ctk.CTkFrame(sidebar)
+        actions.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        row += 1
+        actions.grid_columnconfigure(0, weight=1)
+        actions.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
             actions, text="Goal", font=ctk.CTkFont(size=12, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=(10, 10), pady=8)
-        ctk.CTkButton(
-            actions, text="Segment", command=self.resolve_goal, width=150
-        ).grid(row=0, column=1, padx=4, pady=8)
-        ctk.CTkButton(
-            actions, text="Random Goal", command=self.random_goal, width=120
-        ).grid(row=0, column=2, padx=4, pady=8)
-        ctk.CTkButton(actions, text="Go Home", command=self.go_home, width=100).grid(
-            row=0, column=3, padx=4, pady=8
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
+        ctk.CTkButton(actions, text="Segment", command=self.resolve_goal).grid(
+            row=1, column=0, sticky="ew", padx=(10, 4), pady=4
+        )
+        ctk.CTkButton(actions, text="Random Goal", command=self.random_goal).grid(
+            row=1, column=1, sticky="ew", padx=(4, 10), pady=4
+        )
+        ctk.CTkButton(actions, text="Go Home", command=self.go_home).grid(
+            row=2, column=0, sticky="ew", padx=(10, 4), pady=4
         )
         ctk.CTkButton(
             actions,
             text="Reset Rover",
             command=self.reset_rover,
-            width=110,
             fg_color="#4b5563",
             hover_color="#374151",
-        ).grid(row=0, column=4, padx=(20, 4), pady=8)
+        ).grid(row=2, column=1, sticky="ew", padx=(4, 10), pady=4)
         ctk.CTkButton(
             actions,
             text="STOP",
             command=self.stop,
-            width=90,
             fg_color="#b91c1c",
             hover_color="#991b1b",
-        ).grid(row=0, column=5, padx=(4, 10), pady=8)
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10))
 
         # -- manual drive: D-pad, always visible -- #
-        drive = ctk.CTkFrame(content)
-        drive.pack(fill="x", padx=10, pady=4)
+        drive = ctk.CTkFrame(sidebar)
+        drive.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        row += 1
+        drive.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            drive,
-            text="Manual Drive",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=0, rowspan=3, sticky="w", padx=(10, 16), pady=8)
+            drive, text="Manual Drive", font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
         dpad = ctk.CTkFrame(drive, fg_color="transparent")
-        dpad.grid(row=0, column=1, rowspan=3, pady=6)
+        dpad.grid(row=1, column=0, pady=(0, 4))
         dpad_cells = {
             "fwd": (0, 1, "↑"),
             "left": (1, 0, "←"),
@@ -230,7 +255,9 @@ class NavGuiApp:
             text="hold a direction, or use the arrow keys -- Esc cancels a pending click",
             font=ctk.CTkFont(size=11),
             text_color="#9ca3af",
-        ).grid(row=0, column=2, sticky="w", padx=10)
+            wraplength=self.SIDEBAR_MIN_W - 40,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 10))
 
         for key, direction in (
             ("Up", "fwd"),
@@ -244,11 +271,12 @@ class NavGuiApp:
             )
         root.bind("<Escape>", lambda e: self.cancel_pixel_click())
 
-        # -- segmentation review panel: only packed while actually
+        # -- segmentation review panel: only gridded while actually
         # reviewing (Goal 1) -- bordered like kb_teleop_vl's uncertainty
-        # halt panel so it reads as "action needed", not a fourth static
-        # button row. -- #
-        self.seg_panel = ctk.CTkFrame(content, border_width=2, border_color="#f59e0b")
+        # halt panel so it reads as "action needed", not a permanent panel. -- #
+        self._seg_row = row
+        row += 1
+        self.seg_panel = ctk.CTkFrame(sidebar, border_width=2, border_color="#f59e0b")
         ctk.CTkLabel(
             self.seg_panel,
             text="REVIEWING RESOLVED GOAL",
@@ -256,77 +284,99 @@ class NavGuiApp:
             text_color="#f59e0b",
         ).pack(pady=(10, 2))
         self.seg_desc_label = ctk.CTkLabel(
-            self.seg_panel, text="", wraplength=860, justify="left"
+            self.seg_panel,
+            text="",
+            wraplength=self.SIDEBAR_MIN_W - 40,
+            justify="left",
         )
         self.seg_desc_label.pack(padx=12, pady=(0, 8), fill="x")
-        seg_btn_row = ctk.CTkFrame(self.seg_panel, fg_color="transparent")
-        seg_btn_row.pack(pady=(0, 12))
+        self.seg_panel.bind(
+            "<Configure>",
+            lambda e: self.seg_desc_label.configure(wraplength=max(200, e.width - 24)),
+        )
+        seg_btn_col = ctk.CTkFrame(self.seg_panel, fg_color="transparent")
+        seg_btn_col.pack(pady=(0, 12), fill="x", padx=12)
+        seg_btn_col.grid_columnconfigure(0, weight=1)
         ctk.CTkButton(
-            seg_btn_row,
+            seg_btn_col,
             text="Confirm",
             command=self.confirm_segmentation,
-            width=120,
             fg_color="#15803d",
             hover_color="#166534",
-        ).grid(row=0, column=0, padx=6)
+        ).grid(row=0, column=0, sticky="ew", pady=3)
         ctk.CTkButton(
-            seg_btn_row,
+            seg_btn_col,
             text="Rerun",
             command=self.rerun_segmentation,
-            width=120,
             fg_color="#b45309",
             hover_color="#92400e",
-        ).grid(row=0, column=1, padx=6)
+        ).grid(row=1, column=0, sticky="ew", pady=3)
         ctk.CTkButton(
-            seg_btn_row,
-            text="Pick Manually",
-            command=self.pick_manually,
-            width=140,
-        ).grid(row=0, column=2, padx=6)
+            seg_btn_col, text="Pick Manually", command=self.pick_manually
+        ).grid(row=2, column=0, sticky="ew", pady=3)
 
-        # -- click-to-goal confirm panel: only packed while a click is
+        # -- click-to-goal confirm panel: only gridded while a click is
         # pending confirmation. -- #
-        self.click_panel = ctk.CTkFrame(content, border_width=2, border_color="#00b8d4")
+        self._click_row = row
+        row += 1
+        self.click_panel = ctk.CTkFrame(
+            sidebar, border_width=2, border_color="#00b8d4"
+        )
         self.click_desc_label = ctk.CTkLabel(
             self.click_panel,
             text="Set the goal at the point you clicked?",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color="#22d3ee",
+            wraplength=self.SIDEBAR_MIN_W - 40,
         )
-        self.click_desc_label.pack(pady=(10, 6))
-        click_btn_row = ctk.CTkFrame(self.click_panel, fg_color="transparent")
-        click_btn_row.pack(pady=(0, 10))
+        self.click_desc_label.pack(pady=(10, 6), padx=12)
+        click_btn_col = ctk.CTkFrame(self.click_panel, fg_color="transparent")
+        click_btn_col.pack(pady=(0, 10), fill="x", padx=12)
+        click_btn_col.grid_columnconfigure(0, weight=1)
         ctk.CTkButton(
-            click_btn_row,
+            click_btn_col,
             text="Confirm Point Goal",
             command=self.confirm_pixel_goal,
-            width=160,
             fg_color="#15803d",
             hover_color="#166534",
-        ).grid(row=0, column=0, padx=6)
+        ).grid(row=0, column=0, sticky="ew", pady=3)
         ctk.CTkButton(
-            click_btn_row,
+            click_btn_col,
             text="Cancel",
             command=self.cancel_pixel_click,
-            width=100,
             fg_color="#4b5563",
             hover_color="#374151",
-        ).grid(row=0, column=1, padx=6)
+        ).grid(row=1, column=0, sticky="ew", pady=3)
 
         # -- persistent click-result line (last click's outcome, e.g. "point
         # goal set at world (x, z)" or "click ignored: no valid depth
-        # there") -- stays visible after the confirm panel above closes. -- #
+        # there") -- stays visible after the confirm panel above closes.
+        # This row absorbs leftover sidebar height so the stack above stays
+        # top-anchored instead of the whole sidebar floating mid-window. -- #
+        footer_row = row
+        sidebar.grid_rowconfigure(footer_row, weight=1)
         self.click_status_label = ctk.CTkLabel(
-            content,
+            sidebar,
             text="",
-            anchor="w",
+            anchor="n",
             font=ctk.CTkFont(size=11),
             text_color="#9ca3af",
+            wraplength=self.SIDEBAR_MIN_W - 20,
         )
-        self.click_status_label.pack(fill="x", padx=14, pady=(0, 8))
+        self.click_status_label.grid(
+            row=footer_row, column=0, sticky="new", padx=4, pady=(8, 0)
+        )
 
-        self._photo = None
         self.root.after(REFRESH_MS, self.refresh)
+
+    # ---------------- dynamic sizing ---------------- #
+    def _on_plot_configure(self, event) -> None:
+        # Keep the body-frame canvas square, tracking the sidebar's current
+        # width (clamped) instead of a fixed pixel size baked in at startup.
+        new_size = max(self.PLOT_MIN, min(int(event.width), self.PLOT_MAX))
+        if abs(new_size - self._plot_size) > 2:
+            self._plot_size = new_size
+            self.plot.configure(height=new_size)
 
     # ---------------- commands ---------------- #
     def resolve_goal(self) -> None:
@@ -367,8 +417,16 @@ class NavGuiApp:
 
     # ---------------- click-to-goal ---------------- #
     def on_cam_click(self, event) -> None:
-        nx = min(max(event.x / self.CAM_SIZE, 0.0), 1.0)
-        ny = min(max(event.y / self.CAM_SIZE, 0.0), 1.0)
+        # The camera frame is letterboxed into cam_canvas (see _draw_camera),
+        # so a click has to be mapped through the last-drawn image's actual
+        # on-canvas box, not the canvas's own (possibly wider/taller) bounds.
+        if self._cam_img_box is None:
+            return
+        x0, y0, x1, y1 = self._cam_img_box
+        if not (x0 <= event.x <= x1 and y0 <= event.y <= y1):
+            return
+        nx = min(max((event.x - x0) / (x1 - x0), 0.0), 1.0)
+        ny = min(max((event.y - y0) / (y1 - y0), 0.0), 1.0)
         self._pending_click_norm = (nx, ny)
 
     def confirm_pixel_goal(self) -> None:
@@ -418,12 +476,7 @@ class NavGuiApp:
         d = self.controller.snapshot()
 
         if d.vis_rgb is not None:
-            img = Image.fromarray(d.vis_rgb).convert("RGB")
-            img = img.resize((self.CAM_SIZE, self.CAM_SIZE))
-            if self._pending_click_norm is not None:
-                img = self._draw_pending_click(img)
-            self._photo = ImageTk.PhotoImage(img)
-            self.cam_label.configure(image=self._photo)
+            self._draw_camera(d.vis_rgb)
 
         self._draw_plot(d)
         self._sync_seg_panel(d)
@@ -456,10 +509,10 @@ class NavGuiApp:
 
         alive = self.controller.is_alive()
         if not alive and not self._alive_label_visible:
-            self.alive_label.pack(fill="x", padx=10, pady=(0, 8))
+            self.alive_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
             self._alive_label_visible = True
         elif alive and self._alive_label_visible:
-            self.alive_label.pack_forget()
+            self.alive_label.grid_forget()
             self._alive_label_visible = False
 
         self.root.after(REFRESH_MS, self.refresh)
@@ -467,10 +520,10 @@ class NavGuiApp:
     def _sync_seg_panel(self, d) -> None:
         in_review = d.mode == MODE_REVIEW_SEGMENTATION
         if in_review and not self._seg_panel_visible:
-            self.seg_panel.pack(fill="x", padx=10, pady=4)
+            self.seg_panel.grid(row=self._seg_row, column=0, sticky="ew", pady=(8, 0))
             self._seg_panel_visible = True
         elif not in_review and self._seg_panel_visible:
-            self.seg_panel.pack_forget()
+            self.seg_panel.grid_forget()
             self._seg_panel_visible = False
         if in_review:
             self.seg_desc_label.configure(text=d.status_text)
@@ -478,20 +531,43 @@ class NavGuiApp:
     def _sync_click_panel(self) -> None:
         pending = self._pending_click_norm is not None
         if pending and not self._click_panel_visible:
-            self.click_panel.pack(fill="x", padx=10, pady=4)
+            self.click_panel.grid(
+                row=self._click_row, column=0, sticky="ew", pady=(8, 0)
+            )
             self._click_panel_visible = True
         elif not pending and self._click_panel_visible:
-            self.click_panel.pack_forget()
+            self.click_panel.grid_forget()
             self._click_panel_visible = False
 
-    def _draw_pending_click(self, img: Image.Image) -> Image.Image:
+    def _draw_camera(self, vis_rgb) -> None:
+        # Letterbox the (possibly non-square) frame into whatever size the
+        # hero canvas currently is, so the view actually scales with the
+        # window instead of sitting at a fixed pixel size.
+        cw = self.cam_canvas.winfo_width()
+        ch = self.cam_canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        img = Image.fromarray(vis_rgb).convert("RGB")
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih)
+        dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        img = img.resize((dw, dh))
+        if self._pending_click_norm is not None:
+            img = self._draw_pending_click(img, dw, dh)
+        self._cam_photo = ImageTk.PhotoImage(img)
+        x0, y0 = (cw - dw) // 2, (ch - dh) // 2
+        self.cam_canvas.delete("frame")
+        self.cam_canvas.create_image(x0, y0, anchor="nw", image=self._cam_photo, tags="frame")
+        self._cam_img_box = (x0, y0, x0 + dw, y0 + dh)
+
+    def _draw_pending_click(self, img: Image.Image, dw: int, dh: int) -> Image.Image:
         # Not-yet-confirmed marker at the last click, cyan to read as distinct
         # from the gold confirmed-goal marker the controller reprojects into
         # vis_rgb every frame once a click is confirmed (rover_controller's
         # draw_point_marker).
         nx, ny = self._pending_click_norm
-        x, y = nx * self.CAM_SIZE, ny * self.CAM_SIZE
-        r = 10
+        x, y = nx * dw, ny * dh
+        r = max(6, min(dw, dh) // 48)
         draw = ImageDraw.Draw(img)
         draw.line([(x - r, y), (x + r, y)], fill="#00e5ff", width=2)
         draw.line([(x, y - r), (x, y + r)], fill="#00e5ff", width=2)
@@ -500,7 +576,7 @@ class NavGuiApp:
 
     def _draw_plot(self, d) -> None:
         self.plot.delete("all")
-        S, R = self.PLOT_SIZE, self.PLOT_RANGE
+        S, R = self._plot_size, self.PLOT_RANGE
 
         def to_px(
             forward, left
