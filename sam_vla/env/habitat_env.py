@@ -143,6 +143,16 @@ class MarsHabitatEnv:
                 mesh_id: obj.translation
                 for mesh_id, obj in self._annotation_objects.items()
             }
+            # Hidden by default (rather than onstage/visible, as
+            # register_annotation_meshes leaves them) -- callers outside the
+            # run_segmentation_sweep capture path (e.g. nav/rover_controller's
+            # live loop, which only ever calls get_observation, never
+            # get_full_observation's hide/show dance) must never have these
+            # meshes leak into a frame unless they explicitly ask for one via
+            # get_mesh_overlay_rgb.
+            set_objects_hidden(
+                self._annotation_objects, self._annotation_onstage, hidden=True
+            )
 
         self._registry.start_all()
         return self
@@ -169,6 +179,29 @@ class MarsHabitatEnv:
         yaw = float(quaternion.as_rotation_vector(state.rotation)[1])
         pose = Pose(x=x, y=float(state.position[1]), z=z, yaw=yaw)
         return Observation(rgb=rgb, depth=depth, pose=pose, frame_idx=frame_idx)
+
+    def get_mesh_overlay_rgb(self) -> Optional[np.ndarray]:
+        """RGB captured with the annotation hull meshes visible in the color
+        pass -- i.e. the inverse of get_full_observation's Pass A, and the
+        same composited appearance the mesh_tight_bound2-trained LoRA
+        segmentation checkpoint (sam_lora_runs/exp10) was trained against.
+        For feeding a segmentation model only: never returned by
+        get_observation/get_full_observation, so it never reaches the GUI,
+        the VLM, or anything else that treats a frame as "what the rover
+        sees". Returns None if no annotations_dir was configured. Meshes are
+        restored to hidden before returning, matching this env's resting
+        state (see __enter__)."""
+        if not self._annotation_objects:
+            return None
+        set_objects_hidden(
+            self._annotation_objects, self._annotation_onstage, hidden=False
+        )
+        obs = self._sim.get_sensor_observations()
+        rgb, _depth = rgb_depth(obs)
+        set_objects_hidden(
+            self._annotation_objects, self._annotation_onstage, hidden=True
+        )
+        return rgb
 
     def get_full_observation(self, frame_idx: int) -> Observation:
         """Returns rgb+depth+pose (as get_observation does) AND the semantic

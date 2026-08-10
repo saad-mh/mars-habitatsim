@@ -560,6 +560,11 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         navdp_upstream_replan_every=args.navdp_upstream_replan_every,
         random_goal_bearing_deg=args.random_goal_bearing_deg,
         random_goal_dist_range=(args.random_goal_min_dist, args.random_goal_max_dist),
+        seg_backend=args.seg_backend,
+        seg_checkpoint=args.seg_checkpoint,
+        seg_overlay=args.seg_overlay,
+        annotations_dir=args.annotations_dir,
+        annotation_categories=args.annotation_categories,
     )
 
 
@@ -612,6 +617,41 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--random-goal-bearing-deg", type=float, default=60.0)
     ap.add_argument("--random-goal-min-dist", type=float, default=4.0)
     ap.add_argument("--random-goal-max-dist", type=float, default=8.0)
+    ap.add_argument(
+        "--seg-backend",
+        choices=["lora", "legacy"],
+        default="lora",
+        help="segmentation checkpoint used by 'Segment' goal resolution: 'lora' (default) is "
+        "sam_lora_runs/exp10/best, LoRA-finetuned on mesh_tight_bound2-overlay frames; "
+        "'legacy' is the original single-checkpoint model (best_model.pth)",
+    )
+    ap.add_argument(
+        "--seg-checkpoint",
+        default=None,
+        help="override the checkpoint path (legacy: a .pth file) or dir (lora: a "
+        "finetune_sam2_lora.py out-dir, e.g. sam_lora_runs/exp10/best) for --seg-backend",
+    )
+    ap.add_argument(
+        "--seg-overlay",
+        choices=["mesh", "none"],
+        default="mesh",
+        help="'mesh' (default) composites --annotations-dir's hull meshes into a separate "
+        "frame fed only to the segmentation model, matching what the default lora checkpoint "
+        "was trained on -- never shown in the GUI or sent to the goal-selection VLM. "
+        "'none' segments the plain camera frame",
+    )
+    ap.add_argument(
+        "--annotations-dir",
+        default=str(REPO_ROOT / "annotations" / "mesh_tight_bound2"),
+        help="hull-mesh annotation dir used by --seg-overlay=mesh (default: "
+        "annotations/mesh_tight_bound2, the dataset sam_lora_runs/exp10 was trained on)",
+    )
+    ap.add_argument(
+        "--annotation-categories",
+        nargs="+",
+        default=None,
+        help="restrict --seg-overlay=mesh to these hull categories (default: all)",
+    )
     return ap.parse_args(argv)
 
 

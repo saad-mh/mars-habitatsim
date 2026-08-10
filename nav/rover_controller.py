@@ -61,7 +61,8 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -102,6 +103,14 @@ MODE_REVIEW_SEGMENTATION = "review_segmentation"
 
 # Ground-truth distance at which a point goal counts as reached
 POINT_GOAL_REACHED_M = 0.7
+
+# Default annotations dir for seg_overlay="mesh" -- the dataset
+# sam_lora_runs/exp10 (the default seg_backend="lora" checkpoint) was
+# trained against. Repo-relative so this holds regardless of caller cwd,
+# same convention nav/gui.py's REPO_ROOT uses.
+DEFAULT_ANNOTATIONS_DIR = str(
+    Path(__file__).resolve().parent.parent / "annotations" / "mesh_tight_bound2"
+)
 
 
 @dataclass
@@ -166,6 +175,11 @@ class RoverController:
         world_margin: float = 2.0,
         random_goal_bearing_deg: float = 60.0,
         random_goal_dist_range: tuple = (4.0, 8.0),
+        seg_backend: str = "lora",
+        seg_checkpoint: Optional[str] = None,
+        seg_overlay: str = "mesh",
+        annotations_dir: Optional[str] = DEFAULT_ANNOTATIONS_DIR,
+        annotation_categories: Optional[Sequence[str]] = None,
     ):
         self.scene_path = scene_path
         self.heightmap_path = heightmap_path
@@ -204,6 +218,20 @@ class RoverController:
         self.random_goal_bearing_deg = float(random_goal_bearing_deg)
         self.random_goal_dist_range = tuple(random_goal_dist_range)
         self.world_limit = max(SIZE_X, SIZE_Z) / 2.0 - float(world_margin)
+
+        # Segmentation backend used by the "resolve" mode's SAM2 detection
+        # (see first_frame_resolver._detect): which checkpoint, and whether
+        # to feed it a mesh-overlay frame (see _do_resolve /
+        # MarsHabitatEnv.get_mesh_overlay_rgb) instead of the plain camera
+        # frame -- the overlay is only ever handed to the segmentation
+        # model, never shown in the GUI or sent to the goal-selection VLM.
+        self.seg_backend = seg_backend
+        self.seg_checkpoint = seg_checkpoint
+        self.seg_overlay = seg_overlay
+        self.annotations_dir = (
+            annotations_dir if self.seg_overlay == "mesh" else None
+        )
+        self.annotation_categories = annotation_categories
 
         self._lock = threading.RLock()
         self._running = False
@@ -337,6 +365,8 @@ class RoverController:
                 start_yaw=math.radians(self.start_yaw_deg),
                 with_semantic=True,
                 rock_field_path=self.rock_field_path,
+                annotations_dir=self.annotations_dir,
+                annotation_categories=self.annotation_categories,
             ) as env:
                 self._env_loop(env)
         except Exception as exc:  # pragma: no cover - surfaced to the GUI, not raised
@@ -651,9 +681,17 @@ class RoverController:
         self, env, step, mask_dir, goal_objects, obstacle_objects, current_goal_spec
     ):
         obs_r = env.get_observation(frame_idx=step)
+        # detect_rgb (if any) is a separate frame with the mesh_tight_bound2
+        # annotation hulls composited in, fed only to the segmentation
+        # model -- obs_r.rgb (the plain camera frame) is what the VLM sees
+        # and what the GUI/backprojection use, unmodified.
+        detect_rgb = env.get_mesh_overlay_rgb() if self.seg_overlay == "mesh" else None
         try:
             goal_spec_r, _vlm_result, _dets = first_frame_resolver.resolve_verbose(
-                obs_r.rgb
+                obs_r.rgb,
+                detect_rgb=detect_rgb,
+                backend=self.seg_backend,
+                checkpoint_path=self.seg_checkpoint,
             )
         except Exception as exc:
             with self._lock:
