@@ -5,7 +5,6 @@ import io
 import json
 import math
 import os
-import re
 import socket
 import subprocess
 import sys
@@ -261,6 +260,8 @@ def start_server(args: argparse.Namespace) -> Optional[subprocess.Popen[Any]]:
         str(args.safe_distance),
         "--hard-collision-distance",
         str(args.hard_collision_distance),
+        "--robot-radius",
+        str(args.robot_radius),
         "--safety-weight",
         str(args.safety_weight),
         "--barrier-weight",
@@ -881,13 +882,6 @@ def parser() -> argparse.ArgumentParser:
     argument_parser = argparse.ArgumentParser(
         description="One-file released NavDP + in-denoising S2Diff Mars rollout"
     )
-    # None of this parser's option strings look like negative numbers, so widen
-    # argparse's built-in negative-number detector past its default
-    # ^-\d+$|^-\d*\.\d+$ regex. Without this, compound values like the
-    # "-0.35,0.0" passed to --obstacle-velocity-xz (nargs="*") are misclassified
-    # as an unknown option instead of the argument's value, since the comma
-    # makes them fail the strict single-number pattern.
-    argument_parser._negative_number_matcher = re.compile(r"^-\d.*$")
     argument_parser.add_argument("--navdp-root", required=True)
     argument_parser.add_argument("--navdp-checkpoint", required=True)
     argument_parser.add_argument("--navdp-python", default=sys.executable)
@@ -957,7 +951,7 @@ def parser() -> argparse.ArgumentParser:
         "--robot-radius",
         type=float,
         default=0.24,
-        help="Planar robot footprint radius used only for method-independent evaluation.",
+        help="Planar rover footprint radius used by both guidance and evaluation.",
     )
     argument_parser.add_argument(
         "--evaluation-layout",

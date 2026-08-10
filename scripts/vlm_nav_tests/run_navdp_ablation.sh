@@ -35,6 +35,7 @@ OBSTACLE_UV="${OBSTACLE_UV:-0.50,0.68}"
 # K=4 preserves both circulation directions while being cheaper than K=16/24.
 MAIN_CANDIDATES="${MAIN_CANDIDATES:-4}"
 PARTICLES="${PARTICLES:-8}"
+ROBOT_RADIUS="${ROBOT_RADIUS:-0.24}"
 
 for required_file in \
     "${HABITAT_PYTHON}" \
@@ -78,6 +79,8 @@ COMMON=(
     --temperature 0.25
     --particle-std 0.28
     --particles "${PARTICLES}"
+    --robot-radius "${ROBOT_RADIUS}"
+
     --max-steps "${MAX_STEPS}"
 )
 

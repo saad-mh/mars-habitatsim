@@ -91,16 +91,20 @@ class NavGuiApp:
 
         # Start maximized so the layout below (sized entirely off grid
         # weights, not fixed pixel panels) actually gets the whole screen to
-        # lay out into -- fall back by platform since "zoomed" and the
-        # "-zoomed" attribute aren't both supported everywhere.
+        # lay out into. Always set an explicit near-full-screen geometry
+        # first -- window managers that ignore "zoomed"/"-zoomed" (or a
+        # WM-less display) would otherwise silently leave the window at its
+        # small natural size -- then best-effort request a true maximize on
+        # top of that for the window managers that do support it.
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{int(sw * 0.95)}x{int(sh * 0.9)}")
         try:
             root.state("zoomed")
         except tk.TclError:
             try:
                 root.attributes("-zoomed", True)
             except tk.TclError:
-                sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-                root.geometry(f"{int(sw * 0.95)}x{int(sh * 0.9)}")
+                pass
 
         # Single root-level grid: a hero camera column that soaks up most of
         # the width/height, and a sidebar column that stacks every control
@@ -125,7 +129,7 @@ class NavGuiApp:
         self.cam_canvas.bind("<Button-1>", self.on_cam_click)
         ctk.CTkLabel(
             cam_frame,
-            text="click the view to set a goal point",
+            text="click to set a goal point",
             font=ctk.CTkFont(size=11),
             text_color="#9ca3af",
         ).grid(row=1, column=0, pady=(0, 6))
@@ -134,10 +138,15 @@ class NavGuiApp:
         # state-only review panels stacked in one column so no section sits
         # next to unused horizontal space. Footer row absorbs any leftover
         # vertical space instead of the panels floating in a tall empty
-        # window. -- #
-        sidebar = ctk.CTkFrame(root, fg_color="transparent")
+        # window. Scrollable (not a plain frame): with both state-only
+        # panels able to appear, the stack can exceed a short monitor's
+        # height, and a plain grid silently clips overflow off the bottom
+        # of the window with no way to reach it -- this keeps every control
+        # reachable while still laying out edge-to-edge the rest of the time.
+        sidebar = ctk.CTkScrollableFrame(root, fg_color="transparent")
         sidebar.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
         sidebar.grid_columnconfigure(0, weight=1)
+        self.sidebar = sidebar
 
         row = 0
 
@@ -319,9 +328,7 @@ class NavGuiApp:
         # pending confirmation. -- #
         self._click_row = row
         row += 1
-        self.click_panel = ctk.CTkFrame(
-            sidebar, border_width=2, border_color="#00b8d4"
-        )
+        self.click_panel = ctk.CTkFrame(sidebar, border_width=2, border_color="#00b8d4")
         self.click_desc_label = ctk.CTkLabel(
             self.click_panel,
             text="Set the goal at the point you clicked?",
@@ -370,6 +377,23 @@ class NavGuiApp:
         self.root.after(REFRESH_MS, self.refresh)
 
     # ---------------- dynamic sizing ---------------- #
+    def _scroll_sidebar_to_bottom(self) -> None:
+        # The review/click-confirm panels grid in near the bottom of the
+        # sidebar stack; on a short window the sidebar scrolls (see the
+        # CTkScrollableFrame comment above) rather than clipping content, so
+        # jump the scroll position down as soon as one appears instead of
+        # leaving an action-required panel to be found by accident. Deferred
+        # one tick since the panel's own .grid() call hasn't been laid out
+        # (and the scrollregion hasn't grown to include it) yet this frame.
+        self.root.after_idle(lambda: self.sidebar._parent_canvas.yview_moveto(1.0))
+
+    def _scroll_sidebar_to_top(self) -> None:
+        # Mirror of _scroll_sidebar_to_bottom for when a review/confirm
+        # panel closes -- without this the sidebar stays scrolled down to
+        # where that panel was, hiding the always-visible plot/status/goal
+        # sections above it until the user notices and scrolls back up.
+        self.root.after_idle(lambda: self.sidebar._parent_canvas.yview_moveto(0.0))
+
     def _on_plot_configure(self, event) -> None:
         # Keep the body-frame canvas square, tracking the sidebar's current
         # width (clamped) instead of a fixed pixel size baked in at startup.
@@ -522,9 +546,11 @@ class NavGuiApp:
         if in_review and not self._seg_panel_visible:
             self.seg_panel.grid(row=self._seg_row, column=0, sticky="ew", pady=(8, 0))
             self._seg_panel_visible = True
+            self._scroll_sidebar_to_bottom()
         elif not in_review and self._seg_panel_visible:
             self.seg_panel.grid_forget()
             self._seg_panel_visible = False
+            self._scroll_sidebar_to_top()
         if in_review:
             self.seg_desc_label.configure(text=d.status_text)
 
@@ -535,9 +561,11 @@ class NavGuiApp:
                 row=self._click_row, column=0, sticky="ew", pady=(8, 0)
             )
             self._click_panel_visible = True
+            self._scroll_sidebar_to_bottom()
         elif not pending and self._click_panel_visible:
             self.click_panel.grid_forget()
             self._click_panel_visible = False
+            self._scroll_sidebar_to_top()
 
     def _draw_camera(self, vis_rgb) -> None:
         # Letterbox the (possibly non-square) frame into whatever size the
@@ -557,7 +585,9 @@ class NavGuiApp:
         self._cam_photo = ImageTk.PhotoImage(img)
         x0, y0 = (cw - dw) // 2, (ch - dh) // 2
         self.cam_canvas.delete("frame")
-        self.cam_canvas.create_image(x0, y0, anchor="nw", image=self._cam_photo, tags="frame")
+        self.cam_canvas.create_image(
+            x0, y0, anchor="nw", image=self._cam_photo, tags="frame"
+        )
         self._cam_img_box = (x0, y0, x0 + dw, y0 + dh)
 
     def _draw_pending_click(self, img: Image.Image, dw: int, dh: int) -> Image.Image:
@@ -681,9 +711,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         "needed for the CBF safety layer's generic obstacle/avoidance math, unrelated to which "
         "driving policy is active",
     )
-    ap.add_argument("--start-x", type=float, default=8.0)  # 7.1
-    ap.add_argument("--start-z", type=float, default=10.0)  # 7.7
-    ap.add_argument("--start-yaw", type=float, default=0.0, help="degrees")  # 34
+    ap.add_argument("--start-x", type=float, default=7.1)  # 7.1, 7.6, 2.2, 7.5
+    ap.add_argument("--start-z", type=float, default=7.7)  # 7.7, 7.1, -1.9, 6.9
+    ap.add_argument(
+        "--start-yaw", type=float, default=34.0, help="degrees"
+    )  # 34, 41, 161, 34
     ap.add_argument("--dt", type=float, default=0.1)
     ap.add_argument("--hz", type=float, default=10.0, help="controller tick rate")
     ap.add_argument("--max-linear", type=float, default=0.6)
