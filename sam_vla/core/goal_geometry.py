@@ -32,6 +32,14 @@ MESH_OBST_ID = 2
 # distinct from MESH_GOAL_ID/MESH_OBST_ID, which mark the *chosen* goal/obstacles.
 ROCK_SEMANTIC_ID = 3
 
+# Semantic id for decorative flag markers (sam_vla.env.flag_placement) -- render-only,
+# never a goal/obstacle candidate, distinct from ROCK_SEMANTIC_ID.
+FLAG_SEMANTIC_ID = 4
+
+# Semantic id for the ghost home-base marker (sam_vla.env.home_base) -- render-only,
+# non-collidable, never a goal/obstacle candidate, distinct from FLAG_SEMANTIC_ID.
+HOME_BASE_SEMANTIC_ID = 5
+
 
 def intrinsics_from_hfov(height: int, width: int, hfov_deg: float) -> dict[str, float]:
     """Pinhole intrinsics (fx, fy, cx, cy) for a symmetric camera with the given

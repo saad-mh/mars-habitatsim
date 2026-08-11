@@ -10,10 +10,23 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
-from sam_vla.core.goal_geometry import MESH_GOAL_ID, MESH_OBST_ID, ROCK_SEMANTIC_ID
+from sam_vla.core.goal_geometry import (
+    FLAG_SEMANTIC_ID,
+    HOME_BASE_SEMANTIC_ID,
+    MESH_GOAL_ID,
+    MESH_OBST_ID,
+    ROCK_SEMANTIC_ID,
+)
 from sam_vla.env.sim_utils import register_semantic_mesh
 
-RESERVED_SEMANTIC_IDS = {0, MESH_GOAL_ID, MESH_OBST_ID, ROCK_SEMANTIC_ID}
+RESERVED_SEMANTIC_IDS = {
+    0,
+    MESH_GOAL_ID,
+    MESH_OBST_ID,
+    ROCK_SEMANTIC_ID,
+    FLAG_SEMANTIC_ID,
+    HOME_BASE_SEMANTIC_ID,
+}
 
 # Annotation hulls are terrain-following patches whose vertices already sit
 # exactly at the heightmap's sampled ground height -- coplanar with the real

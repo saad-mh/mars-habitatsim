@@ -111,6 +111,16 @@ def summarize(path: Path, deadlock_speed: float, deadlock_frames: int) -> dict[s
             clearance_source = "legacy_planner_prediction"
             clearance = optional_array(data, "selected_minimum_clearance", length, np.nan)
         clearance = clearance[np.isfinite(clearance) & (clearance >= 0.0)]
+        guidance_correction = optional_array(
+            data, "mean_guidance_noise_correction", length, np.nan
+        )
+        guidance_correction = guidance_correction[np.isfinite(guidance_correction)]
+        effective_sample_size = optional_array(
+            data, "mean_final_effective_sample_size", length, np.nan
+        )
+        effective_sample_size = effective_sample_size[
+            np.isfinite(effective_sample_size)
+        ]
 
         collisions = optional_array(data, "geometric_collision", length).astype(bool)
         collision = bool(collisions.any())
@@ -164,6 +174,14 @@ def summarize(path: Path, deadlock_speed: float, deadlock_frames: int) -> dict[s
             "mode_switch_count": float(sign_switches),
             "minimum_clearance_m": float(clearance.min()) if clearance.size else np.nan,
             "mean_clearance_m": float(clearance.mean()) if clearance.size else np.nan,
+            "mean_guidance_correction": (
+                float(guidance_correction.mean()) if guidance_correction.size else np.nan
+            ),
+            "mean_particle_ess": (
+                float(effective_sample_size.mean())
+                if effective_sample_size.size
+                else np.nan
+            ),
             "latency_p50_ms": (
                 float(np.percentile(latency, 50) * 1000.0) if latency.size else np.nan
             ),
@@ -330,6 +348,8 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         ("minimum_clearance_m_mean", "min_clear"),
         ("path_efficiency_mean", "path_eff"),
         ("latency_p50_ms_mean", "p50_ms"),
+        ("mean_guidance_correction_mean", "guide_rms"),
+        ("mean_particle_ess_mean", "ESS"),
     ]
     print("  ".join(f"{title:>11}" for _, title in columns))
     for row in rows:

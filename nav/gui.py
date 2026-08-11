@@ -316,7 +316,8 @@ class NavGuiApp:
         # currently halted, so this is a no-op the rest of the time.
         for key, angle in UNCERTAINTY_HEADING_KEYS.items():
             root.bind(
-                f"<KeyPress-{key}>", lambda e, a=angle: self.submit_uncertainty_heading(a)
+                f"<KeyPress-{key}>",
+                lambda e, a=angle: self.submit_uncertainty_heading(a),
             )
         root.bind("<KeyPress-r>", lambda e: self.retry_uncertainty())
         root.bind("<KeyPress-R>", lambda e: self.retry_uncertainty())
@@ -798,6 +799,10 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         navdp_upstream_root=args.navdp_upstream_root,
         navdp_root=args.navdp_root,
         rock_field_path=args.rock_field,
+        flag_seed=args.flag_seed,
+        num_flags=args.num_flags,
+        flag_min_spacing=args.flag_min_spacing,
+        flag_boundary_margin=args.flag_boundary_margin,
         start_x=args.start_x,
         start_z=args.start_z,
         start_yaw_deg=args.start_yaw,
@@ -839,6 +844,32 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--rock-field", default=None, help="rock_field.json manifest (optional)"
+    )
+    ap.add_argument(
+        "--flag-seed",
+        type=int,
+        default=None,
+        help="enable randomized flag-marker placement (assets/flags/*.glb) seeded with "
+        "this value -- same seed gives the same layout every run; unset (default) "
+        "places no flags",
+    )
+    ap.add_argument(
+        "--num-flags",
+        type=int,
+        default=6,
+        help="flags to place when --flag-seed is set",
+    )
+    ap.add_argument(
+        "--flag-min-spacing",
+        type=float,
+        default=1.5,
+        help="minimum meters between placed flags",
+    )
+    ap.add_argument(
+        "--flag-boundary-margin",
+        type=float,
+        default=2.0,
+        help="keep placed flags this many meters clear of the scene bounds",
     )
     ap.add_argument(
         "--navdp-upstream-ckpt",

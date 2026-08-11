@@ -25,6 +25,7 @@ HERE = Path(__file__).resolve().parent
 SIZE_X = 50.0
 SIZE_Z = 50.0
 SIZE_Y = 4.820803273566
+MESH_GOAL_ID = 10000
 MESH_OBSTACLE_ID = 2
 
 
@@ -45,6 +46,7 @@ class NavDPS2DiffOutput:
     mean_guidance_noise_correction: float
     final_guidance_noise_correction: float
     maximum_guidance_noise_correction: float
+    mean_final_effective_sample_size: float
 
 
 class NavDPS2DiffClient:
@@ -167,6 +169,9 @@ class NavDPS2DiffClient:
             ),
             maximum_guidance_noise_correction=float(
                 diagnostics["maximum_guidance_noise_correction"][0]
+            ),
+            mean_final_effective_sample_size=float(
+                diagnostics.get("mean_final_effective_sample_size", [0.0])[0]
             ),
         )
 
@@ -293,6 +298,15 @@ def start_server(args: argparse.Namespace) -> Optional[subprocess.Popen[Any]]:
         "--maximum-obstacle-pixels",
         str(args.maximum_obstacle_pixels),
     ]
+    particle_flags = {
+        "particle-anchor": args.particle_anchor,
+        "particle-energy-reweighting": args.particle_energy_reweighting,
+        "particle-collision-mask": args.particle_collision_mask,
+        "particle-noise-schedule": args.particle_noise_schedule,
+        "progressive-guidance": args.progressive_guidance,
+    }
+    for name, enabled in particle_flags.items():
+        command.append(f"--{name}" if enabled else f"--no-{name}")
     command.append("--remove-critic" if args.remove_critic else "--no-remove-critic")
     print("[server]", " ".join(command), flush=True)
     process = subprocess.Popen(command, cwd=str(server_dir))
@@ -574,8 +588,32 @@ def depth_patch_mesh(
     return np.asarray(vertices, dtype=np.float64), np.asarray(faces, dtype=np.int64)
 
 
-def save_obj(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
+def save_obj(
+    path: Path,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    diffuse_rgb: Optional[tuple[float, float, float]] = None,
+) -> None:
+    material_name = None
+    if diffuse_rgb is not None:
+        red, green, blue = (float(value) for value in diffuse_rgb)
+        if not all(0.0 <= value <= 1.0 for value in (red, green, blue)):
+            raise ValueError("OBJ diffuse material values must be in [0, 1]")
+        material_name = "mesh_material"
+        material_path = path.with_suffix(".mtl")
+        with material_path.open("w", encoding="utf-8") as material:
+            material.write(f"newmtl {material_name}\n")
+            material.write(f"Ka {0.25 * red:.4f} {0.25 * green:.4f} {0.25 * blue:.4f}\n")
+            material.write(f"Kd {red:.4f} {green:.4f} {blue:.4f}\n")
+            material.write("Ks 0.1000 0.1000 0.1000\n")
+            material.write("Ns 24.0000\n")
+            material.write("d 1.0000\n")
+            material.write("illum 2\n")
     with path.open("w", encoding="utf-8") as file:
+        if material_name is not None:
+            file.write(f"mtllib {path.with_suffix('.mtl').name}\n")
+            file.write(f"usemtl {material_name}\n")
         for x, y, z in vertices:
             file.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
         for a, b, c in faces:
@@ -600,6 +638,127 @@ def register_semantic_mesh(
     obstacle.collidable = False
     obstacle.semantic_id = int(semantic_id)
     return obstacle
+
+
+def parse_world_xz(specification: str) -> tuple[float, float]:
+    values = [float(value) for value in str(specification).split(",")]
+    if len(values) != 2 or not np.isfinite(values).all():
+        raise ValueError(
+            f"world mesh position must be finite X,Z, got {specification!r}"
+        )
+    return values[0], values[1]
+
+
+def world_box_mesh(
+    center_x: float,
+    base_y: float,
+    center_z: float,
+    half_extent: float,
+    height: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create a closed axis-aligned box whose vertices are in world coordinates."""
+
+    if half_extent <= 0.0 or height <= 0.0:
+        raise ValueError("box half extent and height must be positive")
+    x0, x1 = center_x - half_extent, center_x + half_extent
+    z0, z1 = center_z - half_extent, center_z + half_extent
+    y0, y1 = base_y, base_y + height
+    vertices = np.asarray(
+        [
+            [x0, y0, z0],
+            [x1, y0, z0],
+            [x1, y0, z1],
+            [x0, y0, z1],
+            [x0, y1, z0],
+            [x1, y1, z0],
+            [x1, y1, z1],
+            [x0, y1, z1],
+        ],
+        dtype=np.float64,
+    )
+    faces = np.asarray(
+        [
+            [0, 2, 1], [0, 3, 2],
+            [4, 5, 6], [4, 6, 7],
+            [0, 1, 5], [0, 5, 4],
+            [1, 2, 6], [1, 6, 5],
+            [2, 3, 7], [2, 7, 6],
+            [3, 0, 4], [3, 4, 7],
+        ],
+        dtype=np.int64,
+    )
+    return vertices, faces
+
+
+def place_world_obstacle_meshes(
+    simulator: Any,
+    terrain: Any,
+    xz_specifications: Sequence[str],
+    output_directory: Path,
+    *,
+    half_extent: float,
+    height: float,
+) -> tuple[list[Any], list[np.ndarray], list[np.ndarray]]:
+    """Place static obstacle boxes at exact world X,Z coordinates."""
+
+    mesh_directory = output_directory / "meshes"
+    mesh_directory.mkdir(parents=True, exist_ok=True)
+    objects: list[Any] = []
+    centroids: list[np.ndarray] = []
+    geometries: list[np.ndarray] = []
+    for index, specification in enumerate(xz_specifications):
+        center_x, center_z = parse_world_xz(specification)
+        base_y = terrain.local_height_max(center_x, center_z, half_extent)
+        vertices, faces = world_box_mesh(
+            center_x, base_y, center_z, half_extent, height
+        )
+        mesh_path = mesh_directory / f"world_obstacle_{index}.obj"
+        save_obj(
+            mesh_path, vertices, faces, diffuse_rgb=(0.78, 0.16, 0.06)
+        )
+        semantic_id = MESH_OBSTACLE_ID + index
+        objects.append(register_semantic_mesh(simulator, mesh_path, semantic_id))
+        centroid = vertices.mean(axis=0).astype(np.float32)
+        centroids.append(centroid)
+        geometries.append(vertices[faces][:, :, [0, 2]].astype(np.float64))
+        print(
+            f"[world-mesh] obstacle={index} semantic_id={semantic_id} "
+            f"center_xz={[center_x, center_z]} half_extent={half_extent:.3f} "
+            f"height={height:.3f}",
+            flush=True,
+        )
+    return objects, centroids, geometries
+
+
+def place_world_goal_mesh(
+    simulator: Any,
+    terrain: Any,
+    goal_x: float,
+    goal_z: float,
+    output_directory: Path,
+    *,
+    half_extent: float,
+    height: float,
+) -> Any:
+    """Place a visible, non-obstacle semantic goal marker at the exact goal."""
+
+    base_y = terrain.local_height_max(goal_x, goal_z, half_extent)
+    vertices, faces = world_box_mesh(
+        goal_x, base_y, goal_z, half_extent, height
+    )
+    mesh_directory = output_directory / "meshes"
+    mesh_directory.mkdir(parents=True, exist_ok=True)
+    mesh_path = mesh_directory / "goal_marker.obj"
+    save_obj(
+        mesh_path, vertices, faces, diffuse_rgb=(0.08, 0.85, 0.18)
+    )
+    goal_object = register_semantic_mesh(simulator, mesh_path, MESH_GOAL_ID)
+    print(
+        f"[world-mesh] goal semantic_id={MESH_GOAL_ID} "
+        f"center_xz={[goal_x, goal_z]}",
+        flush=True,
+    )
+    return goal_object
 
 
 def parse_uv_fraction(specification: str, width: int, height: int) -> tuple[float, float]:
@@ -858,15 +1017,21 @@ def wrap_angle(angle: float) -> float:
 
 
 def overlay_frame(
-    rgb: np.ndarray, goal_mask: np.ndarray, obstacle_mask: np.ndarray, text: str
+    rgb: np.ndarray,
+    goal_mask: np.ndarray,
+    obstacle_mask: np.ndarray,
+    text: str,
+    *,
+    show_masks: bool,
 ) -> Image.Image:
     output = np.asarray(rgb, dtype=np.uint8).copy()
-    output[goal_mask > 0] = (
-        0.35 * output[goal_mask > 0] + 0.65 * np.asarray([0, 255, 0])
-    ).astype(np.uint8)
-    output[obstacle_mask > 0] = (
-        0.35 * output[obstacle_mask > 0] + 0.65 * np.asarray([255, 0, 0])
-    ).astype(np.uint8)
+    if show_masks:
+        output[goal_mask > 0] = (
+            0.35 * output[goal_mask > 0] + 0.65 * np.asarray([0, 255, 0])
+        ).astype(np.uint8)
+        output[obstacle_mask > 0] = (
+            0.35 * output[obstacle_mask > 0] + 0.65 * np.asarray([255, 0, 0])
+        ).astype(np.uint8)
     image = Image.fromarray(output)
     draw = ImageDraw.Draw(image)
     draw.rectangle((5, 5, min(image.width - 5, 12 + len(text) * 7), 28), fill=(0, 0, 0))
@@ -910,6 +1075,23 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--gradient-step-size", type=float, default=0.04)
     argument_parser.add_argument("--guidance-strength", type=float, default=0.85)
     argument_parser.add_argument("--temperature", type=float, default=0.35)
+    argument_parser.add_argument(
+        "--particle-anchor", action=argparse.BooleanOptionalAction, default=True
+    )
+    argument_parser.add_argument(
+        "--particle-energy-reweighting",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    argument_parser.add_argument(
+        "--particle-collision-mask", action=argparse.BooleanOptionalAction, default=True
+    )
+    argument_parser.add_argument(
+        "--particle-noise-schedule", action=argparse.BooleanOptionalAction, default=True
+    )
+    argument_parser.add_argument(
+        "--progressive-guidance", action=argparse.BooleanOptionalAction, default=True
+    )
     argument_parser.add_argument("--safe-distance", type=float, default=0.42)
     argument_parser.add_argument("--hard-collision-distance", type=float, default=0.24)
     argument_parser.add_argument("--safety-weight", type=float, default=35.0)
@@ -979,6 +1161,11 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--goal-y", type=float, default=None)
     argument_parser.add_argument("--goal-height", type=float, default=1.2)
     argument_parser.add_argument("--goal-radius", type=int, default=18)
+    argument_parser.add_argument(
+        "--goal-mesh", action=argparse.BooleanOptionalAction, default=False
+    )
+    argument_parser.add_argument("--goal-mesh-half-extent", type=float, default=0.25)
+    argument_parser.add_argument("--goal-mesh-height", type=float, default=1.50)
 
     argument_parser.add_argument(
         "--obstacle-mode", choices=["none", "depth", "mesh", "ghost"], default="none"
@@ -998,6 +1185,23 @@ def parser() -> argparse.ArgumentParser:
             "Actual rendered obstacle mesh locations as image fractions u,v. "
             "Example: --obstacle-mesh-uv 0.50,0.72 0.30,0.68"
         ),
+    )
+    argument_parser.add_argument(
+        "--obstacle-world-xz",
+        nargs="*",
+        default=[],
+        metavar="X,Z",
+        help=(
+            "Static rendered obstacle-box centers in world X,Z coordinates. "
+            "Example: --obstacle-world-xz 0,0. Do not combine with "
+            "--obstacle-mesh-uv."
+        ),
+    )
+    argument_parser.add_argument(
+        "--world-obstacle-half-extent", type=float, default=0.75
+    )
+    argument_parser.add_argument(
+        "--world-obstacle-height", type=float, default=1.40
     )
     argument_parser.add_argument("--mesh-half-pixels", type=int, default=26)
     argument_parser.add_argument("--mesh-obstacle-lift", type=float, default=0.50)
@@ -1030,6 +1234,9 @@ def parser() -> argparse.ArgumentParser:
         default=True,
         help="Store RGB/depth/masks in rollout.npz; disable for large evaluations.",
     )
+    argument_parser.add_argument(
+        "--overlay-masks", action=argparse.BooleanOptionalAction, default=True
+    )
     return argument_parser
 
 
@@ -1044,8 +1251,21 @@ def main() -> None:
         args.ghost_obstacle_x is None or args.ghost_obstacle_z is None
     ):
         raise ValueError("ghost mode requires --ghost-obstacle-x and --ghost-obstacle-z")
-    if args.obstacle_mode == "mesh" and not args.obstacle_mesh_uv:
-        raise ValueError("mesh mode requires --obstacle-mesh-uv u,v [u,v ...]")
+    if args.obstacle_mesh_uv and args.obstacle_world_xz:
+        raise ValueError(
+            "choose either --obstacle-mesh-uv or --obstacle-world-xz, not both"
+        )
+    if args.obstacle_mode == "mesh" and not (
+        args.obstacle_mesh_uv or args.obstacle_world_xz
+    ):
+        raise ValueError(
+            "mesh mode requires --obstacle-world-xz X,Z [X,Z ...] or "
+            "--obstacle-mesh-uv u,v [u,v ...]"
+        )
+    if args.world_obstacle_half_extent <= 0.0 or args.world_obstacle_height <= 0.0:
+        raise ValueError("world obstacle dimensions must be positive")
+    if args.goal_mesh_half_extent <= 0.0 or args.goal_mesh_height <= 0.0:
+        raise ValueError("goal mesh dimensions must be positive")
 
     server_process: Optional[subprocess.Popen[Any]] = None
     simulator = None
@@ -1090,7 +1310,7 @@ def main() -> None:
             args.height,
             args.width,
             args.hfov_deg,
-            with_semantic=args.obstacle_mode == "mesh",
+            with_semantic=args.obstacle_mode == "mesh" or args.goal_mesh,
         )
         agent = simulator.initialize_agent(0)
         intrinsic = camera_intrinsic(args.height, args.width, args.hfov_deg)
@@ -1106,6 +1326,17 @@ def main() -> None:
         initial_goal_distance = float(
             np.linalg.norm(goal[[0, 2]].astype(np.float64) - start_position_xz)
         )
+        goal_mesh_object = None
+        if args.goal_mesh:
+            goal_mesh_object = place_world_goal_mesh(
+                simulator,
+                terrain,
+                args.goal_x,
+                args.goal_z,
+                output_directory,
+                half_extent=args.goal_mesh_half_extent,
+                height=args.goal_mesh_height,
+            )
 
         ghost = None
         if args.obstacle_mode == "ghost":
@@ -1125,6 +1356,24 @@ def main() -> None:
         mesh_geometries: list[np.ndarray] = []
         mesh_velocities = np.zeros((0, 2), dtype=np.float64)
         mesh_placed = False
+        if args.obstacle_mode == "mesh" and args.obstacle_world_xz:
+            mesh_objects, mesh_centroids, mesh_base_geometries = (
+                place_world_obstacle_meshes(
+                    simulator,
+                    terrain,
+                    args.obstacle_world_xz,
+                    output_directory,
+                    half_extent=args.world_obstacle_half_extent,
+                    height=args.world_obstacle_height,
+                )
+            )
+            mesh_velocities = expand_obstacle_velocities(
+                args.obstacle_velocity_xz, len(mesh_objects)
+            )
+            mesh_geometries, mesh_current_centroids = translated_mesh_geometry(
+                mesh_base_geometries, mesh_centroids, mesh_velocities, 0.0
+            )
+            mesh_placed = True
 
         row_keys = [
                 "pose",
@@ -1145,6 +1394,7 @@ def main() -> None:
                 "mean_guidance_noise_correction",
                 "final_guidance_noise_correction",
                 "maximum_guidance_noise_correction",
+                "mean_final_effective_sample_size",
                 "goal_distance",
                 "executed_center_clearance",
                 "executed_surface_clearance",
@@ -1197,9 +1447,24 @@ def main() -> None:
 
             goal_right, _goal_up, goal_forward = camera_coordinates(goal, position, yaw)
             point_goal = np.asarray([max(goal_forward, 0.0), -goal_right], dtype=np.float32)
-            goal_mask, _ = project_world_mask(
-                goal, position, yaw, intrinsic, args.height, args.width, args.goal_radius
+            semantic = (
+                semantic_from_observation(observation)
+                if args.obstacle_mode == "mesh" or args.goal_mesh
+                else None
             )
+            if args.goal_mesh:
+                assert semantic is not None
+                goal_mask = (semantic == MESH_GOAL_ID).astype(np.uint8)
+            else:
+                goal_mask, _ = project_world_mask(
+                    goal,
+                    position,
+                    yaw,
+                    intrinsic,
+                    args.height,
+                    args.width,
+                    args.goal_radius,
+                )
 
             guidance_depth = depth.copy()
             if args.obstacle_mode == "depth":
@@ -1207,7 +1472,7 @@ def main() -> None:
                     depth, args.obstacle_depth_threshold, args.obstacle_min_y_fraction
                 )
             elif args.obstacle_mode == "mesh":
-                semantic = semantic_from_observation(observation)
+                assert semantic is not None
                 semantic_ids = list(
                     range(
                         MESH_OBSTACLE_ID,
@@ -1308,6 +1573,9 @@ def main() -> None:
             rows["maximum_guidance_noise_correction"].append(
                 result.maximum_guidance_noise_correction
             )
+            rows["mean_final_effective_sample_size"].append(
+                result.mean_final_effective_sample_size
+            )
             rows["goal_distance"].append(goal_distance)
             rows["executed_center_clearance"].append(center_clearance)
             rows["executed_surface_clearance"].append(surface_clearance)
@@ -1328,7 +1596,13 @@ def main() -> None:
                     f"guide_rms={result.mean_guidance_noise_correction:.4f} "
                     f"v={action[0]:.2f} w={action[2]:.2f}"
                 )
-                frame = overlay_frame(rgb, goal_mask, obstacle_mask, label)
+                frame = overlay_frame(
+                    rgb,
+                    goal_mask,
+                    obstacle_mask,
+                    label,
+                    show_masks=args.overlay_masks,
+                )
                 frame.save(frame_directory / f"frame_{step:04d}.png")
                 video_frames.append(frame)
 
@@ -1344,6 +1618,7 @@ def main() -> None:
                 f"circ={result.selected_circulation_energy:.5f} "
                 f"latency={planning_time * 1000.0:.1f}ms "
                 f"guide_rms={result.mean_guidance_noise_correction:.6f} "
+                f"ess={result.mean_final_effective_sample_size:.2f} "
                 f"action={action.tolist()}",
                 flush=True,
             )
@@ -1398,6 +1673,13 @@ def main() -> None:
                     "controller": "direct_waypoint_no_optimizer",
                     "uses_velocity_chunk": False,
                     "obstacle_mode": args.obstacle_mode,
+                    "obstacle_world_xz": args.obstacle_world_xz,
+                    "goal_mesh": args.goal_mesh,
+                    "particle_anchor": args.particle_anchor,
+                    "particle_energy_reweighting": args.particle_energy_reweighting,
+                    "particle_collision_mask": args.particle_collision_mask,
+                    "particle_noise_schedule": args.particle_noise_schedule,
+                    "progressive_guidance": args.progressive_guidance,
                     "mesh_obstacle_count": len(mesh_centroids),
                     "moving_obstacles": bool(np.any(np.abs(mesh_velocities) > 0.0)),
                     "obstacle_velocity_xz": mesh_velocities.tolist(),

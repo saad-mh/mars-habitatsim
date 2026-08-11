@@ -49,6 +49,11 @@ class MarsHabitatEnv:
         rock_field_path: Optional[str] = None,
         annotations_dir: Optional[str] = None,
         annotation_categories: Optional[Sequence[str]] = None,
+        flag_seed: Optional[int] = None,
+        num_flags: int = 6,
+        flag_min_spacing: float = 1.5,
+        flag_boundary_margin: float = 2.0,
+        flag_spawn_clearance: float = 2.0,
     ):
         self._scene_path = Path(scene_path)
         self._heightmap_path = Path(heightmap_path)
@@ -68,7 +73,17 @@ class MarsHabitatEnv:
         self._rock_field_path = Path(rock_field_path) if rock_field_path else None
         self._annotations_dir = Path(annotations_dir) if annotations_dir else None
         self._annotation_categories = annotation_categories
+        # None disables flag placement entirely (default) -- generation is live/seeded
+        # rather than a cached manifest (see sam_vla.env.flag_placement), so there's
+        # nothing to opt into by path the way rock_field_path works.
+        self._flag_seed = flag_seed
+        self._num_flags = int(num_flags)
+        self._flag_min_spacing = float(flag_min_spacing)
+        self._flag_boundary_margin = float(flag_boundary_margin)
+        self._flag_spawn_clearance = float(flag_spawn_clearance)
         self.rocks: List[RockSpec] = []
+        self.flags: list = []
+        self.home_base = None
         self.annotation_mesh_id_map: dict = {}
         self._annotation_objects: dict = {}
         self._annotation_onstage: dict = {}
@@ -130,9 +145,32 @@ class MarsHabitatEnv:
         y = self.get_height_at_xz(x, z)
         set_agent_pose(self._agent, x, y, z, yaw)
 
+        from sam_vla.env.home_base import register_home_base
+
+        self.home_base = register_home_base(self._sim, self._terrain, x, z, yaw)
+
         if self._rock_field_path is not None:
             self.rocks, _rock_config = load_rock_field(self._rock_field_path)
             register_rocks(self._sim, self.rocks)
+
+        if self._flag_seed is not None:
+            from sam_vla.env.flag_placement import (
+                FlagFieldConfig,
+                generate_flag_field,
+                register_flags,
+            )
+
+            # Always keep flags clear of the rover's own spawn point, on top
+            # of any caller-supplied exclude zones.
+            flag_config = FlagFieldConfig(
+                seed=self._flag_seed,
+                num_flags=self._num_flags,
+                min_spacing=self._flag_min_spacing,
+                boundary_margin=self._flag_boundary_margin,
+                exclude_zones=[(x, z, self._flag_spawn_clearance)],
+            )
+            self.flags = generate_flag_field(flag_config, self._terrain)
+            register_flags(self._sim, self.flags)
 
         if self._annotations_dir is not None:
             self.annotation_mesh_id_map = load_mesh_id_map(self._annotations_dir)

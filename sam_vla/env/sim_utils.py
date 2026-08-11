@@ -49,18 +49,24 @@ def save_obj(
     verts: np.ndarray,
     faces: np.ndarray,
     diffuse_rgb: Optional[Tuple[float, float, float]] = None,
+    alpha: float = 1.0,
 ) -> None:
     """Write an .obj mesh. If `diffuse_rgb` is given, also write a companion .mtl
     with that diffuse color and zero specular (matte, non-shiny) -- the same
     `Ks 0.000 0.000 0.000` convention the marsyard ground material uses -- and
     reference it from the .obj so importers pick it up instead of falling back
-    to a shiny default gray material."""
+    to a shiny default gray material. `alpha` (1.0 = fully opaque) is written
+    as both `d` and `Tr` (dissolve/its inverse -- different importers honor
+    one or the other) for whatever picks up the .mtl; unverified whether this
+    repo's habitat-sim/GPU combination actually alpha-blends it rather than
+    just rendering opaque (see CLAUDE.md's "Known issues" for other render
+    quirks specific to this setup) -- worth a visual spot-check."""
     path = Path(path)
     with open(path, "w") as f:
         if diffuse_rgb is not None:
             mtl_name = path.with_suffix(".mtl").name
             f.write(f"mtllib {mtl_name}\n")
-            f.write("usemtl rock_mat\n")
+            f.write("usemtl mesh_mat\n")
         for x, y, z in verts:
             f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
         for a, b, c in faces:
@@ -70,12 +76,13 @@ def save_obj(
         r, g, b = diffuse_rgb
         mtl_path = path.with_suffix(".mtl")
         with open(mtl_path, "w") as f:
-            f.write("newmtl rock_mat\n")
+            f.write("newmtl mesh_mat\n")
             f.write(f"Ka {r:.3f} {g:.3f} {b:.3f}\n")
             f.write(f"Kd {r:.3f} {g:.3f} {b:.3f}\n")
             f.write("Ks 0.000 0.000 0.000\n")
             f.write("Ns 1.0\n")
-            f.write("d 1.0\n")
+            f.write(f"d {alpha:.3f}\n")
+            f.write(f"Tr {1.0 - alpha:.3f}\n")
             f.write("illum 1\n")
 
 
@@ -121,6 +128,42 @@ def register_semantic_mesh(
     obj.semantic_id = int(semantic_id)
     if y_offset:
         obj.translation = obj.translation + mn.Vector3(0.0, float(y_offset), 0.0)
+    return obj
+
+
+def register_glb_object(
+    sim,
+    glb_path: str,
+    position: Tuple[float, float, float],
+    yaw: float = 0.0,
+    semantic_id: int = 0,
+    template_name: Optional[str] = None,
+):
+    """Add a fixed-geometry .glb asset (e.g. a flag marker) as a render-only,
+    non-collidable kinematic object at an explicit world (x, y, z) / yaw.
+
+    Unlike register_semantic_mesh's rocks/annotation hulls -- each a unique
+    .obj already baked into its final world position/orientation -- the same
+    .glb geometry here is shared across instances (e.g. every red flag reuses
+    red_flag.glb), so position/rotation are set explicitly post-registration
+    instead of being pre-baked into the mesh, and each call needs a unique
+    template_name (defaults to one derived from the object id) so repeated
+    placements of the same asset don't collide in the template registry."""
+    otm = sim.get_object_template_manager()
+    rom = sim.get_rigid_object_manager()
+    template = otm.create_new_template(str(glb_path))
+    template.render_asset_handle = str(glb_path)
+    template.collision_asset_handle = str(glb_path)
+    template.is_collidable = False
+    name = template_name or f"glb_{semantic_id}_{Path(glb_path).stem}_{id(template)}"
+    template_id = otm.register_template(template, name)
+    obj = rom.add_object_by_template_handle(otm.get_template_handle_by_id(template_id))
+    obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC
+    obj.collidable = False
+    obj.semantic_id = int(semantic_id)
+    x, y, z = position
+    obj.translation = mn.Vector3(float(x), float(y), float(z))
+    obj.rotation = mn.Quaternion.rotation(mn.Rad(float(yaw)), mn.Vector3.y_axis())
     return obj
 
 

@@ -172,6 +172,10 @@ class RoverController:
         navdp_upstream_root: Optional[str] = None,
         navdp_root: Optional[str] = None,
         rock_field_path: Optional[str] = None,
+        flag_seed: Optional[int] = None,
+        num_flags: int = 6,
+        flag_min_spacing: float = 1.5,
+        flag_boundary_margin: float = 2.0,
         start_x: float = 0.0,
         start_z: float = 8.0,
         start_yaw_deg: float = 0.0,
@@ -217,6 +221,10 @@ class RoverController:
         self.navdp_upstream_root = navdp_upstream_root
         self.navdp_root = navdp_root
         self.rock_field_path = rock_field_path
+        self.flag_seed = flag_seed
+        self.num_flags = int(num_flags)
+        self.flag_min_spacing = float(flag_min_spacing)
+        self.flag_boundary_margin = float(flag_boundary_margin)
         self.start_x = float(start_x)
         self.start_z = float(start_z)
         self.start_yaw_deg = float(start_yaw_deg)
@@ -434,6 +442,10 @@ class RoverController:
                 start_yaw=math.radians(self.start_yaw_deg),
                 with_semantic=True,
                 rock_field_path=self.rock_field_path,
+                flag_seed=self.flag_seed,
+                num_flags=self.num_flags,
+                flag_min_spacing=self.flag_min_spacing,
+                flag_boundary_margin=self.flag_boundary_margin,
                 annotations_dir=self.annotations_dir,
                 annotation_categories=self.annotation_categories,
             ) as env:
