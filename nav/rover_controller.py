@@ -36,11 +36,15 @@ Driving modes:
              rather than registering a scene object, since dynamically
              registered objects render zero pixels on this machine (see
              CLAUDE.md's dynamic-object-render-bug note).
-  resolve -- one-shot first_frame_resolver.resolve_verbose() on the current
-             frame (SAM2 detections + Qwen VLM salience pick, no per-preset
-             text targeting -- qwen_client.select_goal has no such
-             parameter, see next.md), then track the resulting goal/obstacle
-             masks every tick exactly as sam_vla.run_navdp_rollout's
+  resolve -- with no target_text: one-shot first_frame_resolver.resolve_verbose()
+             on the current frame (SAM2 detections + Qwen VLM salience pick,
+             no per-preset text targeting -- qwen_client.select_goal has no
+             such parameter, see next.md). With a target_text (Ground
+             Target / a mission GO_TO/FIND step): dino_grounding_resolver
+             instead -- GroundingDINO detects the named open-vocabulary
+             object directly (flags, the home-base cuboid; SAM2 still runs
+             to seed obstacles). Either way, the resulting goal/obstacle
+             masks are tracked every tick exactly as sam_vla.run_navdp_rollout's
              single-goal path does (BeliefGoalTracker.observe(mask, depth),
              holding position rather than driving on a fabricated default
              goal point if the mask has never been sighted -- next.md's
@@ -79,9 +83,10 @@ from sam_vla.core.goal_geometry import (
 )
 from sam_vla.core.pose_integrator import integrate_mars
 from sam_vla.core.types import Action, GoalSpec, Pose
+from sam_vla.core.uncertainty_motion import yaw_rate_toward_heading
 from sam_vla.env.habitat_env import HFOV_DEG, MarsHabitatEnv
 from sam_vla.env.terrain import SIZE_X, SIZE_Z
-from sam_vla.goal_resolution import first_frame_resolver, qwen_grounding_resolver
+from sam_vla.goal_resolution import dino_grounding_resolver, first_frame_resolver
 from sam_vla.perception.semantic_overlay import (
     draw_point_marker,
     overlay_semantic_masks,
@@ -93,6 +98,7 @@ from sam_vla.vlm.qwen_config import QWEN_SERVER_HOST, QWEN_SERVER_PORT
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
 
 from nav.goal_math import body_frame_goal, heading_ahead_point, random_ahead_point
+from nav.mission import GoalKind, Mission
 
 # Uncertainty-halt: reuses vl_direction's own "uncertainty" prompt/session
 # machinery (its documented sole integration point, see vl_direction's module
@@ -111,6 +117,10 @@ MODE_IDLE = "idle"
 MODE_POINT = "point"
 MODE_RESOLVE = "resolve"
 MODE_MANUAL = "manual"
+# In-place rotation toward self._mission_target_yaw -- only ever entered by a
+# Mission's TURN sub-goal (see _start_mission_subgoal), not user-reachable
+# directly.
+MODE_TURN = "turn"
 # Holding state between a completed SAM2/Qwen resolve and the user accepting
 # it -- entered by _do_resolve instead of MODE_RESOLVE, left via
 # request_confirm_segmentation (-> MODE_RESOLVE, starts driving),
@@ -121,7 +131,10 @@ MODE_REVIEW_SEGMENTATION = "review_segmentation"
 # Ground-truth distance at which a point goal counts as reached
 POINT_GOAL_REACHED_M = 0.7
 
-# World-space radius of the ghost-mask circle drawn over a Qwen-grounded
+# Ground-truth yaw error at which a MODE_TURN sub-goal counts as reached
+TURN_GOAL_REACHED_RAD = math.radians(3.0)
+
+# World-space radius of the ghost-mask circle drawn over a DINO-grounded
 # open-vocabulary target (see _do_resolve/self._ground_target_world) --
 # reprojected to a depth-dependent pixel radius every frame, not a fixed
 # on-screen size (see project_world_point_with_pixel_radius).
@@ -158,6 +171,9 @@ class DisplayState:
     goal_reached: bool = False
     error_text: str = ""
     click_status: str = ""
+    # Active Mission's status() line (nav/gui.py's Command panel), "" when no
+    # mission is running -- see nav.mission.Mission.
+    mission_status: str = ""
     # Uncertainty-halt (vl_direction's "uncertainty" prompt against the real
     # BeliefGoalTracker, see this module's imports): uncertainty_value grows
     # while a MODE_RESOLVE goal mask stays unseen; once it reaches
@@ -216,6 +232,10 @@ class RoverController:
         seg_backend: str = "lora",
         seg_checkpoint: Optional[str] = None,
         seg_overlay: str = "mesh",
+        dino_model_id: str = dino_grounding_resolver.DEFAULT_DINO_MODEL_ID,
+        dino_device: str = dino_grounding_resolver.DEFAULT_DINO_DEVICE,
+        dino_box_threshold: float = dino_grounding_resolver.DEFAULT_BOX_THRESHOLD,
+        dino_text_threshold: float = dino_grounding_resolver.DEFAULT_TEXT_THRESHOLD,
         annotations_dir: Optional[str] = DEFAULT_ANNOTATIONS_DIR,
         annotation_categories: Optional[Sequence[str]] = None,
         uncertainty_enabled: bool = True,
@@ -278,6 +298,15 @@ class RoverController:
         self.annotations_dir = annotations_dir if self.seg_overlay == "mesh" else None
         self.annotation_categories = annotation_categories
 
+        # GroundingDINO grounder config (see _do_resolve's target_text path
+        # -> dino_grounding_resolver). Independent of seg_backend/seg_checkpoint
+        # above, which stay SAM2/SAM2-LoRA -- DINO only replaces the Qwen
+        # open-vocabulary grounder, not the SAM2 obstacle/salience path.
+        self.dino_model_id = dino_model_id
+        self.dino_device = dino_device
+        self.dino_box_threshold = float(dino_box_threshold)
+        self.dino_text_threshold = float(dino_text_threshold)
+
         self.uncertainty_enabled = bool(uncertainty_enabled)
         self.uncertainty_cov_threshold = float(uncertainty_cov_threshold)
         self.uncertainty_cov_growth = float(uncertainty_cov_growth)
@@ -312,7 +341,24 @@ class RoverController:
         self._pending_pick_manually = False
         self._pending_uncertainty_heading: Optional[float] = None
         self._pending_uncertainty_retry = False
-        self._pending_nav_command: Optional[str] = None
+        # Active/queued Mission (nav/gui.py's Command panel) -- only ever
+        # touched under self._lock: submit_nav_command (GUI thread) queues,
+        # _env_loop's mission-advance block and every manual-override command
+        # method (GUI thread, cancelling a stale mission) both read/write
+        # self._mission, so unlike self._ground_target_world this can't be
+        # left controller-thread-only.
+        # Raw text waiting for a frame so its (directions, goals) VLM split
+        # can be dispatched (see submit_nav_command/_dispatch_nav_command) --
+        # distinct from self._pending_mission below, which holds the
+        # *already-parsed* Mission once that background call returns.
+        self._pending_nav_command_text: Optional[str] = None
+        self._pending_mission: Optional[Mission] = None
+        self._mission: Optional[Mission] = None
+        # Absolute target world yaw (radians, Pose.yaw's convention) for an
+        # active MODE_TURN sub-goal -- controller-thread-only (set and read
+        # inside _env_loop/_start_mission_subgoal alone), same pattern as
+        # self._ground_target_world.
+        self._mission_target_yaw: Optional[float] = None
 
         # Only ever touched inside self._lock (read/written from both the
         # controller thread and the uncertainty-request background thread).
@@ -349,6 +395,7 @@ class RoverController:
             self._manual_action = Action(
                 v_fwd=float(v_fwd), v_lat=0.0, yaw_rate=float(yaw_rate)
             )
+            self._mission = None
 
     def random_goal(self) -> None:
         with self._lock:
@@ -366,12 +413,14 @@ class RoverController:
             self._world_goal = goal
             self._mode = MODE_POINT
             self.display.goal_reached = False
+            self._mission = None
 
     def go_home(self) -> None:
         with self._lock:
             self._world_goal = (self.start_x, self.start_z)
             self._mode = MODE_POINT
             self.display.goal_reached = False
+            self._mission = None
 
     def request_pixel_goal(self, x_norm: float, y_norm: float) -> None:
         """Queue a click-to-goal request: (x_norm, y_norm) are normalized
@@ -380,15 +429,19 @@ class RoverController:
         thread next tick -- see _handle_pixel_click."""
         with self._lock:
             self._pending_pixel_click = (float(x_norm), float(y_norm))
+            self._mission = None
 
     def request_resolve(self, target_text: Optional[str] = None) -> None:
         """target_text=None -> the original SAM2+Qwen-salience auto-resolve
         (unchanged). A non-empty target_text (e.g. "flag", "blue cuboid")
-        switches to direct Qwen grounding for that object instead -- see
-        qwen_grounding_resolver, wired in via _do_resolve."""
+        switches to direct GroundingDINO grounding for that object instead --
+        see dino_grounding_resolver, wired in via _do_resolve. A manual
+        override, so it cancels any active Mission (see submit_nav_command)
+        the same way every other manual command below does."""
         with self._lock:
             self._pending_resolve = True
             self._resolve_target_text = target_text or None
+            self._mission = None
 
     def request_confirm_segmentation(self) -> None:
         """Accept the goal/obstacle masks from the most recent resolve/rerun
@@ -413,6 +466,7 @@ class RoverController:
     def request_reset(self) -> None:
         with self._lock:
             self._pending_reset = True
+            self._mission = None
 
     def submit_uncertainty_heading(self, angle_deg: float) -> None:
         """Answer an active uncertainty halt with a rover-front-relative
@@ -432,19 +486,29 @@ class RoverController:
 
     def submit_nav_command(self, text: str) -> None:
         """Queue a free-text nav command (nav/gui.py's Command panel) for
-        background segmentation into (directions, goals) via the Qwen VLM
+        background splitting into (directions, goals) via the Qwen VLM
         (qwen_client.parse_nav_command, see
-        qwen_prompts.build_parse_nav_command_prompt) -- consumed and
-        dispatched next tick by _env_loop, result printed to the console by
-        _nav_command_worker. Not yet wired into actual goal-sequencing."""
+        qwen_prompts.build_parse_nav_command_prompt) -- consumed next tick by
+        _env_loop, which dispatches the VLM call on a background thread
+        (_dispatch_nav_command) using that tick's live frame. The result
+        becomes a new Mission (nav.mission.Mission, nav.mission.parse_parts:
+        every direction first as an in-place TURN, then every goal as
+        GO_TO/RETURN), picked up by _env_loop's mission stepper
+        (_start_mission_subgoal) once parsing completes: GO_TO/FIND ground
+        the named target via dino_grounding_resolver and auto-confirm (no
+        review pause -- a human isn't supervising each step of a multi-part
+        instruction), RETURN drives to the spawn point, TURN rotates in
+        place. Advances on each step's ground-truth goal_reached signal,
+        same as a manually driven point/resolve goal."""
         with self._lock:
-            self._pending_nav_command = text
+            self._pending_nav_command_text = text
 
     def stop_driving(self) -> None:
         with self._lock:
             self._mode = MODE_IDLE
             self._world_goal = None
             self._manual_action = Action(0.0, 0.0, 0.0)
+            self._mission = None
 
     def snapshot(self) -> DisplayState:
         with self._lock:
@@ -562,7 +626,7 @@ class RoverController:
                     do_pick_manual,
                     uncertainty_heading,
                     do_uncertainty_retry,
-                    nav_command,
+                    nav_command_text,
                     resolve_target_text,
                 ) = self._consume_pending()
 
@@ -572,6 +636,9 @@ class RoverController:
                     )
                     with self._lock:
                         self._resolve_target_text = None
+                        self._mission = None
+                        self._pending_mission = None
+                    self._mission_target_yaw = None
                     belief_tracker = self._new_belief_tracker()
                     if avoidance is not None:
                         avoidance = self._new_avoidance()
@@ -640,6 +707,21 @@ class RoverController:
                             env, goal_objects, obstacle_objects
                         )
 
+                # A Mission finished parsing (background thread from a prior
+                # tick's _dispatch_nav_command, see submit_nav_command) --
+                # pick it up and start its first sub-goal.
+                with self._lock:
+                    pending_mission = self._pending_mission
+                    self._pending_mission = None
+                if pending_mission is not None:
+                    with self._lock:
+                        self._mission = pending_mission
+                    goal_objects, obstacle_objects, goal_spec = (
+                        self._start_mission_subgoal(
+                            env, step, mask_dir, goal_objects, obstacle_objects, goal_spec
+                        )
+                    )
+
                 obs = env.get_observation(frame_idx=step)
                 semantic = env.get_semantic_frame()
                 goal_mask = (semantic == MESH_GOAL_ID).astype("uint8") * 255
@@ -648,8 +730,8 @@ class RoverController:
                 if pixel_click is not None:
                     self._handle_pixel_click(obs, pixel_click)
 
-                if nav_command is not None:
-                    self._dispatch_nav_command(nav_command, obs.rgb)
+                if nav_command_text is not None:
+                    self._dispatch_nav_command(nav_command_text, obs.rgb)
 
                 if uncertainty_session is not None:
                     self._handle_uncertainty_commands(
@@ -773,6 +855,40 @@ class RoverController:
                         # constructor default (see this module's docstring /
                         # next.md's Integration-project Phase 5).
                         unresolved = True
+                elif mode == MODE_TURN and self._mission_target_yaw is not None:
+                    yaw_rate = yaw_rate_toward_heading(
+                        obs.pose.yaw,
+                        self._mission_target_yaw,
+                        turn_kp=1.4,
+                        max_yaw_rate=self.max_yaw_rate,
+                    )
+                    action = Action(v_fwd=0.0, v_lat=0.0, yaw_rate=yaw_rate)
+                    yaw_err = (
+                        self._mission_target_yaw - obs.pose.yaw + math.pi
+                    ) % (2.0 * math.pi) - math.pi
+                    if abs(yaw_err) < TURN_GOAL_REACHED_RAD:
+                        with self._lock:
+                            self._mode = MODE_IDLE
+                            self.display.goal_reached = True
+                        mode = MODE_IDLE
+                        self._mission_target_yaw = None
+
+                if self._mission is not None and self.display.goal_reached:
+                    # Ground-truth "reached" edge for the mission's current
+                    # sub-goal (same signal a manually driven point/resolve
+                    # goal already produces) -- advance and kick off whatever
+                    # driving mode the next sub-goal needs. _start_mission_subgoal
+                    # clears goal_reached again (or clears self._mission
+                    # entirely on GoalKind.DONE), so this only fires once per
+                    # sub-goal completion, not every tick after.
+                    with self._lock:
+                        if self._mission is not None:
+                            self._mission.advance()
+                    goal_objects, obstacle_objects, goal_spec = (
+                        self._start_mission_subgoal(
+                            env, step, mask_dir, goal_objects, obstacle_objects, goal_spec
+                        )
+                    )
 
                 obstacle_point = None
                 cbf_info: dict = {}
@@ -877,6 +993,9 @@ class RoverController:
                     d.step = step
                     d.frame_count += 1
                     d.uncertainty_value = belief_tracker.uncertainty_value()
+                    d.mission_status = (
+                        self._mission.status() if self._mission is not None else ""
+                    )
 
                 step += 1
                 remaining = period - (time.time() - t0)
@@ -912,7 +1031,7 @@ class RoverController:
             do_pick_manual = self._pending_pick_manually
             uncertainty_heading = self._pending_uncertainty_heading
             do_uncertainty_retry = self._pending_uncertainty_retry
-            nav_command = self._pending_nav_command
+            nav_command_text = self._pending_nav_command_text
             self._pending_resolve = False
             self._pending_reset = False
             self._pending_pixel_click = None
@@ -921,7 +1040,7 @@ class RoverController:
             self._pending_pick_manually = False
             self._pending_uncertainty_heading = None
             self._pending_uncertainty_retry = False
-            self._pending_nav_command = None
+            self._pending_nav_command_text = None
         return (
             do_resolve,
             do_reset,
@@ -931,7 +1050,7 @@ class RoverController:
             do_pick_manual,
             uncertainty_heading,
             do_uncertainty_retry,
-            nav_command,
+            nav_command_text,
             resolve_target_text,
         )
 
@@ -1058,30 +1177,112 @@ class RoverController:
             self.display.uncertainty_line = line
 
     def _dispatch_nav_command(self, text: str, frame: np.ndarray) -> None:
-        """Kicks off the (slow) nav-command-segmentation VLM call on a
-        background thread -- same reasoning as _dispatch_uncertainty_request,
-        the control loop must keep ticking at self.hz regardless of
-        inference latency."""
+        """Kicks off the (slow) nav-command-parsing VLM call on a background
+        thread -- same reasoning as _dispatch_uncertainty_request, the
+        control loop must keep ticking at self.hz regardless of inference
+        latency."""
         thread = threading.Thread(
             target=self._nav_command_worker, args=(text, frame), daemon=True
         )
         thread.start()
 
-    @staticmethod
-    def _nav_command_worker(text: str, frame: np.ndarray) -> None:
-        """Runs on a background thread -- segments a free-text nav command
-        into (directions, goals) via qwen_client.parse_nav_command and
-        prints the result to the console (nav/gui.py's Command panel
-        docstring: "printed to the console for now"). Never touches
-        habitat-sim or self.display -- purely a CLI side-channel until this
-        is wired into actual goal-sequencing."""
+    def _nav_command_worker(self, text: str, frame: np.ndarray) -> None:
+        """Runs on a background thread -- splits a free-text nav command
+        into (directions, goals) via qwen_client.parse_nav_command (see
+        qwen_prompts.build_parse_nav_command_prompt), then turns that split
+        into a Mission (nav.mission.Mission/parse_parts: every direction
+        first as an in-place TURN, then every goal as GO_TO/RETURN). Never
+        touches habitat-sim; only writes self._pending_mission under
+        self._lock, picked up next tick by _env_loop."""
         try:
-            directions, goals, _result = qwen_client.parse_nav_command_verbose(
-                frame, text
-            )
+            directions, goals = qwen_client.parse_nav_command(frame, text)
             print(f"[nav command] {text!r} -> directions={directions} goals={goals}")
+            mission = Mission(text, directions=directions, goal_texts=goals)
         except Exception as exc:
             print(f"[nav command] {text!r} failed: {exc}")
+            return
+        with self._lock:
+            self._pending_mission = mission
+
+    def _start_mission_subgoal(
+        self, env, step, mask_dir, goal_objects, obstacle_objects, goal_spec
+    ):
+        """Kicks off whichever driving mode the active Mission's current
+        sub-goal needs (see nav.mission.Mission) -- called once when a new
+        Mission is queued (submit_nav_command) and again every time the
+        mission-advance edge in _env_loop fires. Only ever called from the
+        controller thread. A GO_TO/FIND resolve that fails (DINO doesn't
+        ground the target, or grounds it with no valid depth) is skipped
+        rather than left stuck forever -- one bad step in a multi-part
+        instruction shouldn't stall the rest of it."""
+        while True:
+            with self._lock:
+                mission = self._mission
+                goal = mission.current if mission is not None else None
+            if goal is None:
+                return goal_objects, obstacle_objects, goal_spec
+
+            if goal.kind == GoalKind.DONE:
+                with self._lock:
+                    self._mode = MODE_IDLE
+                    self._world_goal = None
+                    self._mission = None
+                self._mission_target_yaw = None
+                return goal_objects, obstacle_objects, goal_spec
+
+            if goal.kind in (GoalKind.GO_TO, GoalKind.FIND):
+                goal_objects, obstacle_objects, goal_spec = self._do_resolve(
+                    env,
+                    step,
+                    mask_dir,
+                    goal_objects,
+                    obstacle_objects,
+                    goal_spec,
+                    target_text=goal.target,
+                )
+                with self._lock:
+                    # _do_resolve always leaves a *successful* resolve in
+                    # MODE_REVIEW_SEGMENTATION with an empty click_status
+                    # (goal_mask_warning) -- see its docstring. A mission
+                    # step auto-confirms straight through that review pause
+                    # instead of waiting for a human Confirm click.
+                    resolved = (
+                        self._mode == MODE_REVIEW_SEGMENTATION
+                        and not self.display.click_status
+                    )
+                    if resolved:
+                        self._mode = MODE_RESOLVE
+                        self.display.status_text = (
+                            f"[mission] resolved: {goal_spec.instruction_text}"
+                        )
+                if resolved:
+                    return goal_objects, obstacle_objects, goal_spec
+                print(f"[mission] step {goal.raw!r} failed to resolve -- skipping")
+                with self._lock:
+                    if self._mission is mission:
+                        self._mission.advance()
+                continue
+
+            if goal.kind == GoalKind.RETURN:
+                with self._lock:
+                    self._world_goal = (self.start_x, self.start_z)
+                    self._mode = MODE_POINT
+                    self.display.goal_reached = False
+                return goal_objects, obstacle_objects, goal_spec
+
+            if goal.kind == GoalKind.TURN:
+                pose = self.display.pose
+                heading_deg = {
+                    "right": 90.0,
+                    "left": -90.0,
+                    "back": 180.0,
+                    "around": 180.0,
+                }.get(goal.target, 180.0)
+                self._mission_target_yaw = pose.yaw - math.radians(heading_deg)
+                with self._lock:
+                    self._mode = MODE_TURN
+                    self.display.goal_reached = False
+                return goal_objects, obstacle_objects, goal_spec
 
     def _new_belief_tracker(self) -> BeliefGoalTracker:
         # odom_noise/odom_noise_growth_rate drive uncertainty_value()'s real
@@ -1136,17 +1337,21 @@ class RoverController:
         detect_rgb = env.get_mesh_overlay_rgb() if self.seg_overlay == "mesh" else None
         try:
             if target_text:
-                # Open-vocabulary target (flag, blue cuboid, ...): Qwen
-                # grounds it directly, SAM2 only seeds obstacles. See
-                # qwen_grounding_resolver's module docstring for why this is
-                # a separate path from first_frame_resolver rather than a
-                # branch inside it.
-                goal_spec_r, vlm_result, dets = qwen_grounding_resolver.resolve_verbose(
+                # Open-vocabulary target (flag, blue cuboid, ...):
+                # GroundingDINO grounds it directly, SAM2 only seeds
+                # obstacles. See dino_grounding_resolver's module docstring
+                # for why this is a separate path from first_frame_resolver
+                # rather than a branch inside it.
+                goal_spec_r, vlm_result, dets = dino_grounding_resolver.resolve_verbose(
                     obs_r.rgb,
                     target_text,
                     detect_rgb=detect_rgb,
                     backend=self.seg_backend,
                     checkpoint_path=self.seg_checkpoint,
+                    dino_model_id=self.dino_model_id,
+                    dino_device=self.dino_device,
+                    dino_box_threshold=self.dino_box_threshold,
+                    dino_text_threshold=self.dino_text_threshold,
                 )
             else:
                 goal_spec_r, vlm_result, dets = first_frame_resolver.resolve_verbose(
@@ -1157,8 +1362,8 @@ class RoverController:
                 )
         except Exception as exc:
             # Console print too, not just the status banner -- a
-            # qwen_grounding_resolver "not found" RuntimeError carries
-            # Qwen's actual reasoning (see its message), which was
+            # dino_grounding_resolver "not found" RuntimeError carries
+            # GroundingDINO's own reasoning (see its message), which was
             # previously only visible by reading the (often truncated)
             # sidebar status text.
             print(f"[nav resolve] failed: {exc}")
@@ -1354,4 +1559,6 @@ class RoverController:
                 return "RESOLVE  waiting for goal sighting..."
             label = goal_spec.instruction_text if goal_spec is not None else "?"
             return f"RESOLVE '{label}'  dist={dist_txt}"
+        if mode == MODE_TURN:
+            return "TURN IN PLACE"
         return mode

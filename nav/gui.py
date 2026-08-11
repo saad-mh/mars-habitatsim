@@ -31,7 +31,7 @@ from PIL import Image, ImageDraw, ImageTk
 
 from vl_direction import config as vl_dir_config
 
-from nav.rover_controller import MODE_REVIEW_SEGMENTATION, RoverController
+from nav.rover_controller import MODE_REVIEW_SEGMENTATION, MODE_TURN, RoverController
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REFRESH_MS = 66  # ~15 Hz GUI repaint, independent of the controller's own hz
@@ -52,6 +52,7 @@ MODE_COLORS = {
     "point": "#4ade80",
     "resolve": "#c084fc",
     MODE_REVIEW_SEGMENTATION: "#f59e0b",
+    MODE_TURN: "#fb923c",
 }
 
 # Uncertainty-halt numpad panel: rover-front-relative headings (degrees,
@@ -287,11 +288,17 @@ class NavGuiApp:
             row=4, column=1, sticky="ew", padx=(4, 10), pady=(4, 10)
         )
 
-        # -- free-text command entry: sent to the Qwen VLM (see
-        # submit_command / RoverController.submit_nav_command) to segment
-        # into an ordered list of distinct targets/instructions (e.g. "go
-        # left and find a flag" -> ["go left", "flag"]), printed to the
-        # console for now -- not yet wired into actual goal-sequencing. -- #
+        # -- free-text command entry: split by the Qwen VLM (see
+        # submit_command -> RoverController.submit_nav_command,
+        # qwen_client.parse_nav_command) into (directions, goals), then
+        # turned into an ordered Mission (nav.mission.Mission/parse_parts) of
+        # TURN sub-goals (one per direction) followed by GO_TO/RETURN
+        # sub-goals (one per goal) -- e.g. "go left, find a flag, then
+        # return to home base" -> [TURN 'left', GO_TO 'flag', RETURN 'home
+        # base']. RoverController's mission stepper drives through them one
+        # at a time (auto-confirming each GO_TO/FIND resolve, no review
+        # pause), advancing on each step's ground-truth goal_reached signal
+        # -- the current step is shown in mission_status_label below. -- #
         command_panel = ctk.CTkFrame(sidebar)
         command_panel.grid(row=row, column=0, sticky="ew", pady=(8, 0))
         row += 1
@@ -300,15 +307,27 @@ class NavGuiApp:
             command_panel, text="Command", font=ctk.CTkFont(size=12, weight="bold")
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
         self.command_entry = ctk.CTkEntry(
-            command_panel, placeholder_text='"dance a little"'
+            command_panel, placeholder_text='"go to a flag then return to home"'
         )
         self.command_entry.grid(
-            row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 10)
+            row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 4)
         )
         self.command_entry.bind("<Return>", lambda e: self.submit_command())
         ctk.CTkButton(
             command_panel, text="Send", width=60, command=self.submit_command
-        ).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=(0, 10))
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=(0, 4))
+        self.mission_status_label = ctk.CTkLabel(
+            command_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=11),
+            text_color="#9ca3af",
+            wraplength=self.SIDEBAR_MIN_W - 20,
+        )
+        self.mission_status_label.grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8)
+        )
 
         # -- manual drive: D-pad, always visible -- #
         drive = ctk.CTkFrame(sidebar)
@@ -559,11 +578,13 @@ class NavGuiApp:
         fn(*fn_args)
 
     def submit_command(self) -> None:
-        # Handed to RoverController.submit_nav_command, which segments it via
-        # the Qwen VLM (qwen_client.parse_nav_command) into (directions, goals)
-        # on a background thread -- see nav/rover_controller.py's
-        # _nav_command_worker. Result is printed to the console for now, not
-        # yet wired into actual goal-sequencing.
+        # Handed to RoverController.submit_nav_command, which splits it via
+        # the Qwen VLM (qwen_client.parse_nav_command) into (directions,
+        # goals) on a background thread, turns that into an ordered Mission
+        # (nav.mission.parse_parts), and drives through its sub-goals one at
+        # a time -- see nav/rover_controller.py's _nav_command_worker /
+        # _start_mission_subgoal. Progress shows in mission_status_label
+        # (synced from d.mission_status in refresh() below).
         text = self.command_entry.get().strip()
         if not text:
             return
@@ -690,6 +711,7 @@ class NavGuiApp:
         self._sync_click_panel()
         self._sync_uncertainty_panel(d)
         self.click_status_label.configure(text=d.click_status)
+        self.mission_status_label.configure(text=d.mission_status)
 
         mode_txt = d.mode.upper().replace("_", " ")
         if d.goal_reached:
