@@ -80,3 +80,14 @@ def sample_sweep_poses(config: PoseSweepConfig) -> List[SweepPose]:
 def _axis_positions(half_extent: float, spacing: float) -> List[float]:
     n = max(int(math.floor(2.0 * half_extent / spacing)), 0)
     return [-half_extent + i * spacing for i in range(n + 1)]
+
+
+def sample_in_place_sweep_yaws(num_yaws: int = 8, start_yaw: float = 0.0) -> List[float]:
+    """`num_yaws` yaws (radians) evenly spaced around one full 360deg turn,
+    starting at `start_yaw` -- the single-position counterpart to
+    sample_sweep_poses' scene-wide (x, z, yaw) grid, for a caller that wants
+    to rotate in place at one already-chosen (x, z) and capture every
+    heading rather than move around the scene."""
+    if num_yaws < 1:
+        raise ValueError(f"num_yaws must be >= 1, got {num_yaws}")
+    return [start_yaw + 2.0 * math.pi * i / num_yaws for i in range(num_yaws)]

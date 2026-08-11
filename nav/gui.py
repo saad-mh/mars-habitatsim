@@ -268,6 +268,48 @@ class NavGuiApp:
             hover_color="#991b1b",
         ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10))
 
+        # -- open-vocabulary target grounding: unlike "Segment" (SAM2 +
+        # Qwen-salience over rock detections), this asks Qwen to localize a
+        # named object directly -- for classes SAM2/SAM2-LoRA wasn't trained
+        # on (flags, the home-base blue cuboid). See
+        # sam_vla.goal_resolution.qwen_grounding_resolver / this panel's
+        # ground_target() below. Feeds the same Confirm/Rerun/Pick-manually
+        # review flow "Segment" does -- only how the goal bbox is produced
+        # differs. -- #
+        self.ground_entry = ctk.CTkEntry(
+            actions, placeholder_text='"flag" / "blue cuboid"'
+        )
+        self.ground_entry.grid(
+            row=4, column=0, sticky="ew", padx=(10, 4), pady=(4, 10)
+        )
+        self.ground_entry.bind("<Return>", lambda e: self.ground_target())
+        ctk.CTkButton(
+            actions, text="Ground Target", command=self.ground_target
+        ).grid(row=4, column=1, sticky="ew", padx=(4, 10), pady=(4, 10))
+
+        # -- free-text command entry: sent to the Qwen VLM (see
+        # submit_command / RoverController.submit_nav_command) to segment
+        # into an ordered list of distinct targets/instructions (e.g. "go
+        # left and find a flag" -> ["go left", "flag"]), printed to the
+        # console for now -- not yet wired into actual goal-sequencing. -- #
+        command_panel = ctk.CTkFrame(sidebar)
+        command_panel.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        row += 1
+        command_panel.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            command_panel, text="Command", font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
+        self.command_entry = ctk.CTkEntry(
+            command_panel, placeholder_text='"dance a little"'
+        )
+        self.command_entry.grid(
+            row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 10)
+        )
+        self.command_entry.bind("<Return>", lambda e: self.submit_command())
+        ctk.CTkButton(
+            command_panel, text="Send", width=60, command=self.submit_command
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=(0, 10))
+
         # -- manual drive: D-pad, always visible -- #
         drive = ctk.CTkFrame(sidebar)
         drive.grid(row=row, column=0, sticky="ew", pady=(8, 0))
@@ -298,15 +340,23 @@ class NavGuiApp:
             justify="left",
         ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 10))
 
+        # Global keyboard shortcuts below are bound on root, so they fire on
+        # every keypress in the window regardless of focus -- guard each one
+        # against the command entry having focus, or typing e.g. "left" or a
+        # digit into it would also drive the rover / submit a heading.
         for key, direction in (
             ("Up", "fwd"),
             ("Down", "back"),
             ("Left", "left"),
             ("Right", "right"),
         ):
-            root.bind(f"<KeyPress-{key}>", lambda e, d=direction: self.manual_press(d))
             root.bind(
-                f"<KeyRelease-{key}>", lambda e, d=direction: self.manual_release(d)
+                f"<KeyPress-{key}>",
+                lambda e, d=direction: self._guarded(self.manual_press, d),
+            )
+            root.bind(
+                f"<KeyRelease-{key}>",
+                lambda e, d=direction: self._guarded(self.manual_release, d),
             )
         root.bind("<Escape>", lambda e: self.cancel_pixel_click())
 
@@ -317,10 +367,10 @@ class NavGuiApp:
         for key, angle in UNCERTAINTY_HEADING_KEYS.items():
             root.bind(
                 f"<KeyPress-{key}>",
-                lambda e, a=angle: self.submit_uncertainty_heading(a),
+                lambda e, a=angle: self._guarded(self.submit_uncertainty_heading, a),
             )
-        root.bind("<KeyPress-r>", lambda e: self.retry_uncertainty())
-        root.bind("<KeyPress-R>", lambda e: self.retry_uncertainty())
+        root.bind("<KeyPress-r>", lambda e: self._guarded(self.retry_uncertainty))
+        root.bind("<KeyPress-R>", lambda e: self._guarded(self.retry_uncertainty))
 
         # -- segmentation review panel: only gridded while actually
         # reviewing (Goal 1) -- bordered like kb_teleop_vl's uncertainty
@@ -500,10 +550,39 @@ class NavGuiApp:
             self.plot.configure(height=new_size)
 
     # ---------------- commands ---------------- #
+    def _guarded(self, fn, *fn_args) -> None:
+        # Skip root-level keyboard shortcuts while the command entry has
+        # focus, so typing there doesn't also drive the rover / trigger a
+        # heading submission (see the binding loops above).
+        if self.root.focus_get() in (self.command_entry, self.ground_entry):
+            return
+        fn(*fn_args)
+
+    def submit_command(self) -> None:
+        # Handed to RoverController.submit_nav_command, which segments it via
+        # the Qwen VLM (qwen_client.parse_nav_command) into an ordered list
+        # of distinct targets/instructions on a background thread -- see
+        # nav/rover_controller.py's _nav_command_worker. Result is printed to
+        # the console for now, not yet wired into actual goal-sequencing.
+        text = self.command_entry.get().strip()
+        if not text:
+            return
+        print(f"[nav command] submitted: {text}")
+        self.controller.submit_nav_command(text)
+        self.command_entry.delete(0, "end")
+
     def resolve_goal(self) -> None:
         self._manual_held.clear()
         self.cancel_pixel_click()
         self.controller.request_resolve()
+
+    def ground_target(self) -> None:
+        text = self.ground_entry.get().strip()
+        if not text:
+            return
+        self._manual_held.clear()
+        self.cancel_pixel_click()
+        self.controller.request_resolve(target_text=text)
 
     def random_goal(self) -> None:
         self._manual_held.clear()

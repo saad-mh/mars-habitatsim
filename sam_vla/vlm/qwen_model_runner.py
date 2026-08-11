@@ -27,19 +27,22 @@ def load_qwen_model(device: str = "cuda") -> tuple:
 def run_qwen_inference(
     model,
     processor,
-    image: np.ndarray,
+    image,
     prompt: str,
     max_new_tokens: int = 512,
 ) -> str:
-    pil_image = Image.fromarray(image)
+    # `image` is either a single frame (all of this module's own callers) or
+    # a list of frames (vl_direction's generate mode, e.g. exploration's
+    # multi-frame bursts -- see vl_direction/qwen_model_runner.py, which this
+    # mirrors for that case).
+    images = image if isinstance(image, list) else [image]
+    pil_images = [Image.fromarray(img) for img in images]
 
     messages = [
         {
             "role": "user",
-            "content": [
-                {"type": "image", "image": pil_image},
-                {"type": "text", "text": prompt},
-            ],
+            "content": [{"type": "image", "image": img} for img in pil_images]
+            + [{"type": "text", "text": prompt}],
         }
     ]
 
@@ -48,7 +51,7 @@ def run_qwen_inference(
     )
     inputs = processor(
         text=[text],
-        images=[pil_image],
+        images=pil_images,
         padding=True,
         return_tensors="pt",
     ).to(model.device)

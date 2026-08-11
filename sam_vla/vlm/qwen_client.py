@@ -7,6 +7,7 @@ import io
 import json
 import socket
 import struct
+from typing import Optional
 
 import numpy as np
 
@@ -189,6 +190,55 @@ def drive_direction_verbose(
     return result["direction"], result
 
 
+def _ground_object_result(rgb: np.ndarray, target_text: str) -> dict:
+    response = _send_request(
+        "ground_object",
+        {"image_b64": _encode_image(rgb), "target_text": target_text},
+    )
+    if "error" in response:
+        raise ValueError(f"ground_object failed: {response['error']}")
+    return response["result"]
+
+
+def ground_object_verbose(
+    rgb: np.ndarray, target_text: str
+) -> tuple[Optional[tuple[float, float, float, float]], dict]:
+    """Open-vocabulary grounding for a named object (e.g. "flag", "blue
+    cuboid") with no SAM2 detector upstream -- see
+    sam_vla.goal_resolution.qwen_grounding_resolver, the caller-facing
+    GoalSpec-producing wrapper around this. Returns (bbox_norm, raw_result);
+    bbox_norm is None if the object wasn't found in frame."""
+    result = _ground_object_result(rgb, target_text)
+    bbox_norm = tuple(result["bbox_norm"]) if result["found"] else None
+    return bbox_norm, result
+
+
+def _parse_nav_command_result(rgb: np.ndarray, command_text: str) -> dict:
+    response = _send_request(
+        "parse_nav_command",
+        {"image_b64": _encode_image(rgb), "command_text": command_text},
+    )
+    if "error" in response:
+        raise ValueError(f"parse_nav_command failed: {response['error']}")
+    return response["result"]
+
+
+def parse_nav_command(rgb: np.ndarray, command_text: str) -> list[str]:
+    """Segment a free-text nav command (nav/gui.py's Command panel) into an
+    ordered list of distinct sub-goal phrases -- see
+    qwen_prompts.build_parse_nav_command_prompt for the exact contract."""
+    result = _parse_nav_command_result(rgb, command_text)
+    return result["targets"]
+
+
+def parse_nav_command_verbose(
+    rgb: np.ndarray, command_text: str
+) -> tuple[list[str], dict]:
+    """Same as parse_nav_command, but also returns the raw VLM result dict for logging."""
+    result = _parse_nav_command_result(rgb, command_text)
+    return result["targets"], result
+
+
 if __name__ == "__main__":
     import sys
 
@@ -210,6 +260,9 @@ if __name__ == "__main__":
 
     action = drive_action(rgb, goal_spec, frame_idx=0)
     print("drive_action ->", action)
+
+    targets = parse_nav_command(rgb, "go left find a flag and come back to home base")
+    print("parse_nav_command ->", targets)
 
     direction, result = drive_direction_verbose(rgb, goal_spec, frame_idx=0)
     print("drive_direction_verbose ->", direction, result)

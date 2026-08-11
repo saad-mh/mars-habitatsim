@@ -79,13 +79,15 @@ from sam_vla.core.pose_integrator import integrate_mars
 from sam_vla.core.types import Action, GoalSpec, Pose
 from sam_vla.env.habitat_env import HFOV_DEG, MarsHabitatEnv
 from sam_vla.env.terrain import SIZE_X, SIZE_Z
-from sam_vla.goal_resolution import first_frame_resolver
+from sam_vla.goal_resolution import first_frame_resolver, qwen_grounding_resolver
 from sam_vla.perception.semantic_overlay import (
     draw_point_marker,
     overlay_semantic_masks,
 )
 from sam_vla.policy.navdp_upstream_policy import NavdpUpstreamPolicy
 from sam_vla.safety.cbf_avoidance import CbfObstacleAvoidance
+from sam_vla.vlm import qwen_client
+from sam_vla.vlm.qwen_config import QWEN_SERVER_HOST, QWEN_SERVER_PORT
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
 
 from nav.goal_math import body_frame_goal, heading_ahead_point, random_ahead_point
@@ -95,13 +97,12 @@ from nav.goal_math import body_frame_goal, heading_ahead_point, random_ahead_poi
 # docstring) against the real BeliefGoalTracker.uncertainty_value() computed
 # below -- not scripts/habitat_tests/kb_teleop_vl.py's synthetic covariance
 # proxy, and not imported from that script, to keep nav/ decoupled from it.
-# vl_direction spins up its own Qwen subprocess (distinct port from
-# sam_vla.vlm's, see vl_direction/config.py), independent of --seg-backend's.
+# Talks to the same qwen_server this module already starts for goal
+# resolution/VLA actions (sam_vla.vlm.qwen_server now answers vl_direction's
+# "generate" wire mode too) instead of spawning a second qwen_vlm-env model
+# copy on its own port -- see QwenSocketClient construction in _run() below.
 from vl_direction import config as vl_dir_config
-from vl_direction.client import get_client as get_vl_direction_client
-from vl_direction.qwen_server_manager import (
-    QwenServerManager as VlDirectionQwenServerManager,
-)
+from vl_direction.client import QwenSocketClient as VlDirectionQwenClient
 from vl_direction.uncertainty_session import UncertaintySession
 
 MODE_IDLE = "idle"
@@ -283,6 +284,12 @@ class RoverController:
         self._manual_action = Action(0.0, 0.0, 0.0)
         self._world_goal: Optional[tuple] = None
         self._pending_resolve = False
+        # None -> first_frame_resolver's SAM2+Qwen-salience path (rocks etc,
+        # unchanged). Set -> qwen_grounding_resolver's direct-Qwen-bbox path
+        # for open-vocabulary targets (flags, the home-base cuboid) SAM2
+        # wasn't trained on. Persists across a Rerun of the same resolve
+        # (see request_rerun_segmentation), cleared on Reset.
+        self._resolve_target_text: Optional[str] = None
         self._pending_reset = False
         self._pending_pixel_click: Optional[tuple] = None
         self._pending_confirm_segmentation = False
@@ -290,6 +297,7 @@ class RoverController:
         self._pending_pick_manually = False
         self._pending_uncertainty_heading: Optional[float] = None
         self._pending_uncertainty_retry = False
+        self._pending_nav_command: Optional[str] = None
 
         # Only ever touched inside self._lock (read/written from both the
         # controller thread and the uncertainty-request background thread).
@@ -358,9 +366,14 @@ class RoverController:
         with self._lock:
             self._pending_pixel_click = (float(x_norm), float(y_norm))
 
-    def request_resolve(self) -> None:
+    def request_resolve(self, target_text: Optional[str] = None) -> None:
+        """target_text=None -> the original SAM2+Qwen-salience auto-resolve
+        (unchanged). A non-empty target_text (e.g. "flag", "blue cuboid")
+        switches to direct Qwen grounding for that object instead -- see
+        qwen_grounding_resolver, wired in via _do_resolve."""
         with self._lock:
             self._pending_resolve = True
+            self._resolve_target_text = target_text or None
 
     def request_confirm_segmentation(self) -> None:
         """Accept the goal/obstacle masks from the most recent resolve/rerun
@@ -402,6 +415,16 @@ class RoverController:
         with self._lock:
             self._pending_uncertainty_retry = True
 
+    def submit_nav_command(self, text: str) -> None:
+        """Queue a free-text nav command (nav/gui.py's Command panel) for
+        background segmentation into an ordered list of distinct
+        sub-goals/targets via the Qwen VLM (qwen_client.parse_nav_command,
+        see qwen_prompts.build_parse_nav_command_prompt) -- consumed and
+        dispatched next tick by _env_loop, result printed to the console by
+        _nav_command_worker. Not yet wired into actual goal-sequencing."""
+        with self._lock:
+            self._pending_nav_command = text
+
     def stop_driving(self) -> None:
         with self._lock:
             self._mode = MODE_IDLE
@@ -424,14 +447,15 @@ class RoverController:
 
         qwen_manager = QwenServerManager()
         services = [qwen_manager]
-        # vl_direction's own Qwen subprocess (distinct port, see this
-        # module's import comment) -- only spun up if the uncertainty halt
-        # is actually enabled, since it's an extra GPU-resident server.
+        # Uncertainty-halt reuses this same qwen_server (see this module's
+        # import comment) rather than spawning vl_direction's own -- no
+        # second service to start here, just a client pointed at the
+        # sam_vla.vlm qwen_config host/port.
         uncertainty_client = None
         if self.uncertainty_enabled:
-            vl_direction_qwen_manager = VlDirectionQwenServerManager()
-            services.append(vl_direction_qwen_manager)
-            uncertainty_client = get_vl_direction_client("qwen")
+            uncertainty_client = VlDirectionQwenClient(
+                host=QWEN_SERVER_HOST, port=QWEN_SERVER_PORT
+            )
         try:
             with MarsHabitatEnv(
                 self.scene_path,
@@ -523,12 +547,16 @@ class RoverController:
                     do_pick_manual,
                     uncertainty_heading,
                     do_uncertainty_retry,
+                    nav_command,
+                    resolve_target_text,
                 ) = self._consume_pending()
 
                 if do_reset:
                     goal_objects, obstacle_objects = self._clear_masks(
                         env, goal_objects, obstacle_objects
                     )
+                    with self._lock:
+                        self._resolve_target_text = None
                     belief_tracker = self._new_belief_tracker()
                     if avoidance is not None:
                         avoidance = self._new_avoidance()
@@ -556,7 +584,13 @@ class RoverController:
 
                 if do_resolve or do_rerun_seg:
                     goal_objects, obstacle_objects, goal_spec = self._do_resolve(
-                        env, step, mask_dir, goal_objects, obstacle_objects, goal_spec
+                        env,
+                        step,
+                        mask_dir,
+                        goal_objects,
+                        obstacle_objects,
+                        goal_spec,
+                        target_text=resolve_target_text,
                     )
                     belief_tracker.belief_g = None
                     with self._lock:
@@ -598,6 +632,9 @@ class RoverController:
 
                 if pixel_click is not None:
                     self._handle_pixel_click(obs, pixel_click)
+
+                if nav_command is not None:
+                    self._dispatch_nav_command(nav_command, obs.rgb)
 
                 if uncertainty_session is not None:
                     self._handle_uncertainty_commands(
@@ -820,9 +857,21 @@ class RoverController:
     # ------------------------------------------------------------------ #
     def _consume_pending(
         self,
-    ) -> tuple[bool, bool, Optional[tuple], bool, bool, bool, Optional[float], bool]:
+    ) -> tuple[
+        bool,
+        bool,
+        Optional[tuple],
+        bool,
+        bool,
+        bool,
+        Optional[float],
+        bool,
+        Optional[str],
+        Optional[str],
+    ]:
         with self._lock:
             do_resolve = self._pending_resolve
+            resolve_target_text = self._resolve_target_text
             do_reset = self._pending_reset
             pixel_click = self._pending_pixel_click
             do_confirm_seg = self._pending_confirm_segmentation
@@ -830,6 +879,7 @@ class RoverController:
             do_pick_manual = self._pending_pick_manually
             uncertainty_heading = self._pending_uncertainty_heading
             do_uncertainty_retry = self._pending_uncertainty_retry
+            nav_command = self._pending_nav_command
             self._pending_resolve = False
             self._pending_reset = False
             self._pending_pixel_click = None
@@ -838,6 +888,7 @@ class RoverController:
             self._pending_pick_manually = False
             self._pending_uncertainty_heading = None
             self._pending_uncertainty_retry = False
+            self._pending_nav_command = None
         return (
             do_resolve,
             do_reset,
@@ -847,6 +898,8 @@ class RoverController:
             do_pick_manual,
             uncertainty_heading,
             do_uncertainty_retry,
+            nav_command,
+            resolve_target_text,
         )
 
     def _handle_pixel_click(self, obs, pixel_click: tuple) -> None:
@@ -971,6 +1024,30 @@ class RoverController:
             self.display.uncertainty_request_in_flight = False
             self.display.uncertainty_line = line
 
+    def _dispatch_nav_command(self, text: str, frame: np.ndarray) -> None:
+        """Kicks off the (slow) nav-command-segmentation VLM call on a
+        background thread -- same reasoning as _dispatch_uncertainty_request,
+        the control loop must keep ticking at self.hz regardless of
+        inference latency."""
+        thread = threading.Thread(
+            target=self._nav_command_worker, args=(text, frame), daemon=True
+        )
+        thread.start()
+
+    @staticmethod
+    def _nav_command_worker(text: str, frame: np.ndarray) -> None:
+        """Runs on a background thread -- segments a free-text nav command
+        into an ordered list of distinct targets/instructions via
+        qwen_client.parse_nav_command and prints the result to the console
+        (nav/gui.py's Command panel docstring: "printed to the console for
+        now"). Never touches habitat-sim or self.display -- purely a CLI
+        side-channel until this is wired into actual goal-sequencing."""
+        try:
+            targets, _result = qwen_client.parse_nav_command_verbose(frame, text)
+            print(f"[nav command] {text!r} -> {targets}")
+        except Exception as exc:
+            print(f"[nav command] {text!r} failed: {exc}")
+
     def _new_belief_tracker(self) -> BeliefGoalTracker:
         # odom_noise/odom_noise_growth_rate drive uncertainty_value()'s real
         # growth while the goal mask is unseen (sam_vla.core.belief_tracking's
@@ -1003,7 +1080,14 @@ class RoverController:
         return [], []
 
     def _do_resolve(
-        self, env, step, mask_dir, goal_objects, obstacle_objects, current_goal_spec
+        self,
+        env,
+        step,
+        mask_dir,
+        goal_objects,
+        obstacle_objects,
+        current_goal_spec,
+        target_text: Optional[str] = None,
     ):
         obs_r = env.get_observation(frame_idx=step)
         # detect_rgb (if any) is a separate frame with the mesh_tight_bound2
@@ -1012,12 +1096,26 @@ class RoverController:
         # and what the GUI/backprojection use, unmodified.
         detect_rgb = env.get_mesh_overlay_rgb() if self.seg_overlay == "mesh" else None
         try:
-            goal_spec_r, vlm_result, dets = first_frame_resolver.resolve_verbose(
-                obs_r.rgb,
-                detect_rgb=detect_rgb,
-                backend=self.seg_backend,
-                checkpoint_path=self.seg_checkpoint,
-            )
+            if target_text:
+                # Open-vocabulary target (flag, blue cuboid, ...): Qwen
+                # grounds it directly, SAM2 only seeds obstacles. See
+                # qwen_grounding_resolver's module docstring for why this is
+                # a separate path from first_frame_resolver rather than a
+                # branch inside it.
+                goal_spec_r, vlm_result, dets = qwen_grounding_resolver.resolve_verbose(
+                    obs_r.rgb,
+                    target_text,
+                    detect_rgb=detect_rgb,
+                    backend=self.seg_backend,
+                    checkpoint_path=self.seg_checkpoint,
+                )
+            else:
+                goal_spec_r, vlm_result, dets = first_frame_resolver.resolve_verbose(
+                    obs_r.rgb,
+                    detect_rgb=detect_rgb,
+                    backend=self.seg_backend,
+                    checkpoint_path=self.seg_checkpoint,
+                )
         except Exception as exc:
             with self._lock:
                 self.display.status_text = f"resolve failed: {exc}"

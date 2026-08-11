@@ -78,6 +78,63 @@ def parse_direction_response(raw_text: str) -> dict:
     return parsed
 
 
+def parse_nav_command_response(raw_text: str) -> dict:
+    """Parse a build_parse_nav_command_prompt response: a non-empty list of
+    non-empty target/instruction phrase strings, in the order the model
+    infers the rover should pursue them."""
+    parsed = _load_json_object(raw_text)
+
+    targets = parsed.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise ValueError(
+            f"Missing or empty 'targets' list in response\nraw_text={raw_text!r}"
+        )
+    for target in targets:
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError(
+                f"'targets' must be a list of non-empty strings\nraw_text={raw_text!r}"
+            )
+
+    return parsed
+
+
+def parse_ground_object_response(raw_text: str) -> dict:
+    """Parse a build_ground_object_prompt response: either found=True with a
+    valid bbox_norm, or found=False with bbox_norm=None -- both are valid
+    outcomes (the object legitimately isn't in frame), only a malformed
+    response raises."""
+    parsed = _load_json_object(raw_text)
+
+    found = parsed.get("found")
+    if not isinstance(found, bool):
+        raise ValueError(
+            f"Missing or non-boolean 'found' in response\nraw_text={raw_text!r}"
+        )
+
+    if not found:
+        return {"found": False, "bbox_norm": None, "reasoning": parsed.get("reasoning", "")}
+
+    bbox_norm = parsed.get("bbox_norm")
+    if (
+        not isinstance(bbox_norm, list)
+        or len(bbox_norm) != 4
+        or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in bbox_norm)
+    ):
+        raise ValueError(
+            f"found=true but 'bbox_norm' is missing/malformed\nraw_text={raw_text!r}"
+        )
+
+    x0, y0, x1, y1 = (_clamp(float(v), 0.0, 1.0) for v in bbox_norm)
+    x0, x1 = min(x0, x1), max(x0, x1)
+    y0, y1 = min(y0, y1), max(y0, y1)
+
+    return {
+        "found": True,
+        "bbox_norm": [x0, y0, x1, y1],
+        "reasoning": parsed.get("reasoning", ""),
+    }
+
+
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
@@ -159,3 +216,10 @@ if __name__ == "__main__":
         parse_direction_response('{"direction": "spin", "reasoning": "nope"}')
     except ValueError as e:
         print(f"caught ValueError: {e}")
+
+    print("\n parsed nav command:")
+    print(
+        parse_nav_command_response(
+            '{"targets": ["go left", "flag", "home base"]}'
+        )
+    )

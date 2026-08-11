@@ -16,13 +16,17 @@ from sam_vla.vlm.qwen_model_runner import load_qwen_model, run_qwen_inference
 from sam_vla.vlm.qwen_prompts import (
     build_direction_prompt,
     build_drive_action_prompt,
+    build_ground_object_prompt,
     build_goal_vocabulary_prompt,
+    build_parse_nav_command_prompt,
     build_select_goal_prompt,
 )
 from sam_vla.vlm.qwen_response_parser import (
     parse_direction_response,
     parse_drive_action_response,
+    parse_ground_object_response,
     parse_goal_vocabulary_response,
+    parse_nav_command_response,
     parse_select_goal_response,
 )
 
@@ -108,6 +112,41 @@ def _handle_drive_direction(model, processor, payload: dict) -> dict:
     return {"result": result}
 
 
+def _handle_ground_object(model, processor, payload: dict) -> dict:
+    """Open-vocabulary grounding for objects SAM2/SAM2-LoRA wasn't trained on
+    (flags, the home-base cuboid) -- see build_ground_object_prompt. Unlike
+    _handle_select_goal, this has no detector upstream; Qwen proposes the
+    bbox itself."""
+    image = _decode_image(payload["image_b64"])
+    target_text = payload["target_text"]
+    prompt = build_ground_object_prompt(target_text)
+    raw_text = run_qwen_inference(model, processor, image, prompt)
+    result = parse_ground_object_response(raw_text)
+    return {"result": result}
+
+
+def _handle_parse_nav_command(model, processor, payload: dict) -> dict:
+    image = _decode_image(payload["image_b64"])
+    command_text = payload["command_text"]
+    prompt = build_parse_nav_command_prompt(command_text)
+    raw_text = run_qwen_inference(model, processor, image, prompt)
+    result = parse_nav_command_response(raw_text)
+    return {"result": result}
+
+
+def _handle_generate(model, processor, payload: dict) -> dict:
+    # Same "generate" wire format as vl_direction/qwen_server.py
+    # (free prompt + raw text out, no task-specific parsing) so this one
+    # server can also serve vl_direction's QwenSocketClient -- see
+    # nav/rover_controller.py, which points that client here instead of
+    # spawning a second qwen_vlm-env model copy on its own port.
+    images = [_decode_image(b64) for b64 in payload["images_b64"]]
+    prompt = payload["prompt"]
+    max_new_tokens = payload["max_new_tokens"]
+    text = run_qwen_inference(model, processor, images, prompt, max_new_tokens)
+    return {"result": {"text": text}}
+
+
 def _dispatch(model, processor, message: dict) -> dict:
     mode = message.get("mode")
     payload = message.get("payload", {})
@@ -122,6 +161,12 @@ def _dispatch(model, processor, message: dict) -> dict:
         return _handle_drive_action(model, processor, payload)
     if mode == "drive_direction":
         return _handle_drive_direction(model, processor, payload)
+    if mode == "parse_nav_command":
+        return _handle_parse_nav_command(model, processor, payload)
+    if mode == "ground_object":
+        return _handle_ground_object(model, processor, payload)
+    if mode == "generate":
+        return _handle_generate(model, processor, payload)
     raise ValueError(f"unknown mode: {mode!r}")
 
 

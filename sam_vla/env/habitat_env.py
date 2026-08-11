@@ -22,6 +22,7 @@ from sam_vla.env.sim_utils import (
     set_agent_pose,
     set_objects_hidden,
 )
+from sam_vla.env.pose_sweep import sample_in_place_sweep_yaws
 from sam_vla.env.rock_generation import RockSpec, load_rock_field, register_rocks
 
 RGB_HEIGHT = 480
@@ -327,6 +328,31 @@ class MarsHabitatEnv:
         / MESH_OBST_ID), 0 elsewhere. Requires with_semantic=True."""
         obs = self._sim.get_sensor_observations()
         return np.asarray(obs["semantic"])
+
+    def sweep_in_place(
+        self, num_yaws: int = 8, frame_idx_start: int = 0
+    ) -> List[Observation]:
+        """Rotate the agent through one full 360deg turn at its current
+        (x, z) -- no translation -- capturing one get_full_observation()
+        (rgb+depth+pose, plus semantic if with_semantic=True) per heading.
+        For a script that wants to look around from a fixed spot rather than
+        drive anywhere (e.g. surveying what's around the rover at a point),
+        not for driving/rollout loops. Restores the original heading before
+        returning. Headings come from sample_in_place_sweep_yaws, starting at
+        (and including) the current yaw."""
+        state = self._agent.get_state()
+        x, _y, z = (float(v) for v in state.position)
+        original_yaw = float(quaternion.as_rotation_vector(state.rotation)[1])
+
+        observations = []
+        for i, yaw in enumerate(
+            sample_in_place_sweep_yaws(num_yaws, start_yaw=original_yaw)
+        ):
+            self.step(Pose(x=x, y=0.0, z=z, yaw=yaw))
+            observations.append(self.get_full_observation(frame_idx=frame_idx_start + i))
+
+        self.step(Pose(x=x, y=0.0, z=z, yaw=original_yaw))
+        return observations
 
     def step(self, pose: Pose) -> None:
         # Match spawn's ground offset (local-max + clearance), not a raw single-point
