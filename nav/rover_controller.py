@@ -67,12 +67,14 @@ from typing import Optional, Sequence
 import numpy as np
 
 from sam_vla.core.belief_tracking import BeliefGoalTracker
+from sam_vla.core.ghost_mask import draw_ghost_mask
 from sam_vla.core.goal_geometry import (
     MESH_GOAL_ID,
     MESH_OBST_ID,
     backproject_goal_position,
     bbox_to_world,
     intrinsics_from_hfov,
+    project_world_point_with_pixel_radius,
     project_world_to_pixel,
 )
 from sam_vla.core.pose_integrator import integrate_mars
@@ -118,6 +120,12 @@ MODE_REVIEW_SEGMENTATION = "review_segmentation"
 
 # Ground-truth distance at which a point goal counts as reached
 POINT_GOAL_REACHED_M = 0.7
+
+# World-space radius of the ghost-mask circle drawn over a Qwen-grounded
+# open-vocabulary target (see _do_resolve/self._ground_target_world) --
+# reprojected to a depth-dependent pixel radius every frame, not a fixed
+# on-screen size (see project_world_point_with_pixel_radius).
+GHOST_TARGET_RADIUS_M = 0.5
 
 # Default annotations dir for seg_overlay="mesh" -- the dataset
 # sam_lora_runs/exp10 (the default seg_backend="lora" checkpoint) was
@@ -290,6 +298,13 @@ class RoverController:
         # wasn't trained on. Persists across a Rerun of the same resolve
         # (see request_rerun_segmentation), cleared on Reset.
         self._resolve_target_text: Optional[str] = None
+        # World position of the last Qwen-grounded target (see _do_resolve),
+        # for the ghost-mask overlay drawn every frame in _run. Only ever
+        # touched from _run's own background thread (_do_resolve/_clear_masks
+        # write it, _run's render section reads it, all on that one thread) --
+        # no lock needed, unlike the self._lock-guarded fields above/below
+        # that cross threads.
+        self._ground_target_world: Optional[tuple] = None
         self._pending_reset = False
         self._pending_pixel_click: Optional[tuple] = None
         self._pending_confirm_segmentation = False
@@ -417,9 +432,9 @@ class RoverController:
 
     def submit_nav_command(self, text: str) -> None:
         """Queue a free-text nav command (nav/gui.py's Command panel) for
-        background segmentation into an ordered list of distinct
-        sub-goals/targets via the Qwen VLM (qwen_client.parse_nav_command,
-        see qwen_prompts.build_parse_nav_command_prompt) -- consumed and
+        background segmentation into (directions, goals) via the Qwen VLM
+        (qwen_client.parse_nav_command, see
+        qwen_prompts.build_parse_nav_command_prompt) -- consumed and
         dispatched next tick by _env_loop, result printed to the console by
         _nav_command_worker. Not yet wired into actual goal-sequencing."""
         with self._lock:
@@ -819,6 +834,24 @@ class RoverController:
                 vis_rgb = overlay_semantic_masks(obs.rgb, semantic, text=status)
                 if goal_pixel is not None:
                     vis_rgb = draw_point_marker(vis_rgb, goal_pixel)
+                if self._ground_target_world is not None:
+                    # Reprojected every frame (not baked in once) so the
+                    # ghost mask tracks correctly as the rover moves -- only
+                    # drawn when the target's fixed world position actually
+                    # reprojects into this frame (project_world_point_with_pixel_radius
+                    # returns None otherwise), i.e. only ever shown over what
+                    # can currently be seen, never extrapolated off-screen.
+                    ground_proj = project_world_point_with_pixel_radius(
+                        obs.pose,
+                        self._ground_target_world,
+                        GHOST_TARGET_RADIUS_M,
+                        HFOV_DEG,
+                        obs.rgb.shape[1],
+                        obs.rgb.shape[0],
+                    )
+                    if ground_proj is not None:
+                        gu, gv, gr = ground_proj
+                        vis_rgb = draw_ghost_mask(vis_rgb, gu, gv, gr)
 
                 with self._lock:
                     d = self.display
@@ -1037,14 +1070,16 @@ class RoverController:
     @staticmethod
     def _nav_command_worker(text: str, frame: np.ndarray) -> None:
         """Runs on a background thread -- segments a free-text nav command
-        into an ordered list of distinct targets/instructions via
-        qwen_client.parse_nav_command and prints the result to the console
-        (nav/gui.py's Command panel docstring: "printed to the console for
-        now"). Never touches habitat-sim or self.display -- purely a CLI
-        side-channel until this is wired into actual goal-sequencing."""
+        into (directions, goals) via qwen_client.parse_nav_command and
+        prints the result to the console (nav/gui.py's Command panel
+        docstring: "printed to the console for now"). Never touches
+        habitat-sim or self.display -- purely a CLI side-channel until this
+        is wired into actual goal-sequencing."""
         try:
-            targets, _result = qwen_client.parse_nav_command_verbose(frame, text)
-            print(f"[nav command] {text!r} -> {targets}")
+            directions, goals, _result = qwen_client.parse_nav_command_verbose(
+                frame, text
+            )
+            print(f"[nav command] {text!r} -> directions={directions} goals={goals}")
         except Exception as exc:
             print(f"[nav command] {text!r} failed: {exc}")
 
@@ -1070,11 +1105,15 @@ class RoverController:
     def _new_avoidance(self) -> CbfObstacleAvoidance:
         return CbfObstacleAvoidance(**self._cbf_kwargs)
 
-    @staticmethod
-    def _clear_masks(env, goal_objects: list, obstacle_objects: list) -> tuple:
+    def _clear_masks(self, env, goal_objects: list, obstacle_objects: list) -> tuple:
         """Actually remove every registered goal/obstacle mask mesh from the
         scene (not just untag it) and return the emptied (goal, obstacle)
-        lists -- see _env_loop's goal_objects/obstacle_objects docstring."""
+        lists -- see _env_loop's goal_objects/obstacle_objects docstring.
+        Also drops any ground-target ghost-mask overlay (self._ground_target_world,
+        see _do_resolve) -- every call site here already means "this resolve's
+        state is being invalidated", the same boundary the ghost overlay
+        should disappear at."""
+        self._ground_target_world = None
         for obj in goal_objects + obstacle_objects:
             env.remove_object_mask(obj)
         return [], []
@@ -1117,6 +1156,12 @@ class RoverController:
                     checkpoint_path=self.seg_checkpoint,
                 )
         except Exception as exc:
+            # Console print too, not just the status banner -- a
+            # qwen_grounding_resolver "not found" RuntimeError carries
+            # Qwen's actual reasoning (see its message), which was
+            # previously only visible by reading the (often truncated)
+            # sidebar status text.
+            print(f"[nav resolve] failed: {exc}")
             with self._lock:
                 self.display.status_text = f"resolve failed: {exc}"
             # Leave the mode/masks/goal_spec exactly as they were -- a failed
@@ -1128,11 +1173,25 @@ class RoverController:
         # terminal (which detection the VLM picked as goal_index, and whether
         # that specific bbox's depth backprojection is what silently dropped
         # the goal mask below, as opposed to the VLM never picking one).
-        print(
-            f"[nav resolve] {len(dets)} detection(s), "
-            f"goal_index={vlm_result.get('goal_index')}, "
-            f"reasoning={vlm_result.get('reasoning', '')!r}"
-        )
+        if target_text:
+            # qwen_grounding_resolver's result shape (found/u/v/reasoning),
+            # not select_goal's (goal_index) -- dets here are SAM2's
+            # obstacle-only detections (see qwen_grounding_resolver), not
+            # goal candidates, so labeled accordingly to avoid implying
+            # they were candidates Qwen picked among.
+            print(
+                f"[nav resolve] qwen ground_object(target={target_text!r}): "
+                f"found={vlm_result.get('found')}, "
+                f"u={vlm_result.get('u')}, v={vlm_result.get('v')}, "
+                f"reasoning={vlm_result.get('reasoning', '')!r}, "
+                f"{len(dets)} SAM2 obstacle detection(s)"
+            )
+        else:
+            print(
+                f"[nav resolve] {len(dets)} detection(s), "
+                f"goal_index={vlm_result.get('goal_index')}, "
+                f"reasoning={vlm_result.get('reasoning', '')!r}"
+            )
 
         goal_position = backproject_goal_position(obs_r, goal_spec_r, hfov_deg=HFOV_DEG)
         goal_bbox_norm = goal_spec_r.goal_bbox_norm
@@ -1193,6 +1252,23 @@ class RoverController:
         goal_objects, obstacle_objects = self._clear_masks(
             env, goal_objects, obstacle_objects
         )
+        # Ghost-mask overlay for a Qwen-grounded target (register_object_mask
+        # above is a live 3D mesh, but dynamically registered objects render
+        # 0px on this GPU/driver -- see CLAUDE.md's known-issues memory --
+        # so it alone gives no visual confirmation grounding worked. This is
+        # read every frame in _run's render loop and reprojected via
+        # project_world_point_with_pixel_radius + ghost_mask.draw_ghost_mask,
+        # which (unlike register_object_mask) is a real 2D image overlay and
+        # does render. _clear_masks (just above) already reset this to None;
+        # only set it back when this was actually a Qwen-grounded resolve
+        # with a valid position -- the classic SAM2 auto-resolve path
+        # (target_text=None) keeps relying on the mesh-mask overlay as
+        # before. Excludes used_fallback: that promotes an *obstacle* rock's
+        # position as the goal when the grounded point's own depth was
+        # invalid, which would otherwise show the ghost mask over a rock
+        # instead of the actual requested target.
+        if target_text and goal_position is not None and not used_fallback:
+            self._ground_target_world = goal_position
         new_goal_objects: list = []
         new_obstacle_objects: list = []
         goal_mask_warning = ""

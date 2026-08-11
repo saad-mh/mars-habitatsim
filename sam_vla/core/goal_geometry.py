@@ -161,6 +161,43 @@ def project_world_to_pixel(
     return (int(round(px)), int(round(py)))
 
 
+def project_world_point_with_pixel_radius(
+    pose: Pose,
+    world_xyz: GoalPosition,
+    world_radius_m: float,
+    hfov_deg: float,
+    width: int,
+    height: int,
+) -> Optional[tuple[int, int, float]]:
+    """Same projection as project_world_to_pixel, plus the on-screen pixel
+    radius a sphere of `world_radius_m` centered at world_xyz would project
+    to at this depth (pinhole small-object approximation: radius_px = fx *
+    world_radius_m / z_cam) -- so a caller drawing a ghost mask (see
+    sam_vla.core.ghost_mask.draw_ghost_mask) at a fixed real-world radius
+    gets a circle whose apparent size tracks depth the way a real object's
+    would, instead of a constant pixel radius that reads too big up close or
+    too small far away. Returns None under the same out-of-frame/
+    behind-camera conditions as project_world_to_pixel."""
+    wx, wy, wz = world_xyz
+    dx = wx - pose.x
+    dz = wz - pose.z
+    cos_yaw, sin_yaw = math.cos(pose.yaw), math.sin(pose.yaw)
+    z_cam = -dx * sin_yaw - dz * cos_yaw
+    if z_cam <= 1e-3:
+        return None
+    x_cam = dx * cos_yaw - dz * sin_yaw
+    y_cam = pose.y - wy
+
+    fx = (width / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+    fy = fx
+    px = x_cam * fx / z_cam + width / 2.0
+    py = y_cam * fy / z_cam + height / 2.0
+    if not (0 <= px < width and 0 <= py < height):
+        return None
+    radius_px = fx * float(world_radius_m) / z_cam
+    return (int(round(px)), int(round(py)), radius_px)
+
+
 def backproject_goal_position(
     obs: Observation, goal_spec: GoalSpec, hfov_deg: float
 ) -> GoalPosition | None:

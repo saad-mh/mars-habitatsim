@@ -14,6 +14,8 @@ Run via nav/launch_nav.sh, or directly:
     conda activate habitat
     cd mars-habitatsim
     python -m nav.gui [--scene-path ...] [--heightmap-path ...] [--cbf/--no-cbf] ...
+
+TODO: remove qwen grounding and instead ground from grounding DiNO, probably create the mechanism from @sam_vla/run_navdp_dino_rollout.py .
 """
 
 from __future__ import annotations
@@ -279,13 +281,11 @@ class NavGuiApp:
         self.ground_entry = ctk.CTkEntry(
             actions, placeholder_text='"flag" / "blue cuboid"'
         )
-        self.ground_entry.grid(
-            row=4, column=0, sticky="ew", padx=(10, 4), pady=(4, 10)
-        )
+        self.ground_entry.grid(row=4, column=0, sticky="ew", padx=(10, 4), pady=(4, 10))
         self.ground_entry.bind("<Return>", lambda e: self.ground_target())
-        ctk.CTkButton(
-            actions, text="Ground Target", command=self.ground_target
-        ).grid(row=4, column=1, sticky="ew", padx=(4, 10), pady=(4, 10))
+        ctk.CTkButton(actions, text="Ground Target", command=self.ground_target).grid(
+            row=4, column=1, sticky="ew", padx=(4, 10), pady=(4, 10)
+        )
 
         # -- free-text command entry: sent to the Qwen VLM (see
         # submit_command / RoverController.submit_nav_command) to segment
@@ -560,10 +560,10 @@ class NavGuiApp:
 
     def submit_command(self) -> None:
         # Handed to RoverController.submit_nav_command, which segments it via
-        # the Qwen VLM (qwen_client.parse_nav_command) into an ordered list
-        # of distinct targets/instructions on a background thread -- see
-        # nav/rover_controller.py's _nav_command_worker. Result is printed to
-        # the console for now, not yet wired into actual goal-sequencing.
+        # the Qwen VLM (qwen_client.parse_nav_command) into (directions, goals)
+        # on a background thread -- see nav/rover_controller.py's
+        # _nav_command_worker. Result is printed to the console for now, not
+        # yet wired into actual goal-sequencing.
         text = self.command_entry.get().strip()
         if not text:
             return

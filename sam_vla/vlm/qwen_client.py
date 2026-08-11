@@ -202,15 +202,17 @@ def _ground_object_result(rgb: np.ndarray, target_text: str) -> dict:
 
 def ground_object_verbose(
     rgb: np.ndarray, target_text: str
-) -> tuple[Optional[tuple[float, float, float, float]], dict]:
+) -> tuple[Optional[tuple[float, float]], dict]:
     """Open-vocabulary grounding for a named object (e.g. "flag", "blue
     cuboid") with no SAM2 detector upstream -- see
     sam_vla.goal_resolution.qwen_grounding_resolver, the caller-facing
-    GoalSpec-producing wrapper around this. Returns (bbox_norm, raw_result);
-    bbox_norm is None if the object wasn't found in frame."""
+    GoalSpec-producing wrapper around this. Returns (point_norm, raw_result);
+    point_norm is a normalized (u, v) image point, or None if the object
+    wasn't found in frame. A point rather than a bbox -- see
+    qwen_prompts.build_ground_object_prompt for why."""
     result = _ground_object_result(rgb, target_text)
-    bbox_norm = tuple(result["bbox_norm"]) if result["found"] else None
-    return bbox_norm, result
+    point_norm = (result["u"], result["v"]) if result["found"] else None
+    return point_norm, result
 
 
 def _parse_nav_command_result(rgb: np.ndarray, command_text: str) -> dict:
@@ -223,20 +225,22 @@ def _parse_nav_command_result(rgb: np.ndarray, command_text: str) -> dict:
     return response["result"]
 
 
-def parse_nav_command(rgb: np.ndarray, command_text: str) -> list[str]:
-    """Segment a free-text nav command (nav/gui.py's Command panel) into an
-    ordered list of distinct sub-goal phrases -- see
+def parse_nav_command(rgb: np.ndarray, command_text: str) -> tuple[list[str], list[str]]:
+    """Segment a free-text nav command (nav/gui.py's Command panel) into
+    (directions, goals) -- directions is closed-vocabulary movement words
+    (see qwen_response_parser.NAV_COMMAND_DIRECTIONS), goals is free-text
+    target phrases kept as-is -- see
     qwen_prompts.build_parse_nav_command_prompt for the exact contract."""
     result = _parse_nav_command_result(rgb, command_text)
-    return result["targets"]
+    return result["directions"], result["goals"]
 
 
 def parse_nav_command_verbose(
     rgb: np.ndarray, command_text: str
-) -> tuple[list[str], dict]:
+) -> tuple[list[str], list[str], dict]:
     """Same as parse_nav_command, but also returns the raw VLM result dict for logging."""
     result = _parse_nav_command_result(rgb, command_text)
-    return result["targets"], result
+    return result["directions"], result["goals"], result
 
 
 if __name__ == "__main__":
@@ -261,8 +265,10 @@ if __name__ == "__main__":
     action = drive_action(rgb, goal_spec, frame_idx=0)
     print("drive_action ->", action)
 
-    targets = parse_nav_command(rgb, "go left find a flag and come back to home base")
-    print("parse_nav_command ->", targets)
+    directions, goals = parse_nav_command(
+        rgb, "go left find a flag and come back to home base"
+    )
+    print("parse_nav_command -> directions:", directions, "goals:", goals)
 
     direction, result = drive_direction_verbose(rgb, goal_spec, frame_idx=0)
     print("drive_direction_verbose ->", direction, result)

@@ -78,29 +78,50 @@ def parse_direction_response(raw_text: str) -> dict:
     return parsed
 
 
+NAV_COMMAND_DIRECTIONS = ("left", "right", "back", "front")
+
+
 def parse_nav_command_response(raw_text: str) -> dict:
-    """Parse a build_parse_nav_command_prompt response: a non-empty list of
-    non-empty target/instruction phrase strings, in the order the model
-    infers the rover should pursue them."""
+    """Parse a build_parse_nav_command_prompt response: a 'directions' list
+    (closed vocabulary, NAV_COMMAND_DIRECTIONS) and a 'goals' list (free-text
+    target phrases, kept as-is), each in the order the model infers the
+    rover should pursue them. Either list may be empty, but not both."""
     parsed = _load_json_object(raw_text)
 
-    targets = parsed.get("targets")
-    if not isinstance(targets, list) or not targets:
+    directions = parsed.get("directions")
+    if not isinstance(directions, list):
         raise ValueError(
-            f"Missing or empty 'targets' list in response\nraw_text={raw_text!r}"
+            f"Missing or non-list 'directions' in response\nraw_text={raw_text!r}"
         )
-    for target in targets:
-        if not isinstance(target, str) or not target.strip():
+    for direction in directions:
+        if direction not in NAV_COMMAND_DIRECTIONS:
             raise ValueError(
-                f"'targets' must be a list of non-empty strings\nraw_text={raw_text!r}"
+                f"'directions' must only contain one of {NAV_COMMAND_DIRECTIONS}"
+                f"\nraw_text={raw_text!r}"
             )
 
-    return parsed
+    goals = parsed.get("goals")
+    if not isinstance(goals, list):
+        raise ValueError(
+            f"Missing or non-list 'goals' in response\nraw_text={raw_text!r}"
+        )
+    for goal in goals:
+        if not isinstance(goal, str) or not goal.strip():
+            raise ValueError(
+                f"'goals' must be a list of non-empty strings\nraw_text={raw_text!r}"
+            )
+
+    if not directions and not goals:
+        raise ValueError(
+            f"Both 'directions' and 'goals' are empty in response\nraw_text={raw_text!r}"
+        )
+
+    return {"directions": directions, "goals": goals}
 
 
 def parse_ground_object_response(raw_text: str) -> dict:
     """Parse a build_ground_object_prompt response: either found=True with a
-    valid bbox_norm, or found=False with bbox_norm=None -- both are valid
+    valid (u, v) point, or found=False with u=v=None -- both are valid
     outcomes (the object legitimately isn't in frame), only a malformed
     response raises."""
     parsed = _load_json_object(raw_text)
@@ -112,25 +133,28 @@ def parse_ground_object_response(raw_text: str) -> dict:
         )
 
     if not found:
-        return {"found": False, "bbox_norm": None, "reasoning": parsed.get("reasoning", "")}
+        return {
+            "found": False,
+            "u": None,
+            "v": None,
+            "reasoning": parsed.get("reasoning", ""),
+        }
 
-    bbox_norm = parsed.get("bbox_norm")
+    u, v = parsed.get("u"), parsed.get("v")
     if (
-        not isinstance(bbox_norm, list)
-        or len(bbox_norm) != 4
-        or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in bbox_norm)
+        not isinstance(u, (int, float))
+        or isinstance(u, bool)
+        or not isinstance(v, (int, float))
+        or isinstance(v, bool)
     ):
         raise ValueError(
-            f"found=true but 'bbox_norm' is missing/malformed\nraw_text={raw_text!r}"
+            f"found=true but 'u'/'v' are missing/non-numeric\nraw_text={raw_text!r}"
         )
-
-    x0, y0, x1, y1 = (_clamp(float(v), 0.0, 1.0) for v in bbox_norm)
-    x0, x1 = min(x0, x1), max(x0, x1)
-    y0, y1 = min(y0, y1), max(y0, y1)
 
     return {
         "found": True,
-        "bbox_norm": [x0, y0, x1, y1],
+        "u": _clamp(float(u), 0.0, 1.0),
+        "v": _clamp(float(v), 0.0, 1.0),
         "reasoning": parsed.get("reasoning", ""),
     }
 
@@ -220,6 +244,6 @@ if __name__ == "__main__":
     print("\n parsed nav command:")
     print(
         parse_nav_command_response(
-            '{"targets": ["go left", "flag", "home base"]}'
+            '{"directions": ["left"], "goals": ["flag", "home base"]}'
         )
     )

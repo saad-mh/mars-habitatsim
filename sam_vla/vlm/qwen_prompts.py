@@ -167,33 +167,41 @@ def build_drive_action_prompt(instruction_text: str, frame_idx: int) -> str:
 
 def build_parse_nav_command_prompt(command_text: str) -> str:
     """nav/gui.py's free-text Command panel: segments a natural-language nav
-    command into an ordered list of distinct sub-goals -- each either a
-    short movement instruction or a short phrase naming a specific target
-    object -- so a multi-target command like "go left, find a flag, then
-    come back to home base" can eventually drive goal-sequencing one target
-    at a time instead of being handed to goal resolution as one opaque
+    command into two ordered lists -- "directions" (closed-vocabulary
+    movement instructions) and "goals" (short phrases naming specific
+    target objects) -- so a multi-part command like "go left, find a flag,
+    then come back to home base" can eventually drive goal-sequencing one
+    step at a time instead of being handed to goal resolution as one opaque
     string. The image is scene context only (nothing here is graded against
     it yet)."""
     return (
         "You are a command parser for a Mars rover. The image is the "
         "rover's current camera view, given for context only.\n\n"
         f'Rover command: "{command_text}"\n\n'
-        "Break this command into an ordered list of distinct sub-goals the "
-        "rover should pursue in sequence. Each item is either a short "
-        'movement instruction (e.g. "go left") or a short phrase naming a '
-        'specific target object to find or navigate to (e.g. "white flag", '
-        '"flag on the right", "home base"). Preserve the order implied by '
-        "the command, and keep each phrase as short as possible while "
-        "still distinguishing it from any other target in the same "
-        'command (e.g. keep "on the right" only if there is more than one '
-        "flag to tell apart).\n\n"
+        "Break this command into two ordered lists:\n"
+        '  "directions": plain movement instructions, each normalized to '
+        'exactly one of "left", "right", "back", "front" (e.g. "go left" '
+        '-> "left", "turn around" -> "back", "keep going straight" -> '
+        '"front"). Only include an entry here for movement with no named '
+        "target -- a command to navigate toward a specific object (even "
+        '"go back to home base") belongs in "goals", not here.\n'
+        '  "goals": short phrases naming a specific target object to find '
+        'or navigate to (e.g. "white flag", "flag on the right", "home '
+        'base"), kept as close to the original wording as possible while '
+        "staying as short as possible -- still distinguishing it from any "
+        'other target in the same command (e.g. keep "on the right" only '
+        "if there is more than one flag to tell apart).\n\n"
+        "Preserve the order implied by the command within each list "
+        "separately.\n\n"
         "Examples:\n"
         '  "go left find a flag and come back to home base" -> '
-        '["go left", "flag", "home base"]\n'
+        '{"directions": ["left"], "goals": ["flag", "home base"]}\n'
         '  "find the white flag and then go to the flag on the right" -> '
-        '["white flag", "flag on the right"]\n\n'
+        '{"directions": [], "goals": ["white flag", "flag on the right"]}\n'
+        '  "turn right then go straight" -> '
+        '{"directions": ["right", "front"], "goals": []}\n\n'
         "Respond with ONLY a JSON object in this exact format, no other "
-        'text:\n{"targets": [<str>, ...]}'
+        'text:\n{"directions": [<str>, ...], "goals": [<str>, ...]}'
     )
 
 
@@ -204,20 +212,28 @@ def build_ground_object_prompt(target_text: str) -> str:
     upstream -- for object classes SAM2/SAM2-LoRA wasn't trained on (e.g.
     the placed flag markers, the home-base ghost cuboid, see
     sam_vla/env/flag_placement.py, sam_vla/env/home_base.py), not for rocks,
-    which stay on the SAM2 path."""
+    which stay on the SAM2 path.
+
+    Asks for a single point rather than a bbox: a tight bbox is a harder
+    regression target for a VLM to get right than "where roughly is it",
+    and the caller only ever needs a point to backproject/draw a ghost mask
+    at anyway (see qwen_grounding_resolver, nav/rover_controller.py's
+    ground-target ghost-mask overlay)."""
     return (
         "You are the vision system for a Mars rover. The image shows the "
-        f'rover\'s current camera view. Find the "{target_text}" in this '
-        "image.\n\n"
+        f'rover\'s current camera view. Look for the "{target_text}" in '
+        "this image.\n\n"
         "If it is visible, respond with ONLY a JSON object in this exact "
         "format, no other text:\n"
-        '{"found": true, "bbox_norm": [x_min, y_min, x_max, y_max], '
+        '{"found": true, "u": <float in [0, 1]>, "v": <float in [0, 1]>, '
         '"reasoning": <str, brief explanation>}\n'
-        "bbox_norm is a normalized bounding box tightly around the object, "
-        "each value in [0, 1] image coordinates (x: 0=left edge, "
-        "1=right edge; y: 0=top edge, 1=bottom edge).\n\n"
+        f'u/v is the approximate point at the center of the "{target_text}" '
+        "in normalized image coordinates (u: 0=left edge, 1=right edge; "
+        "v: 0=top edge, 1=bottom edge). Base u/v only on where you can "
+        "actually see it in this specific image -- do not estimate a "
+        "location for it if you cannot see it.\n\n"
         f'If the "{target_text}" is not visible anywhere in the image, '
-        'respond with ONLY {"found": false, "bbox_norm": null, '
+        'respond with ONLY {"found": false, "u": null, "v": null, '
         '"reasoning": <str, brief explanation>}'
     )
 
@@ -278,7 +294,5 @@ if __name__ == "__main__":
     print()
     print("=== build_parse_nav_command_prompt ===")
     print(
-        build_parse_nav_command_prompt(
-            "go left find a flag and come back to home base"
-        )
+        build_parse_nav_command_prompt("go left find a flag and come back to home base")
     )
