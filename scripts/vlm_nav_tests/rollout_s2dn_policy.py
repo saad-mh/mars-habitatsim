@@ -252,6 +252,10 @@ def start_server(args: argparse.Namespace) -> Optional[subprocess.Popen[Any]]:
         str(args.particles),
         "--particle-std",
         str(args.particle_std),
+        "--gradient-steps",
+        str(args.gradient_steps),
+        "--gradient-step-size",
+        str(args.gradient_step_size),
         "--guidance-strength",
         str(args.guidance_strength),
         "--temperature",
@@ -887,7 +891,7 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--navdp-python", default=sys.executable)
     argument_parser.add_argument("--navdp-device", default="cuda:0")
     argument_parser.add_argument(
-        "--planner-mode", choices=["pure-navdp", "s2diff"], default="s2diff"
+        "--planner-mode", choices=["pure-navdp", "s2diff", "gradient"], default="s2diff"
     )
     argument_parser.add_argument(
         "--remove-critic", action=argparse.BooleanOptionalAction, default=True
@@ -902,6 +906,8 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--candidates", type=int, default=16)
     argument_parser.add_argument("--particles", type=int, default=8)
     argument_parser.add_argument("--particle-std", type=float, default=0.22)
+    argument_parser.add_argument("--gradient-steps", type=int, default=3)
+    argument_parser.add_argument("--gradient-step-size", type=float, default=0.04)
     argument_parser.add_argument("--guidance-strength", type=float, default=0.85)
     argument_parser.add_argument("--temperature", type=float, default=0.35)
     argument_parser.add_argument("--safe-distance", type=float, default=0.42)
@@ -1056,6 +1062,8 @@ def main() -> None:
             "navdp-s2diff-pixels",
             "navdp-hlc-s2diff",
             "navdp-hlc-s2diff-no-critic",
+            "navdp-hlc-gradient",
+            "navdp-hlc-gradient-no-critic",
             "navdp-pure-critic",
         }
         if algorithm not in supported_algorithms:
