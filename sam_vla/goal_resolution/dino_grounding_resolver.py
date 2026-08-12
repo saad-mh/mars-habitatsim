@@ -80,6 +80,46 @@ def _to_prompt(target_text: str) -> str:
     return text if text.endswith(".") else text + "."
 
 
+# Above this IoU (against the DINO-grounded goal_bbox_norm), a SAM2
+# "obstacle" detection is treated as the same physical object DINO just
+# grounded, not a distinct one -- see _drop_goal_overlap.
+_GOAL_OVERLAP_IOU_THRESHOLD = 0.3
+
+
+def _iou_norm(a: tuple, b: tuple) -> float:
+    """IoU of two normalized (0-1) xyxy boxes."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def _drop_goal_overlap(
+    goal_bbox_norm: tuple, detections: List[Detection]
+) -> List[Detection]:
+    """SAM2's obstacle sweep (first_frame_resolver.resolve_obstacles) is run
+    blind to what DINO just grounded -- it segments everything in frame,
+    which usually includes the DINO-grounded object itself. Without this
+    filter that same object ends up registered TWICE by _do_resolve: once as
+    the goal mesh (from goal_bbox_norm) and again as an obstacle mesh
+    (from here), overlapping it -- the CBF then steers to avoid the very
+    thing it's driving toward. Drop any SAM detection that substantially
+    overlaps the goal box; a real, distinct obstacle standing next to (not
+    on top of) the goal keeps a low IoU and survives this filter."""
+    return [
+        d
+        for d in detections
+        if _iou_norm(goal_bbox_norm, d.bbox_norm) < _GOAL_OVERLAP_IOU_THRESHOLD
+    ]
+
+
 def resolve_verbose(
     rgb: np.ndarray,
     target_text: str,
@@ -145,6 +185,12 @@ def resolve_verbose(
         # depend on SAM2 finding anything -- only obstacles do, so zero
         # detections is a legitimate (obstacle-free) outcome, not a failure.
         obstacle_detections = []
+    else:
+        # SAM2 doesn't know what DINO just grounded -- strip out whichever
+        # of its detections is actually the grounded target itself so it
+        # doesn't also get registered as an obstacle mesh on top of the
+        # goal mesh (see _drop_goal_overlap).
+        obstacle_detections = _drop_goal_overlap(goal_bbox_norm, obstacle_detections)
 
     goal_spec = GoalSpec(
         goal_bbox_norm=goal_bbox_norm,

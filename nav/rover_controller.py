@@ -1337,59 +1337,14 @@ class RoverController:
                 return goal_objects, obstacle_objects, goal_spec
 
             if goal.kind in (GoalKind.GO_TO, GoalKind.FIND):
-                # Search/scan for every remaining GO_TO/FIND target in this
-                # mission (mission.py's GoalKind.FIND docstring: "search/scan
-                # until a target appears") -- restricted to exactly this
-                # list, no open-ended DINO prompts -- before trying the
-                # existing single-frame resolve below, which only ever sees
-                # whatever's already in the current frame. A target that
-                # was off-frame at mission-start (the common FIND case) would
-                # otherwise just fail to resolve and get skipped.
-                remaining_targets = [
-                    g.target
-                    for g in mission.goals[mission.idx :]
-                    if g.kind in (GoalKind.GO_TO, GoalKind.FIND)
-                ]
-                sweep_trackers = {t: self._new_belief_tracker() for t in remaining_targets}
-                try:
-                    dino_grounding_resolver.sweep_and_seed_beliefs(
-                        env,
-                        remaining_targets,
-                        sweep_trackers,
-                        hfov_deg=HFOV_DEG,
-                        num_yaws=self.mission_sweep_yaws,
-                        dino_model_id=self.dino_model_id,
-                        dino_device=self.dino_device,
-                        dino_box_threshold=self.dino_box_threshold,
-                        dino_text_threshold=self.dino_text_threshold,
-                    )
-                except Exception as exc:
-                    print(f"[mission] sweep over {remaining_targets!r} failed: {exc}")
-                else:
-                    found = [t for t in remaining_targets if sweep_trackers[t].belief_g is not None]
-                    print(f"[mission] sweep over {remaining_targets!r} found: {found!r}")
-
-                current_tracker = sweep_trackers[goal.target]
-                if current_tracker.belief_g is not None:
-                    # Turn to face the sweep's live (rotation-corrected, not
-                    # first-sighting-stale) bearing so the single-frame
-                    # resolve below actually has the target in view -- same
-                    # sign convention as goal_math.heading_ahead_point's
-                    # theta = yaw + heading_deg (bearing() uses the same
-                    # atan2(left, forward) this module's body_frame_goal
-                    # does). Propagate the sweep tracker by that exact turn
-                    # too (ordinary BeliefGoalTracker.propagate, one more
-                    # step) so its belief_g stays correct for the
-                    # observe_body_point seed below.
-                    bearing = current_tracker.bearing()
-                    pose = self.display.pose
-                    current_tracker.propagate(
-                        Action(v_fwd=0.0, v_lat=0.0, yaw_rate=bearing), dt=1.0
-                    )
-                    env.step(
-                        Pose(x=pose.x, y=0.0, z=pose.z, yaw=pose.yaw + bearing)
-                    )
-
+                # Single front-facing DINO resolve on whatever's already in
+                # the current frame -- no 360 sweep. sweep_and_seed_beliefs
+                # (dino_grounding_resolver) rotated through 8 discrete
+                # headings with no cross-frame consistency check on what it
+                # found, which let a single high-scoring false positive
+                # (e.g. a blue cuboid grounding "flag") pick the bearing the
+                # rover then turned to face and re-resolved against. Disabled
+                # for now -- see this session's flag-misdetection debugging.
                 goal_objects, obstacle_objects, goal_spec = self._do_resolve(
                     env,
                     step,
@@ -1415,18 +1370,13 @@ class RoverController:
                             f"[mission] resolved: {goal_spec.instruction_text}"
                         )
                 if resolved:
-                    if current_tracker.belief_g is not None:
-                        # Seed the live tracker from the sweep's own sighting
-                        # rather than leave belief_g at whatever it was
-                        # before this sub-goal (possibly None, possibly a
-                        # stale point from the PREVIOUS sub-goal) -- the
-                        # per-tick MODE_RESOLVE loop only re-observes via the
-                        # live goal mask, which never renders on this
-                        # GPU/driver (see CLAUDE.md's dynamic-object-render
-                        # bug), so without this the belief would just sit on
-                        # whatever it last held instead of this sighting.
-                        forward, left = (float(v) for v in current_tracker.belief_g)
-                        belief_tracker.observe_body_point(forward, left)
+                    # No sweep-tracker sighting to seed belief_tracker from
+                    # here -- MODE_RESOLVE's own per-tick fallback
+                    # (self._ground_target_world -> body_frame_goal ->
+                    # observe_body_point, see the MODE_RESOLVE branch below)
+                    # already re-seeds it from the same ground_target_world
+                    # _do_resolve just set, as soon as the target is next
+                    # in-frame.
                     return goal_objects, obstacle_objects, goal_spec
                 print(f"[mission] step {goal.raw!r} failed to resolve -- skipping")
                 with self._lock:

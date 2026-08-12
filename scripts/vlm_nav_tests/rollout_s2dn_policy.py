@@ -39,6 +39,7 @@ class NavDPS2DiffOutput:
     escape_turn: bool
     valid_obstacle_points: int
     selected_circulation_sign: float
+    candidate_circulation_signs: np.ndarray
     selected_barrier_energy: float
     selected_circulation_energy: float
     minimum_clearance: np.ndarray
@@ -83,10 +84,17 @@ class NavDPS2DiffClient:
         rgb: np.ndarray,
         depth: np.ndarray,
         obstacle_pixels: np.ndarray,
+        goal_mode: str = "point",
+        forced_circulation_sign: float = 0.0,
     ) -> NavDPS2DiffOutput:
         goal_xy = np.asarray(goal_xy, dtype=np.float32).reshape(-1)
         if goal_xy.shape != (2,):
             raise ValueError(f"goal_xy must have shape [2], got {goal_xy.shape}")
+        if goal_mode not in {"point", "pixel"}:
+            raise ValueError("goal_mode must be point or pixel")
+        forced_circulation_sign = float(forced_circulation_sign)
+        if forced_circulation_sign not in {-1.0, 0.0, 1.0}:
+            raise ValueError("forced_circulation_sign must be -1, 0, or +1")
 
         rgb = np.asarray(rgb, dtype=np.uint8)
         if rgb.ndim != 3 or rgb.shape[-1] < 3:
@@ -98,6 +106,15 @@ class NavDPS2DiffClient:
             depth = depth[..., 0]
         if depth.shape != rgb.shape[:2]:
             raise ValueError(f"depth/rgb shape mismatch: {depth.shape} vs {rgb.shape[:2]}")
+
+        if goal_mode == "pixel":
+            if not np.all(np.isfinite(goal_xy)) or not np.allclose(
+                goal_xy, np.round(goal_xy)
+            ):
+                raise ValueError("PixelGoal must be integer [u,v]")
+            goal_xy = np.round(goal_xy).astype(np.int64)
+            if not (0 <= goal_xy[0] < rgb.shape[1] and 0 <= goal_xy[1] < rgb.shape[0]):
+                raise ValueError("PixelGoal lies outside the RGB image")
 
         pixels = np.asarray(obstacle_pixels)
         if pixels.size == 0:
@@ -116,8 +133,9 @@ class NavDPS2DiffClient:
         depth_bytes = io.BytesIO()
         Image.fromarray(depth_u16).save(depth_bytes, format="PNG")
 
+        endpoint = "pixelgoal_step" if goal_mode == "pixel" else "pointgoal_step"
         response = requests.post(
-            f"{self.server_url}/pointgoal_step",
+            f"{self.server_url}/{endpoint}",
             files={
                 "image": ("image.jpg", rgb_bytes.getvalue(), "image/jpeg"),
                 "depth": ("depth.png", depth_bytes.getvalue(), "image/png"),
@@ -128,6 +146,7 @@ class NavDPS2DiffClient:
                         "goal_x": [float(goal_xy[0])],
                         "goal_y": [float(goal_xy[1])],
                         "obstacle_pixels": [pixels.tolist()],
+                        "forced_circulation_signs": [forced_circulation_sign],
                     }
                 )
             },
@@ -150,6 +169,9 @@ class NavDPS2DiffClient:
             valid_obstacle_points=int(diagnostics["valid_obstacle_points"][0]),
             selected_circulation_sign=float(
                 diagnostics["selected_circulation_sign"][0]
+            ),
+            candidate_circulation_signs=np.asarray(
+                diagnostics["candidate_circulation_signs"][0], dtype=np.float32
             ),
             selected_barrier_energy=float(diagnostics["selected_barrier_energy"][0]),
             selected_circulation_energy=float(
@@ -186,6 +208,77 @@ class NavDPS2DiffClient:
         response.raise_for_status()
 
 
+@dataclass(frozen=True)
+class QwenHomotopyDecision:
+    side: str
+    circulation_sign: float
+    confidence: float
+    obstacle_relevant: bool
+    queried_qwen: bool
+    raw_response: Optional[str]
+    repeated_sides: tuple[str, ...]
+    repeated_confidences: tuple[float, ...]
+    consistency_rate: float
+    used_fallback: bool
+
+
+class QwenHomotopyClient:
+    """HTTP client for the isolated visual-Qwen process."""
+
+    def __init__(self, server_url: str, timeout: float = 300.0) -> None:
+        self.server_url = server_url.rstrip("/")
+        self.timeout = float(timeout)
+
+    def reset(self) -> None:
+        response = requests.post(f"{self.server_url}/reset", timeout=self.timeout)
+        self._raise_for_error(response)
+
+    def step(
+        self, overlaid_rgb: np.ndarray, obstacle_mask: np.ndarray
+    ) -> QwenHomotopyDecision:
+        image_bytes = io.BytesIO()
+        Image.fromarray(np.asarray(overlaid_rgb, dtype=np.uint8)).save(
+            image_bytes, format="PNG"
+        )
+        mask_bytes = io.BytesIO()
+        Image.fromarray(
+            (np.asarray(obstacle_mask) > 0).astype(np.uint8) * 255
+        ).save(mask_bytes, format="PNG")
+        response = requests.post(
+            f"{self.server_url}/select",
+            files={
+                "image": ("overlay.png", image_bytes.getvalue(), "image/png"),
+                "obstacle_mask": ("mask.png", mask_bytes.getvalue(), "image/png"),
+            },
+            timeout=self.timeout,
+        )
+        self._raise_for_error(response)
+        payload = response.json()
+        return QwenHomotopyDecision(
+            side=str(payload["side"]),
+            circulation_sign=float(payload["circulation_sign"]),
+            confidence=float(payload["confidence"]),
+            obstacle_relevant=bool(payload["obstacle_relevant"]),
+            queried_qwen=bool(payload["queried_qwen"]),
+            raw_response=payload.get("raw_response"),
+            repeated_sides=tuple(payload.get("repeated_sides", [])),
+            repeated_confidences=tuple(
+                float(value) for value in payload.get("repeated_confidences", [])
+            ),
+            consistency_rate=float(payload.get("consistency_rate", 1.0)),
+            used_fallback=bool(payload.get("used_fallback", False)),
+        )
+
+    @staticmethod
+    def _raise_for_error(response: requests.Response) -> None:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and "error" in payload:
+            raise RuntimeError(str(payload["error"]))
+        response.raise_for_status()
+
 def port_is_open(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=1.0):
@@ -219,6 +312,47 @@ def stop_server(process: Optional[subprocess.Popen[Any]]) -> None:
         process.kill()
         process.wait()
 
+
+def start_qwen_homotopy_server(
+    args: argparse.Namespace,
+) -> Optional[subprocess.Popen[Any]]:
+    if not args.qwen_homotopy or not args.start_qwen_homotopy_server:
+        return None
+    if port_is_open(args.qwen_homotopy_host, args.qwen_homotopy_port):
+        raise RuntimeError(
+            f"Qwen homotopy port {args.qwen_homotopy_port} is already in use; "
+            "pass --no-start-qwen-homotopy-server to use an existing service"
+        )
+    server_file = HERE / "qwen_homotopy_server.py"
+    if not server_file.is_file():
+        raise FileNotFoundError(f"Qwen homotopy server not found: {server_file}")
+    command = [
+        str(args.qwen_homotopy_python),
+        str(server_file),
+        "--host",
+        str(args.qwen_homotopy_host),
+        "--port",
+        str(args.qwen_homotopy_port),
+        "--model-id",
+        str(args.qwen_model_id),
+        "--device",
+        str(args.qwen_device),
+        "--minimum-obstacle-pixels",
+        str(args.homotopy_minimum_obstacle_pixels),
+        "--release-clear-frames",
+        str(args.homotopy_release_clear_frames),
+        "--consistency-repeats",
+        str(args.homotopy_consistency_repeats),
+    ]
+    print("[qwen-server]", " ".join(command), flush=True)
+    process = subprocess.Popen(command, cwd=str(HERE))
+    wait_for_server(
+        process,
+        args.qwen_homotopy_host,
+        args.qwen_homotopy_port,
+        args.qwen_homotopy_timeout,
+    )
+    return process
 
 def start_server(args: argparse.Namespace) -> Optional[subprocess.Popen[Any]]:
     if not args.start_server:
@@ -936,6 +1070,36 @@ def camera_intrinsic(height: int, width: int, hfov_deg: float) -> np.ndarray:
     )
 
 
+
+def world_goal_to_pixel(
+    point: np.ndarray,
+    position: np.ndarray,
+    yaw: float,
+    intrinsic: np.ndarray,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Project a world goal to a valid PixelGoal, clamping off-screen bearings."""
+
+    right, up, forward = camera_coordinates(point, position, yaw)
+    fx, fy = float(intrinsic[0, 0]), float(intrinsic[1, 1])
+    cx, cy = float(intrinsic[0, 2]), float(intrinsic[1, 2])
+    margin = 11
+    bearing = math.atan2(right, forward)
+    maximum_bearing = math.atan2(max(cx - margin, 1.0), fx)
+    bearing = float(np.clip(bearing, -maximum_bearing, maximum_bearing))
+    u = cx + fx * math.tan(bearing)
+    v = cy - fy * up / forward if forward > 0.05 else 0.62 * height
+    return np.asarray(
+        [
+            int(np.clip(round(u), margin, width - margin - 1)),
+            int(np.clip(round(v), margin, height - margin - 1)),
+        ],
+        dtype=np.int32,
+    )
+
+
+
 def circle_mask(height: int, width: int, u: float, v: float, radius: int) -> np.ndarray:
     yy, xx = np.ogrid[:height, :width]
     return (((xx - u) ** 2 + (yy - v) ** 2) <= radius**2).astype(np.uint8)
@@ -1023,6 +1187,8 @@ def overlay_frame(
     text: str,
     *,
     show_masks: bool,
+    detection_box: Optional[np.ndarray] = None,
+    detection_label: Optional[str] = None,
 ) -> Image.Image:
     output = np.asarray(rgb, dtype=np.uint8).copy()
     if show_masks:
@@ -1034,6 +1200,11 @@ def overlay_frame(
         ).astype(np.uint8)
     image = Image.fromarray(output)
     draw = ImageDraw.Draw(image)
+    if detection_box is not None:
+        x1, y1, x2, y2 = [float(value) for value in detection_box]
+        draw.rectangle((x1, y1, x2, y2), outline=(255, 255, 0), width=3)
+        if detection_label:
+            draw.text((x1 + 2, max(y1 - 14, 2)), detection_label, fill=(255, 255, 0))
     draw.rectangle((5, 5, min(image.width - 5, 12 + len(text) * 7), 28), fill=(0, 0, 0))
     draw.text((10, 9), text, fill=(255, 255, 255))
     return image
@@ -1057,6 +1228,35 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--navdp-device", default="cuda:0")
     argument_parser.add_argument(
         "--planner-mode", choices=["pure-navdp", "s2diff", "gradient"], default="s2diff"
+    )
+    argument_parser.add_argument(
+        "--goal-mode", choices=["point", "pixel"], default="point"
+    )
+    argument_parser.add_argument(
+        "--qwen-model-id", default="Qwen/Qwen2.5-VL-3B-Instruct"
+    )
+    argument_parser.add_argument("--qwen-device", default="auto")
+    argument_parser.add_argument("--qwen-homotopy-python", default=sys.executable)
+    argument_parser.add_argument("--qwen-homotopy-host", default="127.0.0.1")
+    argument_parser.add_argument("--qwen-homotopy-port", type=int, default=8890)
+    argument_parser.add_argument("--qwen-homotopy-timeout", type=float, default=600.0)
+    argument_parser.add_argument(
+        "--start-qwen-homotopy-server",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    argument_parser.add_argument(
+        "--qwen-homotopy", action=argparse.BooleanOptionalAction, default=False,
+        help=(
+            "When a metric obstacle becomes relevant, Qwen chooses the single "
+            "LEFT/RIGHT circulation sign used by every trajectory candidate."
+        ),
+    )
+    argument_parser.add_argument("--homotopy-minimum-obstacle-pixels", type=int, default=30)
+    argument_parser.add_argument("--homotopy-release-clear-frames", type=int, default=8)
+    argument_parser.add_argument(
+        "--homotopy-consistency-repeats", type=int, default=5,
+        help="Repeat Qwen on the identical obstacle frame and use majority vote.",
     )
     argument_parser.add_argument(
         "--remove-critic", action=argparse.BooleanOptionalAction, default=True
@@ -1156,8 +1356,8 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--start-x", type=float, default=0.0)
     argument_parser.add_argument("--start-z", type=float, default=8.0)
     argument_parser.add_argument("--start-yaw-deg", type=float, default=0.0)
-    argument_parser.add_argument("--goal-x", type=float, required=True)
-    argument_parser.add_argument("--goal-z", type=float, required=True)
+    argument_parser.add_argument("--goal-x", type=float, default=None)
+    argument_parser.add_argument("--goal-z", type=float, default=None)
     argument_parser.add_argument("--goal-y", type=float, default=None)
     argument_parser.add_argument("--goal-height", type=float, default=1.2)
     argument_parser.add_argument("--goal-radius", type=int, default=18)
@@ -1195,6 +1395,16 @@ def parser() -> argparse.ArgumentParser:
             "Static rendered obstacle-box centers in world X,Z coordinates. "
             "Example: --obstacle-world-xz 0,0. Do not combine with "
             "--obstacle-mesh-uv."
+        ),
+    )
+    argument_parser.add_argument(
+        "--obstacle-world-xz-item",
+        action="append",
+        default=[],
+        metavar="X,Z",
+        help=(
+            "Repeatable form that safely accepts negative coordinates, e.g. "
+            "--obstacle-world-xz-item=-3,0."
         ),
     )
     argument_parser.add_argument(
@@ -1242,7 +1452,13 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
+    if args.obstacle_world_xz_item:
+        args.obstacle_world_xz.extend(args.obstacle_world_xz_item)
     np.random.seed(args.seed)
+    if args.goal_x is None or args.goal_z is None:
+        raise ValueError("fixed PointGoal requires --goal-x and --goal-z")
+    if args.qwen_homotopy and args.goal_mode != "point":
+        raise ValueError("Qwen homotopy selection currently requires --goal-mode point")
     if args.robot_radius < 0.0:
         raise ValueError("robot-radius must be non-negative")
     if args.obstacle_velocity_xz and args.obstacle_mode != "mesh":
@@ -1267,9 +1483,22 @@ def main() -> None:
     if args.goal_mesh_half_extent <= 0.0 or args.goal_mesh_height <= 0.0:
         raise ValueError("goal mesh dimensions must be positive")
 
+
+    if args.qwen_homotopy and args.planner_mode == "pure-navdp":
+        raise ValueError("Qwen homotopy conditioning requires s2diff or gradient mode")
+
+    qwen_process: Optional[subprocess.Popen[Any]] = None
     server_process: Optional[subprocess.Popen[Any]] = None
     simulator = None
     try:
+        qwen_process = start_qwen_homotopy_server(args)
+        homotopy_selector = None
+        if args.qwen_homotopy:
+            homotopy_selector = QwenHomotopyClient(
+                f"http://{args.qwen_homotopy_host}:{args.qwen_homotopy_port}",
+                timeout=args.qwen_homotopy_timeout,
+            )
+            homotopy_selector.reset()
         server_process = start_server(args)
         server_url = f"http://{args.server_host}:{args.server_port}"
         client = NavDPS2DiffClient(server_url)
@@ -1387,6 +1616,7 @@ def main() -> None:
                 "escape_turn",
                 "valid_obstacle_points",
                 "selected_circulation_sign",
+                "candidate_circulation_signs",
                 "selected_barrier_energy",
                 "selected_circulation_energy",
                 "planning_time_seconds",
@@ -1400,12 +1630,18 @@ def main() -> None:
                 "executed_surface_clearance",
                 "geometric_collision",
                 "obstacle_positions_world",
+
+                "qwen_homotopy_sign",
+                "qwen_homotopy_side",
+                "qwen_homotopy_confidence",
+                "qwen_homotopy_queried",
         ]
         if args.archive_observations:
             row_keys.extend(("rgb", "depth", "goal_mask", "obstacle_mask"))
         rows: dict[str, list[Any]] = {key: [] for key in row_keys}
         video_frames: list[Image.Image] = []
         success = False
+        homotopy_events: list[dict[str, Any]] = []
 
         for step in range(int(args.max_steps)):
             y = terrain.local_height_max(x, z, args.pose_terrain_radius) + args.clearance
@@ -1445,16 +1681,33 @@ def main() -> None:
                 observation = simulator.get_sensor_observations()
                 rgb, depth = rgb_depth(observation)
 
-            goal_right, _goal_up, goal_forward = camera_coordinates(goal, position, yaw)
-            point_goal = np.asarray([max(goal_forward, 0.0), -goal_right], dtype=np.float32)
             semantic = (
                 semantic_from_observation(observation)
                 if args.obstacle_mode == "mesh" or args.goal_mesh
                 else None
             )
+            goal_right, _goal_up, goal_forward = camera_coordinates(
+                goal, position, yaw
+            )
+            point_goal = np.asarray(
+                [max(goal_forward, 0.0), -goal_right], dtype=np.float32
+            )
             if args.goal_mesh:
                 assert semantic is not None
                 goal_mask = (semantic == MESH_GOAL_ID).astype(np.uint8)
+                # The obstacle may visually occlude the real goal mesh in the
+                # intentionally collinear test. Keep its projected fixed-goal
+                # overlay visible for Qwen without changing the numeric PointGoal.
+                if not np.any(goal_mask):
+                    goal_mask, _ = project_world_mask(
+                        goal,
+                        position,
+                        yaw,
+                        intrinsic,
+                        args.height,
+                        args.width,
+                        args.goal_radius,
+                    )
             else:
                 goal_mask, _ = project_world_mask(
                     goal,
@@ -1465,7 +1718,18 @@ def main() -> None:
                     args.width,
                     args.goal_radius,
                 )
-
+            planner_goal = point_goal
+            if args.goal_mode == "pixel":
+                planner_goal = world_goal_to_pixel(
+                    goal, position, yaw, intrinsic, args.height, args.width
+                )
+                goal_mask = circle_mask(
+                    args.height,
+                    args.width,
+                    planner_goal[0],
+                    planner_goal[1],
+                    args.goal_radius,
+                )
             guidance_depth = depth.copy()
             if args.obstacle_mode == "depth":
                 obstacle_mask = depth_obstacle_mask(
@@ -1503,12 +1767,61 @@ def main() -> None:
             obstacle_pixels = pixels_from_mask(
                 obstacle_mask, args.maximum_obstacle_pixels
             )
+            homotopy_decision = None
+            forced_circulation_sign = 0.0
+            if homotopy_selector is not None:
+                homotopy_obstacle_mask = (
+                    (obstacle_mask > 0)
+                    & np.isfinite(guidance_depth)
+                    & (guidance_depth >= args.minimum_obstacle_depth)
+                    & (guidance_depth <= args.maximum_obstacle_depth)
+                ).astype(np.uint8)
+                qwen_overlay = overlay_frame(
+                    rgb,
+                    goal_mask,
+                    homotopy_obstacle_mask,
+                    "Qwen homotopy: choose LEFT or RIGHT",
+                    show_masks=True,
+                )
+                homotopy_decision = homotopy_selector.step(
+                    np.asarray(qwen_overlay.convert("RGB")), homotopy_obstacle_mask
+                )
+                forced_circulation_sign = homotopy_decision.circulation_sign
+                if homotopy_decision.queried_qwen:
+                    event = {
+                        "step": step,
+                        "side": homotopy_decision.side,
+                        "circulation_sign": forced_circulation_sign,
+                        "confidence": homotopy_decision.confidence,
+                        "repeat_sides": list(homotopy_decision.repeated_sides),
+                        "repeat_confidences": list(
+                            homotopy_decision.repeated_confidences
+                        ),
+                        "consistency_rate": homotopy_decision.consistency_rate,
+                        "used_fallback": homotopy_decision.used_fallback,
+                        "raw_response": homotopy_decision.raw_response,
+                    }
+                    homotopy_events.append(event)
+                    query_directory = output_directory / "qwen_homotopy_queries"
+                    query_directory.mkdir(parents=True, exist_ok=True)
+                    qwen_overlay.save(query_directory / f"query_step_{step:04d}.png")
+                    print(
+                        f"[qwen-homotopy] side={homotopy_decision.side} "
+                        f"sign={forced_circulation_sign:+.0f} "
+                        f"confidence={homotopy_decision.confidence:.2f} "
+                        f"consistency={homotopy_decision.consistency_rate:.2%} "
+                        f"repeats={list(homotopy_decision.repeated_sides)} "
+                        f"fallback={homotopy_decision.used_fallback}",
+                        flush=True,
+                    )
             planning_start = time.perf_counter()
             result = client.plan(
-                goal_xy=point_goal,
+                goal_xy=planner_goal,
                 rgb=rgb,
                 depth=guidance_depth,
                 obstacle_pixels=obstacle_pixels,
+                goal_mode=args.goal_mode,
+                forced_circulation_sign=forced_circulation_sign,
             )
             planning_time = time.perf_counter() - planning_start
             action = (
@@ -1549,7 +1862,7 @@ def main() -> None:
                 rows["obstacle_mask"].append(obstacle_mask)
             rows["pose"].append(pose)
             rows["action_3d"].append(action)
-            rows["point_goal"].append(point_goal)
+            rows["point_goal"].append(planner_goal)
             rows["selected_trajectory"].append(result.trajectory)
             rows["all_trajectories"].append(result.all_trajectories)
             rows["all_values"].append(result.all_values)
@@ -1558,6 +1871,9 @@ def main() -> None:
             rows["escape_turn"].append(result.escape_turn)
             rows["valid_obstacle_points"].append(result.valid_obstacle_points)
             rows["selected_circulation_sign"].append(result.selected_circulation_sign)
+            rows["candidate_circulation_signs"].append(
+                result.candidate_circulation_signs
+            )
             rows["selected_barrier_energy"].append(result.selected_barrier_energy)
             rows["selected_circulation_energy"].append(
                 result.selected_circulation_energy
@@ -1586,9 +1902,26 @@ def main() -> None:
                 else np.zeros((0, 3), dtype=np.float64)
             )
 
+            rows["qwen_homotopy_sign"].append(forced_circulation_sign)
+            rows["qwen_homotopy_side"].append(
+                homotopy_decision.side if homotopy_decision is not None else "AUTO"
+            )
+            rows["qwen_homotopy_confidence"].append(
+                homotopy_decision.confidence if homotopy_decision is not None else 0.0
+            )
+            rows["qwen_homotopy_queried"].append(
+                homotopy_decision.queried_qwen if homotopy_decision is not None else False
+            )
+
             if args.save_frames and step % max(int(args.save_every), 1) == 0:
+
+                side_label = (
+                    homotopy_decision.side
+                    if homotopy_decision is not None
+                    else "AUTO"
+                )
                 label = (
-                    f"t={step} goal={goal_distance:.2f}m pixels={len(obstacle_pixels)} "
+                    f"t={step} goal={goal_distance:.2f}m qwen_side={side_label} pixels={len(obstacle_pixels)} "
                     f"pred={result.selected_minimum_clearance:.2f}m "
                     f"actual={surface_clearance:.2f}m "
                     f"mode={result.selected_circulation_sign:+.0f} "
@@ -1608,6 +1941,7 @@ def main() -> None:
 
             print(
                 f"step={step:04d} goal={goal_distance:.2f}m "
+                f"qwen_side={homotopy_decision.side if homotopy_decision else 'AUTO'} "
                 f"pixels={len(obstacle_pixels)} valid={result.valid_obstacle_points} "
                 f"selected={result.selected_index} fallback={result.fallback_stop} "
                 f"escape={result.escape_turn} mode={result.selected_circulation_sign:+.0f} "
@@ -1661,6 +1995,7 @@ def main() -> None:
             robot_radius=np.asarray(args.robot_radius, dtype=np.float64),
             evaluation_layout=np.asarray(args.evaluation_layout),
             seed=np.asarray(args.seed, dtype=np.int64),
+            goal_mode=np.asarray(args.goal_mode),
         )
         with (output_directory / "manifest.json").open("w", encoding="utf-8") as file:
             json.dump(
@@ -1671,6 +2006,16 @@ def main() -> None:
                     "final_goal_distance": float(rows["goal_distance"][-1]),
                     "planner": "released_navdp_s2diff_pixels",
                     "controller": "direct_waypoint_no_optimizer",
+                    "qwen_role": "obstacle_homotopy_only",
+                    "qwen_process_isolated_from_habitat": True,
+                    "qwen_creates_goal_or_action": False,
+                    "qwen_homotopy": args.qwen_homotopy,
+                    "qwen_homotopy_events": homotopy_events,
+                    "qwen_homotopy_forces_all_candidates": args.qwen_homotopy,
+                    "homotopy_sign_convention": {"LEFT": -1.0, "RIGHT": 1.0},
+                    "homotopy_minimum_obstacle_pixels": args.homotopy_minimum_obstacle_pixels,
+                    "homotopy_release_clear_frames": args.homotopy_release_clear_frames,
+                    "homotopy_consistency_repeats": args.homotopy_consistency_repeats,
                     "uses_velocity_chunk": False,
                     "obstacle_mode": args.obstacle_mode,
                     "obstacle_world_xz": args.obstacle_world_xz,
@@ -1678,6 +2023,7 @@ def main() -> None:
                     "particle_anchor": args.particle_anchor,
                     "particle_energy_reweighting": args.particle_energy_reweighting,
                     "particle_collision_mask": args.particle_collision_mask,
+                    "goal_mode": args.goal_mode,
                     "particle_noise_schedule": args.particle_noise_schedule,
                     "progressive_guidance": args.progressive_guidance,
                     "mesh_obstacle_count": len(mesh_centroids),
@@ -1711,6 +2057,7 @@ def main() -> None:
         if simulator is not None:
             simulator.close()
         stop_server(server_process)
+        stop_server(qwen_process)
 
 
 if __name__ == "__main__":

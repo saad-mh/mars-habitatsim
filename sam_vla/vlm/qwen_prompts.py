@@ -192,14 +192,27 @@ def build_parse_nav_command_prompt(command_text: str) -> str:
         'other target in the same command (e.g. keep "on the right" only '
         "if there is more than one flag to tell apart).\n\n"
         "Preserve the order implied by the command within each list "
-        "separately.\n\n"
+        "separately. Base both lists ONLY on the words in the command -- "
+        'the image is context for later steps, not something to parse '
+        'directions out of. If the command names no explicit movement word '
+        '(e.g. "go to the flag", "find the rover", "head to the flag now"), '
+        '"directions" MUST be an empty list -- never invent a direction '
+        "to fill it, and never let a target's apparent position in the "
+        "image or its similarity to a target in one of the examples below "
+        "imply a direction that was not actually stated.\n\n"
         "Examples:\n"
         '  "go left find a flag and come back to home base" -> '
         '{"directions": ["left"], "goals": ["flag", "home base"]}\n'
         '  "find the white flag and then go to the flag on the right" -> '
         '{"directions": [], "goals": ["white flag", "flag on the right"]}\n'
         '  "turn right then go straight" -> '
-        '{"directions": ["right", "front"], "goals": []}\n\n'
+        '{"directions": ["right", "front"], "goals": []}\n'
+        '  "go to the flag" -> '
+        '{"directions": [], "goals": ["flag"]}\n'
+        '  "head to the flag now" -> '
+        '{"directions": [], "goals": ["flag"]}\n'
+        '  "drive to the rover" -> '
+        '{"directions": [], "goals": ["rover"]}\n\n'
         "Respond with ONLY a JSON object in this exact format, no other "
         'text:\n{"directions": [<str>, ...], "goals": [<str>, ...]}'
     )

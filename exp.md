@@ -1,738 +1,1339 @@
-The Belief System in navdp/
-3. "This area is explored": in which case the agent should mark the area as explored and not return to it. The agent should move forward n+-variable units, turn left/right randomly, and repeat until the goal is found. The agent should also be able to backtrack if it hits a dead end or obstacle.
+#!/usr/bin/env python3
+"""Interactive control panel for nav.rover_controller.RoverController --
+the in-house, single-process equivalent of Nav_new/MARS/launch_mars.sh's
+DINO+NavDP GUI, driving the actual published NavDP model instead of this
+repo's own custom S2DiT+NavDP model (see rover_controller.py's docstring).
 
-During the previous steps, it is clear there is an underlying pattern the agent follows to explore the environment. In that case, keep the underlying exploration pattern as a function and repeat the exploration pattern until the goal is found. The agent should also be able to backtrack if it hits a dead end or obstacle. Based on the given prompt, let the VLM decide the exploration pattern and the agent should follow the exploration pattern until the goal is found. Give it functions to explore the environment, explore left/right, and mark areas as explored. The agent should be able to backtrack if it hits a dead end or obstacle. The exploration pattern should be determined by the VLM based on the current state of the environment and the goal location. navigation goal is, expressed in the robot's local body frame, that survives even when the goal is not currently visible. It's a classic Bayesian filter (mean + covariance) wrapped in machine-learning infrastructure so a diffusion policy can consume it as conditioning. Everything else in this system — occupancy forecasting, safety CBFs, route management, semantic priors, VLM grounding — is built to feed into or read out of this one belief representation.
+Run via nav/launch_nav.sh, or directly:
+conda activate habitat
+cd mars-habitatsim
+python -m nav.gui [--scene-path ...] [--heightmap-path ...] [--cbf/--no-cbf] ...
 
-I'll go layer by layer: state → refinement → encoding → policy integration → runtime control → data/training.
+Open-vocabulary target grounding ("Ground Target" / a Command-panel GO_TO/FIND
+step) uses GroundingDINO (navdp.extensions.GroundingDINODetector, see
+sam_vla.goal_resolution.dino_grounding_resolver) instead of Qwen VLM
+point-grounding -- ported from scripts/vlm_nav_tests/qwen_search_dino.py's
+own DINO usage, --dino-\* flags below configure it. The SAM2+Qwen-salience
+"Segment" path and the Qwen-based free-text Command-splitting/uncertainty-halt
+prompts are unrelated and still use Qwen.
 
-1. The core state: SubgoalBeliefBank
-belief_bank.py
+========================================================================
+REACH UI/UX PRINCIPLES (Ma et al., "Human-Robot Interaction through
+REACH", DLR/NASA) -- this layout is a deliberate re-implementation of the
+REACH Handheld-Device interface principles for a desktop sim console.
+Every control below carries a `# REACH Pn:` tag naming the principle it
+serves; the same numbering is used in reach_gui/REACH_UI_justification.md.
 
-This is a plain NumPy Kalman-filter-like tracker, one BeliefSlot per named goal ("beanbag", "cabinet", etc.):
+P1 CONTEXTUAL / ADAPTIVE MENUS. Actions are shown _because of_ the
+current selection or rover state, not all at once. (REACH: "a
+contextual menu that adapts based on user selection" -- object vs
+module vs rover give different actions.)
+P2 THREE-STAGE COMMAND FEEDBACK. Every command surfaces an explicit
+lifecycle: RECEIVED -> EXECUTING -> COMPLETE. (REACH rover-status
+bar: "1) acknowledgment of command receipt, 2) task execution
+status, 3) task completion confirmation" -- the rover gives no
+other signal.)
+P3 CHUNKED, LINEAR TASKWORK. Multi-step work is shown as an ordered
+list with N/total progress so the operator can self-check without
+line-by-line direction. (REACH taskwork pages, "feasible chunks".)
+P4 MAP / SITUATIONAL AWARENESS. A persistent frame of reference:
+rover pose, goal, planned path and hazards, available at any
+moment. (REACH map: rover + user position, terrain/hazards,
+suggested path.)
+P5 SIMPLIFIED, GLOVE-SAFE CONTROLS. Few, large, well-separated
+buttons to prevent accidental activation. (REACH: buttons "spaced
+... further apart to prevent accidental activation, when wearing
+thick gloves"; "controls were simplified".)
+P6 ONLY ESSENTIAL INFORMATION. Minimize clutter / cognitive load;
+advanced detail is de-emphasized or revealed on demand. (REACH:
+"only essential information is exchanged"; reduced cognitive load.)
+P7 INTUITIVE POINT-AND-SELECT. Direct the rover by pointing at a
+target in the live view. (REACH: "pointing and selecting ... an
+object in environment".)
+P8 ALWAYS-AVAILABLE SAFETY / EMERGENCY TAKEOVER. Stop is reachable at
+all times regardless of scroll or mode. (REACH Rover-Driver
+Console: "emergency takeover"; proximity safety.)
+P9 CONTINUOUS FEEDBACK, LOW FRUSTRATION. Immediate acknowledgment of
+every action to "curb frustration/confusion". (REACH results:
+-40% frustration driven by continuous feedback.)
+P10 AUTONOMY & INTENT COMMUNICATION. Show what the rover is doing and
+why (mode, goal, progress), supporting perceived autonomy. (REACH:
+"communicate intents and progress for better HRC".)
+========================================================================
+"""
 
+from **future** import annotations
 
-BeliefSlot: goal_id, mu[2], Sigma[2,2], visible, initialized, last_seen_step, time_since_seen, confidence
-Each call to bank.update(observations, odom_delta, step) does one of three things per slot (belief_bank.py:99-134):
+import argparse
+import math
+from pathlib import Path
+from typing import Optional
 
-Seen → snap mu to the measured position, Sigma to a tight sigma_visible (0.05), reset time_since_seen=0, confidence=1.
-Not seen, but previously initialized → dead-reckon: mu is transformed by the inverse SE(2) odometry (ego_motion_update, belief_bank.py:193-203), Sigma grows by +odom_noise each step, confidence decays geometrically, time_since_seen increments.
-Never seen → stays at a huge, uninformative Sigma (large_uncertainty=1000).
-This means: as the robot moves and the goal drops out of the camera FOV, the belief mean keeps pointing at the goal's last-known location by literally rotating/translating it against the robot's own motion — so the robot can still turn back toward it.
+import tkinter as tk
+import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageTk
 
-bank.as_tensor(...) (belief_bank.py:136-175) flattens all slots into the raw 11-dim feature layout used everywhere downstream:
+from sam_vla.goal_resolution import dino_grounding_resolver
+from vl_direction import config as vl_dir_config
 
+from nav.rover_controller import MODE_REVIEW_SEGMENTATION, MODE_TURN, RoverController
 
-[mu_x, mu_y, Sigma_xx, Sigma_xy, Sigma_yy,
- visible, initialized, time_since_seen, confidence,
- is_active, route_index_normalized]
-This 11-dim vector-per-goal is the belief interchange format between every module below.
+REPO_ROOT = Path(**file**).resolve().parent.parent
+REFRESH_MS = 66 # ~15 Hz GUI repaint, independent of the controller's own hz
 
-2. Neural refinement: RelationalBelief
-relational_belief.py
+PLOT_BG = "#242424"
+PLOT_AXIS = "#555555"
+PLOT_ROVER = "#e5e7eb"
+PLOT_OBSTACLE = "#f87171"
+PLOT_TRAJECTORY = "#f97373"
+PLOT_GOAL = "#fbbf24"
 
-The raw Kalman belief above is purely geometric/hand-designed. RelationalBelief is a small permutation-equivariant Transformer that takes the [B, N, 11] bank tensor for all goals at once and outputs a refined 13-dim tensor:
+# REACH P5: glove-safe control sizing. One place to tune the whole
 
+# console's button footprint so every primary action stays large and
 
-[mu_x, mu_y, Sigma_xx, Sigma_xy, Sigma_yy,
- visible, initialized, time_since_seen, confidence,
- is_active, route_index_normalized,
- sigma_ale_mean, sigma_epi_mean]
-Key design points:
+# every gap stays wide enough to miss with a thick glove -- the paper's
 
-Zero-init correction: delta_head weights start at zero, so at initialization the module is an exact identity on mu (relational_belief.py:91-92). The correction is gated by correction_gate = initialized * (1 - visible*confidence) * (1 - exp(-recency/5)) (relational_belief.py:141) — i.e., it's only allowed to nudge the mean when the belief is stale/occluded, never when a fresh sensor reading is trusted.
-Two separate uncertainty heads: sigma_ale (aleatoric — sensor/dynamics noise, initialized to equal the Kalman Sigma) and sigma_epi (epistemic — "how much should the network itself distrust this," near-zero at init). This split is what later feeds the EpistemicGate (section 6).
-Self-supervised training via occlusion_dropout/reconstruction_loss (relational_belief.py:176-238): randomly hides visible slots, trains the network to reconstruct mu (Gaussian NLL, supervising sigma_ale) and to have sigma_epi regress the actual reconstruction error — i.e., epistemic uncertainty is calibrated against real mistakes, not just guessed.
-This is the "smart" layer on top of the "dumb" Kalman filter — it lets goals reason about each other (permutation-equivariant self-attention across the N goal slots) and learn when the Kalman assumption (constant-velocity dead reckoning) is breaking down.
+# core hardware fix ("spaced the buttons further apart").
 
-3. Turning belief into policy conditioning: belief_encoder.py
-belief_encoder.py
+BTN_H = 46 # primary action button height (px)
+BTN_GAP = 8 # inter-button spacing (px)
+SECTION_GAP = 12 # spacing between labeled sections (px)
 
-Three pieces:
+# REACH P2: the three-stage command lifecycle, in order. The status
 
-normalize_belief_features (belief_encoder.py:11-46): squashes the unbounded raw belief entries (mu in metres, Sigma growing unboundedly during long occlusions, time_since_seen in raw frame counts) into roughly [-1,1] via /5, log1p, tanh. This matters because a long occlusion makes Sigma/time_since_seen blow up; feeding that raw into a Linear layer saturates it and produces near-random conditioning for exactly the long-occlusion case that matters most.
-BeliefEncoder: MLP + learned per-goal-slot positional embedding + optional Transformer encoder → per-goal condition tokens [B, N, embed_dim], plus one active_belief_token gathered via active_goal_index (or inferred from the is_active flag, feature index 9).
-ObstacleMapEncoder / RouteTokenEncoder: siblings that encode the local occupancy grid and the current route-pointer index into tokens the same way.
-NavDPConditionAdapter: the glue class actually embedded in the policies. It optionally encodes belief/obstacle-map/route-index and appends those tokens after the base VLM/image condition tokens (torch.cat), never replacing them — so a pretrained image-conditioned policy keeps working even with the belief branch bolted on.
-4. Policy integration
-There are three different policy architectures that consume belief, at increasing sophistication:
+# header renders exactly these, lighting the active one -- this is the
 
-a) model.py (flow-matching NavDP) and model_s2_dit.py (S2DiT)
-Both just own a NavDPConditionAdapter and a BeliefConditionedCocosSource and pass belief_tensor/obstacle_map/route_index/active_goal_index straight through encode() → the adapter → concatenated condition tokens (model.py:295-344). This is the "basic" integration: belief is just more tokens for cross-attention.
+# whole "rover status update bar" of the paper, made unmissable.
 
-b) cocos_source.py — BeliefConditionedCocosSource
-cocos_source.py
-Rather than diffusion always starting from pure Gaussian noise x_source = N(0,1), this predicts a belief-informed source mean from the pooled condition tokens: x_source = alpha*mean + beta*epsilon. Diffusion is cheaper/more accurate when you start closer to the answer — this lets the belief bias where the diffusion sampling starts from.
+STAGE_ORDER = ("received", "executing", "complete")
+STAGE_LABELS = {
+"received": "1 · RECEIVED",
+"executing": "2 · EXECUTING",
+"complete": "3 · COMPLETE",
+}
+STAGE_ACTIVE_COLOR = "#22d3ee"
+STAGE_DONE_COLOR = "#4ade80"
+STAGE_IDLE_COLOR = "#3f3f46"
 
-c) belief_augmented_traj_dit.py — BeliefAugmentedTrajectoryDiT (the most complete integration)
-belief_augmented_traj_dit.py
+# Mode -> accent color, shared by the big mode label and (where relevant)
 
-This is a full trajectory-diffusion DiT designed to wrap a frozen, pretrained image-conditioned policy and add belief on top without disturbing the original weights:
+# the panel that goes with that mode -- REACH P10: keeps color the one
 
-DiTCrossAttnBlock (belief_augmented_traj_dit.py:34-99) has two cross-attention paths into the trajectory tokens: the original cross_attn (frozen image/VLM condition) and a new memory_cross_attn gated by a learned tanh(memory_gate) starting at 0 — so belief/route/obstacle tokens start as a complete no-op and only get weight as training justifies it.
-refine_belief() runs the raw 11-dim bank tensor through RelationalBelief (section 2) before encoding it.
-BeliefAnchoredSource (belief_augmented_traj_dit.py:102-172): predicts both a trajectory source mean and a noise-scale beta from the active belief slot. beta is trained to shrink when the belief is reliable (high confidence, low Sigma) — i.e., diffusion sampling gets a tighter, more confident prior exactly when the belief says it should trust itself.
-set_train_stage("adapter"/"top"/"all") (belief_augmented_traj_dit.py:648-679): freeze schedule for warm-start training — you can train only the belief/memory branch while keeping the pretrained backbone frozen, exactly matching the "adapter" scripts described below.
-5. Dual-diffusion novelty layer: dual_belief_diffusion.py
-dual_belief_diffusion.py
+# consistent cue for "what is the rover doing right now" across the
 
-This is a two-stage diffusion stack for when the belief history itself (not just the current slot) needs to be inferred:
+# whole window.
 
-Backward/context diffusion (DualHeadConditionedDiT): given the current condition tokens, diffusion-reconstructs a short window of the recent belief trajectory (belief_history_steps) it didn't directly observe, and predicts a log-variance per dimension in the same pass (dual heads: eps_head, logvar_head).
-Forward waypoint diffusion: the reconstructed belief-history + its uncertainty are encoded into extra tokens (history_encoder) and appended to conditioning for the actual action-chunk diffusion, whose noise schedule is modulated by AdaptiveNoiseSchedule — higher predicted uncertainty in the belief history → higher injected noise scale in the forward diffusion, so the policy naturally hedges when its own belief-reconstruction is unsure.
-This is a research/ablation-grade component for when you want the diffusion policy to explicitly reason about uncertain belief histories, not just the current mean/covariance.
+MODE_COLORS = {
+"idle": "#9ca3af",
+"manual": "#60a5fa",
+"point": "#4ade80",
+"resolve": "#c084fc",
+MODE_REVIEW_SEGMENTATION: "#f59e0b",
+MODE_TURN: "#fb923c",
+}
 
-6. Runtime control extensions
-These live in navdp/navdp/extensions/ and are the pieces that turn belief numbers into actual robot decisions.
+# Uncertainty-halt numpad panel: rover-front-relative headings (degrees,
 
-belief_control.py
-belief_control.py
+# same convention as nav/goal_math.heading_ahead_point -- 0=front,
 
-EpistemicGate: decides "should the robot stop and scan instead of committing to a waypoint chunk?" It fires if either sigma_epi (from RelationalBelief, index 12 of the refined 13-dim tensor) is above threshold or u_occ (occupancy-forecast uncertainty, see §7) is high — two independent uncertainty sources, either can trigger a scan-in-place. High u_occ alone (without triggering a full scan) also scales down commanded speed via speed_scale_from_u_occ.
-strength_from_sigma_ale: maps aleatoric uncertainty to an SDEdit "strength" — used to decide how much noise to re-inject when warm-starting diffusion sampling from a previous trajectory.
-build_warm_start_path: builds a straight-line path toward the belief mean, used to warm-start diffusion sampling (warm_x in BeliefAugmentedTrajectoryDiT.sample).
-refine_bank_with_model: convenience wrapper calling RelationalBelief at inference time.
-route_manager.py
-route_manager.py
-RouteManager.update() reads the belief mean of the currently active goal and advances the route pointer once the robot is within success_radius of it (route_manager.py:60-78). So the belief bank isn't just conditioning — it's literally what decides "we've arrived, move to the next subgoal."
+# positive=clockwise) bound to the same physical key layout
 
-foresight_gate.py
-foresight_gate.py
-Ranks diffusion-sampled action candidates using OccupancyForesightHead (§7) as a secondary signal, strictly subordinate to a hard depth-based collision gate — rejected candidates can never be re-admitted (enforced by an assertion, foresight_gate.py:114-116). This is a geometric analogue of the epistemic gate: "predicted-free space is a reason to prefer a path, never permission to ignore real depth."
+# scripts/habitat_tests/kb_teleop_vl.py's uncertainty panel uses, redrawn
 
-semantic_prior.py
-semantic_prior.py
-Before the goal has ever been seen, SemanticPrior.predict() turns currently-visible anchor objects (e.g. seeing a stove implies a kitchen implies a fridge nearby) into a broad Gaussian prior over goal position, using an AffinityTable of co-occurrence weights. seed_belief_bank() injects this into a BeliefSlot — but only if the slot has never been initialized, so a real metric sighting always overrides the coarser semantic guess. This is literally seeding the Kalman filter's prior from vision-language semantics instead of leaving it at "totally uninformative."
+# independently here rather than imported (nav/ stays decoupled from that
 
-system2_pixel_goal.py
-system2_pixel_goal.py
-A frozen VLM (QwenVLPixelGoal) grounds a language instruction to a pixel goal every every steps (System2Scheduler). That pixel is rendered into a goal-mask blob fed into the same pipeline slot a ground-truth segmentation mask would fill. Between VLM calls, the goal mask is empty and the belief bank propagates the last grounded pixel by odometry — i.e., the belief/occlusion machinery is explicitly reused as the async bridge between a slow VLM and a fast control loop.
+# script). Grid position drives the heads-up panel's clickable button
 
-ghost_geometry.py
-ghost_geometry.py
-Pure math (no torch) to project a belief's bearing/range estimate into pixel space so it can be rendered as a "ghost" overlay circle on the current image — a visualization/debug tool for occluded-goal belief.
+# layout, keys drive the numpad keyboard shortcuts.
 
-safe_diffusion.py
-safe_diffusion.py
-CBF (control-barrier-function) safety guidance for diffusion sampling. Belief connects here via mu_goal in cbf_horizon_cost/build_cbf_guidance: the goal-attraction term steers the sampled trajectory back toward the belief-predicted goal position, independent of any currently-visible obstacle — so even after an obstacle has been avoided and left the mask, the guidance keeps pulling the robot back toward what the belief says is the goal (this is called out explicitly as compensating for the "bare policy tends to forget the belief" failure mode, safe_diffusion.py:442-447).
+UNCERTAINTY_HEADING_KEYS = {
+"8": 0.0,
+"9": 45.0,
+"6": 90.0,
+"3": 135.0,
+"2": 180.0,
+"1": -135.0,
+"4": -90.0,
+"7": -45.0,
+}
+UNCERTAINTY_HEADING_GRID_POS = {
+"7": (0, 0),
+"8": (0, 1),
+"9": (0, 2),
+"4": (1, 0),
+"6": (1, 2),
+"1": (2, 0),
+"2": (2, 1),
+"3": (2, 2),
+}
 
-7. The occupancy analogue: occupancy_foresight.py
-occupancy_foresight.py
+def \_default_navdp_upstream_ckpt() -> Optional[str]:
+"""Same repo-relative fallback sam_vla.run_navdp_rollout uses -- a plain
+invocation just works on a checkout that already has Phase 0's
+(next.md's Integration project) gitignored checkpoint in place."""
+candidate = REPO_ROOT / "navdp" / "navdp-cross-modal.ckpt"
+return str(candidate) if candidate.exists() else None
 
-Not "belief" about a goal, but the same pattern applied to geometry: predicting the next egocentric occupancy grid, with an aleatoric uncertainty (u_occ) that plays the same functional role as sigma_ale in the goal belief. Key mechanism: egomotion_warp() analytically warps the current occupancy grid by the candidate action's SE(2) motion (the same transform SubgoalBeliefBank.ego_motion_update uses) — so "propagate what you know by how you moved" is shared physics between goal-belief and occupancy-belief. A small residual conv net only has to learn newly-revealed geometry. u_occ's floor is literally the fraction of the robot's footprint that came from warped-but-unobserved (out-of-bounds) cells — i.e., "how much of my forecast for the space I'm about to drive into is a hallucination." This feeds ForesightGate and EpistemicGate above.
+class NavGuiApp:
+SIDEBAR_MIN_W = 360
+PLOT_MIN = 200
+PLOT_MAX = 480
+PLOT_RANGE = 6.0 # meters shown top-to-bottom of the body-frame plot
 
-8. Data layer
-belief_bank.py is used directly during dataset construction: habitat_route_dataset.py builds a per-episode SubgoalBeliefBank, replays every frame through bank.update() (feeding SAM-mask+depth-derived observations and pose-derived odometry), and caches the resulting [T, 1, 11] belief sequence (_episode_belief_sequence, habitat_route_dataset.py:448-476). couple_belief_dropout deliberately synchronizes goal-mask dropout (simulated occlusion) with the belief that's fed to the policy, so training sees consistent "goal hidden → belief must coast on odometry" episodes rather than a mismatched signal.
-route_belief_dataset.py (route_belief_dataset.py) is a generic loader for precomputed .npz/.pkl route-belief training samples (belief_tensor is one of the required fields) — the format the model-conditioning code above expects at training time.
-9. Training/eval scripts (in navdp/scripts/)
-These represent a deliberate ladder of increasing dependence on the frozen backbone:
+    def __init__(
+        self,
+        root: ctk.CTk,
+        controller: RoverController,
+        max_linear: float,
+        max_angular: float,
+    ):
+        self.root = root
+        self.controller = controller
+        self.max_linear = max_linear
+        self.max_angular = max_angular
+        self.closed = False
+        self._manual_held: set[str] = set()
+        self._pending_click_norm: Optional[tuple[float, float]] = None
+        self._seg_panel_visible = False
+        self._click_panel_visible = False
+        self._cam_img_box: Optional[tuple[int, int, int, int]] = None
+        self._cam_photo = None
+        self._plot_size = self.PLOT_MIN
+        # REACH P9: last action acknowledged, echoed in the status header
+        # the instant a button is pressed (before the controller's own
+        # state catches up on the next tick) so no press ever feels lost.
+        self._ack_text = ""
 
-gen_belief_propagation_data.py — synthesizes pure belief-space episodes (dead-reckoning + re-observation dynamics, zero rendering/Habitat dependency) with a scripted P-controller as the target-generating policy.
-train_belief_only_policy.py / test_belief_only_policy.py — trains a small, freshly-initialized diffusion policy conditioned purely on the propagated belief sequence, with zero dependence on any pretrained image backbone. Purpose: isolate and study belief-propagation dynamics as the sole driver of actions.
-train_belief_adapter.py — teaches a frozen pretrained S2DiT policy the "belief-driven return" behavior: appends a small zero-init adapter conditioned on belief bearing, trained against P-controller counterfactual targets, specifically for out-of-view frames where belief is the only cue that can pull the robot back on-screen.
-train_vla_adapter.py — the sibling recipe conditioned on language embeddings instead of belief bearing (shares precompute_cond/diffusion_loss with the belief adapter script).
-10. Deployment loop: policy_runner.py
-policy_runner.py
+        root.title("mars-habitatsim/nav · REACH console")
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.minsize(900, 640)
 
-PolicyRunner.step() (policy_runner.py:120-186) is the real-time loop tying everything together, once per frame:
+        # Start maximized so the layout below (sized entirely off grid
+        # weights, not fixed pixel panels) actually gets the whole screen to
+        # lay out into. Always set an explicit near-full-screen geometry
+        # first -- window managers that ignore "zoomed"/"-zoomed" (or a
+        # WM-less display) would otherwise silently leave the window at its
+        # small natural size -- then best-effort request a true maximize on
+        # top of that for the window managers that do support it.
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{int(sw * 0.95)}x{int(sh * 0.9)}")
+        try:
+            root.state("zoomed")
+        except tk.TclError:
+            try:
+                root.attributes("-zoomed", True)
+            except tk.TclError:
+                pass
 
-Compute odometry delta from consecutive poses.
-make_belief_observation() (from mask+depth via SAMDepthTargetExtractor) → bank.update(obs, odom, step).
-bank.as_tensor(...) → belief_t tensor.
-Build the obstacle occupancy grid (DepthObstacleMap).
-Optionally build CBF guidance (nearest_obstacle_point, estimate_obstacle_velocity, build_cbf_guidance) — safety, largely independent of belief except via mu_goal if enabled elsewhere.
-self.model.sample(..., belief_tensor=belief_t, obstacle_map=obstacle_t, ..., guidance_fn=guidance) — belief flows into the policy exactly through the NavDPConditionAdapter/BeliefAugmentedTrajectoryDiT path described in §3–4.
-Mental model summary
+        # Root grid: row 0 is the working area (camera hero + sidebar),
+        # row 1 is the pinned emergency bar. REACH P8: the STOP control
+        # lives OUTSIDE the scrollable sidebar, on its own always-visible
+        # root row, so an emergency takeover is one click away no matter
+        # how far the sidebar is scrolled or what mode is active.
+        root.grid_rowconfigure(0, weight=1)
+        root.grid_rowconfigure(1, weight=0)
+        root.grid_columnconfigure(0, weight=3)
+        root.grid_columnconfigure(1, weight=1, minsize=self.SIDEBAR_MIN_W)
 
-SubgoalBeliefBank (Kalman filter, numpy)      -- "where is the goal, and how sure am I"
-        │  raw [N,11] tensor
-        ▼
-RelationalBelief (transformer)                -- refines mu, splits uncertainty into
-        │  refined [N,13] tensor                 aleatoric (sensor) vs epistemic (model)
-        ▼
-BeliefEncoder / NavDPConditionAdapter         -- belief -> extra condition tokens
-        │
-        ▼
-Policy (model.py / model_s2_dit.py /          -- diffusion/flow-matching conditioned on
-BeliefAugmentedTrajectoryDiT)                    belief tokens + belief-anchored source/noise
-        │
-        ▼
-Runtime control (EpistemicGate, ForesightGate,-- belief uncertainty -> scan-vs-commit,
-RouteManager, safe_diffusion goal-attraction)    route advancement, safety steering
-Everything else (occupancy_foresight.py, semantic_prior.py, system2_pixel_goal.py, ghost_geometry.py) either feeds this belief pipeline a better prior/observation, consumes its uncertainty output for a control decision, or visualizes it — but the Kalman-filter-plus-transformer-refinement core described in §1–2 is the single source of truth every other file reads from or writes into.
+        mono_font = ctk.CTkFont(family="Consolas", size=12)
+        mode_font = ctk.CTkFont(size=17, weight="bold")
 
-belief_encoder.py
-I am supposed to be playing around, experimenting with different values, mean, covariance, and other stuff, to see which set of params work the best for this belief. All of the belief knowledge should be from within @navdp/ . I do not want any writeovers inside the same directory. if need be, create a new directory named 'belief_exp', which would contain scripts to test parameters and variables. My mentor asked to test specifically about mean, covariance, and others. Plan the implementation before working it out.
-Bash Check scripts dir, runs dir, and semantic prior eval script existence
-IN
-ls -la /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/
-echo "---runs/belief_only_policy---"
-find /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/runs -maxdepth 3
-echo "---eval_semantic_prior exists?---"
-find /home/gpu/Desktop/pineapple/mars-habitatsim -iname "eval_semantic_prior*"
+        # ---------------- camera hero (REACH P7: point-and-select) ------- #
+        # Fills all left-column space; the frame is letterboxed into it on
+        # every refresh so it tracks window size. Clicking the live view is
+        # the primary, most intuitive way to designate a goal -- the direct
+        # analog of REACH "point and select an object in the environment".
+        cam_frame = ctk.CTkFrame(root)
+        cam_frame.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        cam_frame.grid_rowconfigure(0, weight=1)
+        cam_frame.grid_columnconfigure(0, weight=1)
 
-OUT
-total 144
-drwxrwxr-x 3 gpu gpu  4096 Jul 17 20:23 .
-drwxrwxr-x 6 gpu gpu  4096 Jul 17 18:36 ..
--rw-rw-r-- 1 gpu gpu  7608 Jul 17 17:03 gen_belief_propagation_data.py
-drwxrwxr-x 2 gpu gpu  4096 Jul 17 20:23 __pycache__
--rw-rw-r-- 1 gpu gpu 75157 Jul 17 14:44 rollout_habitat_policy.py
--rw-rw-r-- 1 gpu gpu  5448 Jul 17 20:11 test_belief_only_policy.py
--rw-rw-r-- 1 gpu gpu  6852 Jul 17 16:05 train_belief_adapter.py
--rw-rw-r-- 1 gpu gpu 16763 Jul 17 17:06 train_belief_only_policy.py
--rw-rw-r-- 1 gpu gpu 11333 Jul 17 14:44 train_vla_adapter.py
----runs/belief_only_policy---
-/home/gpu/Desktop/pineapple/mars-habitatsim/navdp/runs
-/home/gpu/Desktop/pineapple/mars-habitatsim/navdp/runs/belief_only_policy
-/home/gpu/Desktop/pineapple/mars-habitatsim/navdp/runs/belief_only_policy/belief_only_policy.pt
----eval_semantic_prior exists?---
-Bash Check line counts of relevant scripts
-IN
-wc -l /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/gen_belief_propagation_data.py /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/train_belief_only_policy.py /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/test_belief_only_policy.py /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/rollout_habitat_policy.py
+        self.cam_canvas = tk.Canvas(cam_frame, bg="#111111", highlightthickness=0)
+        self.cam_canvas.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 2))
+        self.cam_canvas.bind("<Button-1>", self.on_cam_click)
+        ctk.CTkLabel(
+            cam_frame,
+            text="POINT & SELECT — click any point in the live view to send the rover there",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#22d3ee",
+        ).grid(row=1, column=0, pady=(0, 6))
 
-OUT
-   150 /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/gen_belief_propagation_data.py
-   348 /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/train_belief_only_policy.py
-   124 /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/test_belief_only_policy.py
-  1697 /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/rollout_habitat_policy.py
-  2319 total
-Read gen_belief_propagation_data.py (lines 51-150)
-Read train_belief_only_policy.py (lines 61-348)
-Read test_belief_only_policy.py (lines 51-124)
-Bash Find belief bank param usage/defaults in rollout script
-IN
-grep -n "SubgoalBeliefBank(\|sigma_init\|sigma_visible\|odom_noise\|decay_factor\|large_uncertainty" /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/rollout_habitat_policy.py
+        # ---------------- sidebar ---------------------------------------- #
+        # REACH P6 (only essential info) + P5 (spacing): one vertical
+        # column of clearly-labeled sections, top-anchored, generous gaps.
+        # Scrollable so no control is ever clipped off a short monitor
+        # (contextual review panels can push the stack past screen height).
+        sidebar = ctk.CTkScrollableFrame(root, fg_color="transparent")
+        sidebar.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=(10, 4))
+        sidebar.grid_columnconfigure(0, weight=1)
+        self.sidebar = sidebar
 
-OUT
-864:    bank = SubgoalBeliefBank([category], sigma_visible=0.05, odom_noise=0.02)
-Bash Inspect belief_adapter.pt checkpoint contents and RelationalBelief usage
-IN
-cd /home/gpu/Desktop/pineapple/mars-habitatsim/navdp && python3 -c "
-import torch
-ckpt = torch.load('belief_adapter.pt', map_location='cpu', weights_only=False)
-if isinstance(ckpt, dict):
-    for k,v in ckpt.items():
-        if hasattr(v,'keys'):
-            print(k, '-> dict with', len(v), 'keys; sample:', list(v.keys())[:5])
+        row = 0
+
+        # ===== SECTION 1 — ROVER STATUS (REACH P2 + P9 + P10) =========== #
+        # The single most important panel in the paper: continuous,
+        # three-stage feedback the rover cannot otherwise provide. Placed
+        # first and always visible.
+        self.status_panel = ctk.CTkFrame(sidebar, border_width=2, border_color="#3f3f46")
+        self.status_panel.grid(row=row, column=0, sticky="ew")
+        row += 1
+        self.status_panel.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            self.status_panel,
+            text="ROVER STATUS",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#9ca3af",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        # REACH P2: the three lifecycle pills, lit in order.
+        stage_row = ctk.CTkFrame(self.status_panel, fg_color="transparent")
+        stage_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        for i in range(3):
+            stage_row.grid_columnconfigure(i, weight=1)
+        self.stage_pills: dict[str, ctk.CTkLabel] = {}
+        for i, stage in enumerate(STAGE_ORDER):
+            pill = ctk.CTkLabel(
+                stage_row,
+                text=STAGE_LABELS[stage],
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color=STAGE_IDLE_COLOR,
+                corner_radius=6,
+                text_color="#e5e7eb",
+            )
+            pill.grid(row=0, column=i, sticky="ew", padx=2, ipady=5)
+            self.stage_pills[stage] = pill
+
+        self.mode_label = ctk.CTkLabel(
+            self.status_panel, text="", anchor="w", justify="left", font=mode_font
+        )
+        self.mode_label.grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 0))
+        self.detail_label = ctk.CTkLabel(
+            self.status_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            wraplength=self.SIDEBAR_MIN_W - 40,
+            font=ctk.CTkFont(size=12),
+        )
+        self.detail_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(2, 2))
+        self.status_panel.bind(
+            "<Configure>",
+            lambda e: self.detail_label.configure(wraplength=max(200, e.width - 20)),
+        )
+        # REACH P6: verbose numeric telemetry is deliberately de-emphasized
+        # (small, grey, mono) -- present for an operator who wants it, but
+        # never competing with the primary status above.
+        self.telemetry_label = ctk.CTkLabel(
+            self.status_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            font=mono_font,
+            text_color="#9ca3af",
+        )
+        self.telemetry_label.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self.alive_label = ctk.CTkLabel(
+            self.status_panel,
+            text="controller thread died -- see console",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#f87171",
+        )
+        self._alive_label_visible = False
+
+        # ===== SECTION 2 — MAP / SITUATIONAL AWARENESS (REACH P4) ======= #
+        # Persistent body-frame frame-of-reference: rover, goal, planned
+        # path (trajectory) and hazards (obstacles) always on screen.
+        plot_frame = ctk.CTkFrame(sidebar)
+        plot_frame.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
+        row += 1
+        plot_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            plot_frame,
+            text="MAP — rover · goal · path · hazards",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#9ca3af",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(6, 0))
+        self.plot = tk.Canvas(
+            plot_frame, height=self.PLOT_MIN, bg=PLOT_BG, highlightthickness=0
+        )
+        self.plot.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
+        self.plot.bind("<Configure>", self._on_plot_configure)
+
+        # ===== SECTION 3 — DESIGNATE TARGET (REACH P1 + P7) ============= #
+        # REACH P1 (contextual menu): this section is only the *selection*
+        # half of the workflow -- the three ways to designate a target.
+        # The *action* half (Confirm / Rerun / Pick manually, or a point
+        # confirm) is not shown here; it appears contextually below only
+        # once a target actually exists. That mirrors REACH's "select an
+        # object, THEN the relevant actions appear" adaptive menu.
+        target = ctk.CTkFrame(sidebar)
+        target.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
+        row += 1
+        target.grid_columnconfigure(0, weight=1)
+        target.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            target, text="DESIGNATE TARGET", font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
+
+        # REACH P7/P1: segment the scene and let the model pick a rock goal.
+        ctk.CTkButton(
+            target, text="Segment Scene", height=BTN_H, command=self.resolve_goal
+        ).grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=BTN_GAP // 2)
+        # REACH P1: open-vocabulary grounding -- name a target the segmenter
+        # wasn't trained on; produces the same reviewable goal.
+        ctk.CTkButton(
+            target, text="Ground Target", height=BTN_H, command=self.ground_target
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=BTN_GAP // 2)
+        # REACH P1: free-text open-vocabulary entry feeding Ground Target.
+        self.ground_entry = ctk.CTkEntry(
+            target, placeholder_text='name it: "flag" / "blue cuboid"', height=38
+        )
+        self.ground_entry.grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, BTN_GAP)
+        )
+        self.ground_entry.bind("<Return>", lambda e: self.ground_target())
+        # REACH P10 (autonomy): let the rover self-select a plausible
+        # exploration goal when the operator has no specific target.
+        ctk.CTkButton(
+            target, text="Random Goal", height=BTN_H, command=self.random_goal
+        ).grid(row=3, column=0, sticky="ew", padx=(10, 4), pady=(0, BTN_GAP))
+        # REACH P1 (rover-as-selectable-object → "go home" action): the
+        # paper's rover menu includes "go home" (autonomous return to
+        # start). Same verb, same place.
+        ctk.CTkButton(
+            target, text="Go Home", height=BTN_H, command=self.go_home
+        ).grid(row=3, column=1, sticky="ew", padx=(4, 10), pady=(0, BTN_GAP))
+
+        # ===== SECTION 4 — TASKWORK / MISSION (REACH P3 + P10) ========== #
+        # Free-text command -> ordered, chunked mission the operator can
+        # self-check step by step (progress synced from d.mission_status),
+        # exactly REACH's linear taskwork pages that "reduce the need for
+        # constant, line-by-line directions from ground control".
+        command_panel = ctk.CTkFrame(sidebar)
+        command_panel.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
+        row += 1
+        command_panel.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            command_panel, text="TASKWORK", font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
+        self.command_entry = ctk.CTkEntry(
+            command_panel,
+            placeholder_text='"go to a flag then return to home"',
+            height=38,
+        )
+        self.command_entry.grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 4))
+        self.command_entry.bind("<Return>", lambda e: self.submit_command())
+        # REACH P3: dispatch the ordered mission.
+        ctk.CTkButton(
+            command_panel, text="Send", width=72, height=38, command=self.submit_command
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=(0, 4))
+        self.mission_status_label = ctk.CTkLabel(
+            command_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=12),
+            text_color="#e5e7eb",
+            wraplength=self.SIDEBAR_MIN_W - 20,
+        )
+        self.mission_status_label.grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, BTN_GAP)
+        )
+
+        # ===== SECTION 5 — MANUAL DRIVE (REACH P5 + P7) ================= #
+        # Direct D-pad control, large glove-safe keys, always visible.
+        drive = ctk.CTkFrame(sidebar)
+        drive.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
+        row += 1
+        drive.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            drive, text="MANUAL DRIVE", font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
+        dpad = ctk.CTkFrame(drive, fg_color="transparent")
+        dpad.grid(row=1, column=0, pady=(0, 4))
+        dpad_cells = {
+            "fwd": (0, 1, "↑"),
+            "left": (1, 0, "←"),
+            "right": (1, 2, "→"),
+            "back": (2, 1, "↓"),
+        }
+        # REACH P5: each drive key is large (64x52) and separated by wide
+        # padding so a gloved press cannot spill onto the neighbour.
+        for direction, (r, c, glyph) in dpad_cells.items():
+            b = ctk.CTkButton(dpad, text=glyph, width=64, height=52, font=mode_font)
+            b.bind("<ButtonPress-1>", lambda e, d=direction: self.manual_press(d))
+            b.bind("<ButtonRelease-1>", lambda e, d=direction: self.manual_release(d))
+            b.grid(row=r, column=c, padx=6, pady=6)
+        ctk.CTkLabel(
+            drive,
+            text="hold a direction, or use the arrow keys — Esc cancels a pending click",
+            font=ctk.CTkFont(size=11),
+            text_color="#9ca3af",
+            wraplength=self.SIDEBAR_MIN_W - 40,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, BTN_GAP))
+
+        # Global keyboard shortcuts below are bound on root, so they fire on
+        # every keypress in the window regardless of focus -- guard each one
+        # against a text entry having focus, or typing e.g. "left" or a
+        # digit into it would also drive the rover / submit a heading.
+        for key, direction in (
+            ("Up", "fwd"),
+            ("Down", "back"),
+            ("Left", "left"),
+            ("Right", "right"),
+        ):
+            root.bind(
+                f"<KeyPress-{key}>",
+                lambda e, d=direction: self._guarded(self.manual_press, d),
+            )
+            root.bind(
+                f"<KeyRelease-{key}>",
+                lambda e, d=direction: self._guarded(self.manual_release, d),
+            )
+        root.bind("<Escape>", lambda e: self.cancel_pixel_click())
+
+        # Numpad heading shortcuts for the uncertainty-halt panel below --
+        # bound unconditionally (these digits aren't used elsewhere in this
+        # GUI); the controller itself drops a submission that isn't
+        # currently halted, so this is a no-op the rest of the time.
+        for key, angle in UNCERTAINTY_HEADING_KEYS.items():
+            root.bind(
+                f"<KeyPress-{key}>",
+                lambda e, a=angle: self._guarded(self.submit_uncertainty_heading, a),
+            )
+        root.bind("<KeyPress-r>", lambda e: self._guarded(self.retry_uncertainty))
+        root.bind("<KeyPress-R>", lambda e: self._guarded(self.retry_uncertainty))
+
+        # ===== CONTEXTUAL PANEL A — REVIEW RESOLVED GOAL (REACH P1) ===== #
+        # Only gridded while actually reviewing a resolved goal. This IS a
+        # REACH contextual menu: the Confirm / Rerun / Pick-manually
+        # actions exist only because a segmentation/grounding selection
+        # exists to act on. Bordered so it reads as "action needed".
+        self._seg_row = row
+        row += 1
+        self.seg_panel = ctk.CTkFrame(sidebar, border_width=2, border_color="#f59e0b")
+        ctk.CTkLabel(
+            self.seg_panel,
+            text="REVIEW RESOLVED GOAL",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#f59e0b",
+        ).pack(pady=(10, 2))
+        self.seg_desc_label = ctk.CTkLabel(
+            self.seg_panel,
+            text="",
+            wraplength=self.SIDEBAR_MIN_W - 40,
+            justify="left",
+        )
+        self.seg_desc_label.pack(padx=12, pady=(0, 8), fill="x")
+        self.seg_panel.bind(
+            "<Configure>",
+            lambda e: self.seg_desc_label.configure(wraplength=max(200, e.width - 24)),
+        )
+        seg_btn_col = ctk.CTkFrame(self.seg_panel, fg_color="transparent")
+        seg_btn_col.pack(pady=(0, 12), fill="x", padx=12)
+        seg_btn_col.grid_columnconfigure(0, weight=1)
+        # REACH P1: accept this selection as the goal.
+        ctk.CTkButton(
+            seg_btn_col,
+            text="Confirm",
+            height=BTN_H,
+            command=self.confirm_segmentation,
+            fg_color="#15803d",
+            hover_color="#166534",
+        ).grid(row=0, column=0, sticky="ew", pady=3)
+        # REACH P1: reject and re-resolve (same intent, new result).
+        ctk.CTkButton(
+            seg_btn_col,
+            text="Rerun",
+            height=BTN_H,
+            command=self.rerun_segmentation,
+            fg_color="#b45309",
+            hover_color="#92400e",
+        ).grid(row=1, column=0, sticky="ew", pady=3)
+        # REACH P1 + P7: fall back to point-and-select if the auto result
+        # is wrong.
+        ctk.CTkButton(
+            seg_btn_col, text="Pick Manually", height=BTN_H, command=self.pick_manually
+        ).grid(row=2, column=0, sticky="ew", pady=3)
+
+        # ===== CONTEXTUAL PANEL B — CONFIRM POINT GOAL (REACH P1 + P7) == #
+        # Only gridded while a click is pending confirmation -- the
+        # contextual action menu for a point-and-select target.
+        self._click_row = row
+        row += 1
+        self.click_panel = ctk.CTkFrame(sidebar, border_width=2, border_color="#00b8d4")
+        self.click_desc_label = ctk.CTkLabel(
+            self.click_panel,
+            text="Set the goal at the point you clicked?",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#22d3ee",
+            wraplength=self.SIDEBAR_MIN_W - 40,
+        )
+        self.click_desc_label.pack(pady=(10, 6), padx=12)
+        click_btn_col = ctk.CTkFrame(self.click_panel, fg_color="transparent")
+        click_btn_col.pack(pady=(0, 10), fill="x", padx=12)
+        click_btn_col.grid_columnconfigure(0, weight=1)
+        # REACH P7: commit the pointed-at goal.
+        ctk.CTkButton(
+            click_btn_col,
+            text="Confirm Point Goal",
+            height=BTN_H,
+            command=self.confirm_pixel_goal,
+            fg_color="#15803d",
+            hover_color="#166534",
+        ).grid(row=0, column=0, sticky="ew", pady=3)
+        # REACH P1: back out of the selection (REACH menu "back button").
+        ctk.CTkButton(
+            click_btn_col,
+            text="Cancel",
+            height=BTN_H,
+            command=self.cancel_pixel_click,
+            fg_color="#4b5563",
+            hover_color="#374151",
+        ).grid(row=1, column=0, sticky="ew", pady=3)
+
+        # ===== CONTEXTUAL PANEL C — UNCERTAINTY HALT (REACH P1+P8+P10) == #
+        # Only gridded while the controller is halted on belief
+        # uncertainty. A contextual heading-request menu: the rover has
+        # stopped itself (P8 safety) and asks the human for a direction
+        # (P10 shared autonomy). Same bordered numpad shape as
+        # scripts/habitat_tests/kb_teleop_vl.py's panel, redrawn here.
+        self._uncertainty_row = row
+        row += 1
+        self.uncertainty_panel = ctk.CTkFrame(
+            sidebar, border_width=2, border_color="#38bdf8"
+        )
+        self.uncertainty_title = ctk.CTkLabel(
+            self.uncertainty_panel, text="", font=ctk.CTkFont(size=14, weight="bold")
+        )
+        self.uncertainty_title.pack(pady=(10, 2))
+        self.uncertainty_desc_label = ctk.CTkLabel(
+            self.uncertainty_panel,
+            text="",
+            wraplength=self.SIDEBAR_MIN_W - 40,
+            justify="left",
+        )
+        self.uncertainty_desc_label.pack(padx=12, pady=(0, 8), fill="x")
+        self.uncertainty_panel.bind(
+            "<Configure>",
+            lambda e: self.uncertainty_desc_label.configure(
+                wraplength=max(200, e.width - 24)
+            ),
+        )
+        uncertainty_grid = ctk.CTkFrame(self.uncertainty_panel, fg_color="transparent")
+        uncertainty_grid.pack(pady=(0, 6))
+        self.uncertainty_buttons: dict[str, ctk.CTkButton] = {}
+        # REACH P1 + P5: one large heading key per compass direction, in
+        # the numpad layout, spaced to prevent mis-selection.
+        for key, angle in UNCERTAINTY_HEADING_KEYS.items():
+            r, c = UNCERTAINTY_HEADING_GRID_POS[key]
+            btn = ctk.CTkButton(
+                uncertainty_grid,
+                text=f"{key}\n{angle:+.0f}°",
+                width=68,
+                height=50,
+                command=lambda a=angle: self.submit_uncertainty_heading(a),
+            )
+            btn.grid(row=r, column=c, padx=4, pady=4)
+            self.uncertainty_buttons[key] = btn
+        # REACH P1: re-request a VLM heading sweep instead of committing.
+        self.uncertainty_retry_button = ctk.CTkButton(
+            self.uncertainty_panel,
+            text="Retry (R)",
+            height=BTN_H,
+            fg_color="#b45309",
+            hover_color="#92400e",
+            command=self.retry_uncertainty,
+        )
+        self.uncertainty_retry_button.pack(pady=(0, 12))
+        self._uncertainty_panel_visible = False
+
+        # ===== FOOTER — last click outcome (REACH P9) =================== #
+        # Persistent one-line acknowledgment of the last point-goal click
+        # ("point goal set at ..." / "click ignored: no valid depth").
+        # This row absorbs leftover sidebar height so the stack stays
+        # top-anchored instead of floating mid-window.
+        footer_row = row
+        sidebar.grid_rowconfigure(footer_row, weight=1)
+        self.click_status_label = ctk.CTkLabel(
+            sidebar,
+            text="",
+            anchor="n",
+            font=ctk.CTkFont(size=11),
+            text_color="#9ca3af",
+            wraplength=self.SIDEBAR_MIN_W - 20,
+        )
+        self.click_status_label.grid(
+            row=footer_row, column=0, sticky="new", padx=4, pady=(BTN_GAP, 0)
+        )
+
+        # ===== PINNED EMERGENCY BAR (REACH P8) ========================== #
+        # On its own root row, spanning the full width, OUTSIDE the
+        # scrollable sidebar -- always on screen. This is the paper's
+        # emergency-takeover affordance: the single most safety-critical
+        # control gets the largest, reddest, most reachable real estate.
+        stop_bar = ctk.CTkFrame(root, fg_color="transparent")
+        stop_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        stop_bar.grid_columnconfigure(0, weight=3)
+        stop_bar.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(
+            stop_bar,
+            text="■  EMERGENCY STOP",
+            height=56,
+            font=ctk.CTkFont(size=18, weight="bold"),
+            command=self.stop,
+            fg_color="#b91c1c",
+            hover_color="#991b1b",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        # REACH P8: reset/recover is destructive-adjacent, so it sits next
+        # to STOP but is visually subordinate (grey, narrower).
+        ctk.CTkButton(
+            stop_bar,
+            text="Reset Rover",
+            height=56,
+            command=self.reset_rover,
+            fg_color="#4b5563",
+            hover_color="#374151",
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        self.root.after(REFRESH_MS, self.refresh)
+
+    # ---------------- dynamic sizing ---------------- #
+    def _scroll_sidebar_to_bottom(self) -> None:
+        # The contextual review/confirm panels grid in near the bottom of
+        # the sidebar stack; on a short window the sidebar scrolls rather
+        # than clipping, so jump the scroll down as soon as one appears
+        # instead of leaving an action-required panel to be found by
+        # accident (REACH P9: never make the operator hunt for the next
+        # step). Deferred one tick since the panel's own .grid() hasn't been
+        # laid out (scrollregion hasn't grown to include it) yet this frame.
+        self.root.after_idle(lambda: self.sidebar._parent_canvas.yview_moveto(1.0))
+
+    def _scroll_sidebar_to_top(self) -> None:
+        # Mirror of _scroll_sidebar_to_bottom for when a contextual panel
+        # closes -- return to the always-on status/map sections above.
+        self.root.after_idle(lambda: self.sidebar._parent_canvas.yview_moveto(0.0))
+
+    def _on_plot_configure(self, event) -> None:
+        # Keep the body-frame canvas square, tracking the sidebar's current
+        # width (clamped) instead of a fixed pixel size baked in at startup.
+        new_size = max(self.PLOT_MIN, min(int(event.width), self.PLOT_MAX))
+        if abs(new_size - self._plot_size) > 2:
+            self._plot_size = new_size
+            self.plot.configure(height=new_size)
+
+    # ---------------- commands ---------------- #
+    def _guarded(self, fn, *fn_args) -> None:
+        # Skip root-level keyboard shortcuts while a text entry has focus,
+        # so typing there doesn't also drive the rover / trigger a heading
+        # submission (see the binding loops above).
+        if self.root.focus_get() in (self.command_entry, self.ground_entry):
+            return
+        fn(*fn_args)
+
+    def _ack(self, text: str) -> None:
+        # REACH P9: record an immediate human-readable acknowledgment of
+        # the just-pressed control; refresh() echoes it in the status
+        # header so no press ever feels unregistered.
+        self._ack_text = text
+
+    def submit_command(self) -> None:
+        # Handed to RoverController.submit_nav_command, which splits it via
+        # the Qwen VLM (qwen_client.parse_nav_command) into (directions,
+        # goals) on a background thread, turns that into an ordered Mission
+        # (nav.mission.parse_parts), and drives through its sub-goals one at
+        # a time. Progress shows in mission_status_label.
+        text = self.command_entry.get().strip()
+        if not text:
+            return
+        print(f"[nav command] submitted: {text}")
+        self._ack(f"taskwork queued: {text}")
+        self.controller.submit_nav_command(text)
+        self.command_entry.delete(0, "end")
+
+    def resolve_goal(self) -> None:
+        self._manual_held.clear()
+        self.cancel_pixel_click()
+        self._ack("segmenting scene…")
+        self.controller.request_resolve()
+
+    def ground_target(self) -> None:
+        text = self.ground_entry.get().strip()
+        if not text:
+            return
+        self._manual_held.clear()
+        self.cancel_pixel_click()
+        self._ack(f"grounding target: {text}")
+        self.controller.request_resolve(target_text=text)
+
+    def random_goal(self) -> None:
+        self._manual_held.clear()
+        self.cancel_pixel_click()
+        self._ack("random goal requested")
+        self.controller.random_goal()
+
+    def go_home(self) -> None:
+        self._manual_held.clear()
+        self.cancel_pixel_click()
+        self._ack("returning home")
+        self.controller.go_home()
+
+    def reset_rover(self) -> None:
+        self._manual_held.clear()
+        self.cancel_pixel_click()
+        self._ack("rover reset")
+        self.controller.request_reset()
+
+    def stop(self) -> None:
+        self._manual_held.clear()
+        self.cancel_pixel_click()
+        self._ack("STOP — driving halted")
+        self.controller.stop_driving()
+
+    # ---------------- segmentation review (Goal 1) ---------------- #
+    def confirm_segmentation(self) -> None:
+        self._ack("goal confirmed")
+        self.controller.request_confirm_segmentation()
+
+    def rerun_segmentation(self) -> None:
+        self._ack("re-resolving goal…")
+        self.controller.request_rerun_segmentation()
+
+    def pick_manually(self) -> None:
+        self._manual_held.clear()
+        self._ack("pick a point in the live view")
+        self.controller.request_pick_manually()
+
+    # ---------------- uncertainty halt ---------------- #
+    def submit_uncertainty_heading(self, angle_deg: float) -> None:
+        self._ack(f"heading sent: {angle_deg:+.0f}°")
+        self.controller.submit_uncertainty_heading(angle_deg)
+
+    def retry_uncertainty(self) -> None:
+        self._ack("requesting VLM sweep…")
+        self.controller.retry_uncertainty_request()
+
+    # ---------------- click-to-goal ---------------- #
+    def on_cam_click(self, event) -> None:
+        # The camera frame is letterboxed into cam_canvas (see _draw_camera),
+        # so a click has to be mapped through the last-drawn image's actual
+        # on-canvas box, not the canvas's own (possibly wider/taller) bounds.
+        if self._cam_img_box is None:
+            return
+        x0, y0, x1, y1 = self._cam_img_box
+        if not (x0 <= event.x <= x1 and y0 <= event.y <= y1):
+            return
+        nx = min(max((event.x - x0) / (x1 - x0), 0.0), 1.0)
+        ny = min(max((event.y - y0) / (y1 - y0), 0.0), 1.0)
+        self._pending_click_norm = (nx, ny)
+        self._ack("point selected — confirm below")
+
+    def confirm_pixel_goal(self) -> None:
+        if self._pending_click_norm is None:
+            return
+        self._manual_held.clear()
+        nx, ny = self._pending_click_norm
+        self._ack("point goal committed")
+        self.controller.request_pixel_goal(nx, ny)
+        self._pending_click_norm = None
+
+    def cancel_pixel_click(self) -> None:
+        self._pending_click_norm = None
+
+    # ---------------- manual drive ---------------- #
+    def manual_press(self, direction: str) -> None:
+        self.cancel_pixel_click()
+        self._manual_held.add(direction)
+        self._manual_update()
+
+    def manual_release(self, direction: str) -> None:
+        self._manual_held.discard(direction)
+        self._manual_update()
+
+    def _manual_update(self) -> None:
+        if not self._manual_held:
+            self.controller.stop_driving()
+            return
+        lin = ang = 0.0
+        if "fwd" in self._manual_held:
+            lin += self.max_linear
+        if "back" in self._manual_held:
+            lin -= 0.5 * self.max_linear
+        if "left" in self._manual_held:
+            ang += self.max_angular
+        if "right" in self._manual_held:
+            ang -= self.max_angular
+        self.controller.set_manual(lin, ang)
+
+    def on_close(self) -> None:
+        self.closed = True
+        self.root.destroy()
+
+    # ---------------- refresh loop ---------------- #
+    def _derive_stage(self, d) -> Optional[str]:
+        # REACH P2: fold the controller's existing signals into the
+        # three-stage lifecycle without needing any new controller field.
+        # COMPLETE wins; otherwise an active goal that is moving is
+        # EXECUTING, an active goal not yet moving is RECEIVED. No goal ->
+        # no stage lit (idle / manual).
+        if d.goal_reached:
+            return "complete"
+        active = d.mode in ("point", "resolve", MODE_TURN, MODE_REVIEW_SEGMENTATION)
+        if not active:
+            return None
+        moving = abs(d.action.v_fwd) > 0.01 or abs(d.action.yaw_rate) > 0.01
+        return "executing" if moving else "received"
+
+    def _sync_stage_pills(self, stage: Optional[str]) -> None:
+        # Light stages up to and including the active one: past stages
+        # green (done), current stage cyan (active), future stages grey.
+        active_idx = STAGE_ORDER.index(stage) if stage in STAGE_ORDER else -1
+        for i, name in enumerate(STAGE_ORDER):
+            if active_idx < 0:
+                color = STAGE_IDLE_COLOR
+            elif i < active_idx:
+                color = STAGE_DONE_COLOR
+            elif i == active_idx:
+                color = STAGE_ACTIVE_COLOR
+            else:
+                color = STAGE_IDLE_COLOR
+            self.stage_pills[name].configure(fg_color=color)
+
+    def refresh(self) -> None:
+        if self.closed:
+            return
+        d = self.controller.snapshot()
+
+        if d.vis_rgb is not None:
+            self._draw_camera(d.vis_rgb)
+
+        self._draw_plot(d)
+        self._sync_seg_panel(d)
+        self._sync_click_panel()
+        self._sync_uncertainty_panel(d)
+        self.click_status_label.configure(text=d.click_status)
+        self.mission_status_label.configure(text=d.mission_status)
+
+        # REACH P2: drive the three-stage lifecycle pills.
+        self._sync_stage_pills(self._derive_stage(d))
+
+        mode_txt = d.mode.upper().replace("_", " ")
+        if d.goal_reached:
+            mode_txt += "  ✓ GOAL REACHED"
+        self.mode_label.configure(
+            text=mode_txt, text_color=MODE_COLORS.get(d.mode, "#e5e7eb")
+        )
+        # REACH P9: prefer the freshest human ack, fall back to controller
+        # status text -- so the header reacts on the same frame as a press.
+        self.detail_label.configure(text=self._ack_text or d.status_text)
+
+        pose_txt = (
+            f"pose ({d.pose.x:.1f}, {d.pose.z:.1f}, yaw={math.degrees(d.pose.yaw):.0f}deg)"
+            if d.pose is not None
+            else "pose: -"
+        )
+        act = d.action
+        cbf_txt = ""
+        if d.cbf_info.get("blocked"):
+            cbf_txt = "  CBF:orbit" if d.cbf_info.get("orbiting") else "  CBF:blocked"
+        if d.cbf_info.get("hard_gate_fired"):
+            cbf_txt += "  CBF:hard-gate"
+        unc_txt = (
+            f"   unc={d.uncertainty_value:.2f}/{d.uncertainty_threshold:.2f}"
+            if d.uncertainty_enabled
+            else ""
+        )
+        self.telemetry_label.configure(
+            text=f"{pose_txt}   step={d.step}   "
+            f"v=[{act.v_fwd:.2f},{act.v_lat:.2f}] yaw_rate={act.yaw_rate:+.2f}{cbf_txt}{unc_txt}"
+        )
+
+        alive = self.controller.is_alive()
+        if not alive and not self._alive_label_visible:
+            self.alive_label.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
+            self._alive_label_visible = True
+        elif alive and self._alive_label_visible:
+            self.alive_label.grid_forget()
+            self._alive_label_visible = False
+
+        self.root.after(REFRESH_MS, self.refresh)
+
+    def _sync_seg_panel(self, d) -> None:
+        in_review = d.mode == MODE_REVIEW_SEGMENTATION
+        if in_review and not self._seg_panel_visible:
+            self.seg_panel.grid(row=self._seg_row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
+            self._seg_panel_visible = True
+            self._scroll_sidebar_to_bottom()
+        elif not in_review and self._seg_panel_visible:
+            self.seg_panel.grid_forget()
+            self._seg_panel_visible = False
+            self._scroll_sidebar_to_top()
+        if in_review:
+            self.seg_desc_label.configure(text=d.status_text)
+
+    def _sync_click_panel(self) -> None:
+        pending = self._pending_click_norm is not None
+        if pending and not self._click_panel_visible:
+            self.click_panel.grid(
+                row=self._click_row, column=0, sticky="ew", pady=(SECTION_GAP, 0)
+            )
+            self._click_panel_visible = True
+            self._scroll_sidebar_to_bottom()
+        elif not pending and self._click_panel_visible:
+            self.click_panel.grid_forget()
+            self._click_panel_visible = False
+            self._scroll_sidebar_to_top()
+
+    def _sync_uncertainty_panel(self, d) -> None:
+        if not d.uncertainty_halted:
+            if self._uncertainty_panel_visible:
+                self.uncertainty_panel.grid_forget()
+                self._uncertainty_panel_visible = False
+                self._scroll_sidebar_to_top()
+            return
+
+        if not self._uncertainty_panel_visible:
+            self.uncertainty_panel.grid(
+                row=self._uncertainty_row, column=0, sticky="ew", pady=(SECTION_GAP, 0)
+            )
+            self._uncertainty_panel_visible = True
+            self._scroll_sidebar_to_bottom()
+
+        in_flight = d.uncertainty_request_in_flight
+        button_state = "disabled" if in_flight else "normal"
+        for btn in self.uncertainty_buttons.values():
+            btn.configure(state=button_state)
+        self.uncertainty_retry_button.configure(state=button_state)
+
+        if in_flight:
+            self.uncertainty_panel.configure(border_color="#f59e0b")
+            self.uncertainty_title.configure(
+                text="REQUESTING VLM SWEEP...", text_color="#f59e0b"
+            )
         else:
-            print(k, '=', v if not hasattr(v,'shape') else v.shape)
-"
-echo "---grep for RelationalBelief training/usage in scripts---"
-grep -rn "RelationalBelief\|relational_belief" /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/ 2>/dev/null
-echo "---grep for EpistemicGate usage in scripts---"
-grep -rln "EpistemicGate" /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/scripts/ 2>/dev/null
-
-OUT
-Traceback (most recent call last):
-  File "<string>", line 2, in <module>
-ModuleNotFoundError: No module named 'torch'
----grep for RelationalBelief training/usage in scripts---
----grep for EpistemicGate usage in scripts---
-Bash Check python env and search full repo for EpistemicGate/RelationalBelief usage outside core modules
-IN
-which python3; python3 -c "import sys; print(sys.executable)"
-find / -maxdepth 4 -iname "venv" -o -iname ".venv" 2>/dev/null | grep -v proc | head -5
-grep -rln "EpistemicGate\|RelationalBelief" /home/gpu/Desktop/pineapple/mars-habitatsim/navdp/ --include="*.py" | grep -v "/models/\|/extensions/"
-
-OUT
-/usr/bin/python3
-/usr/bin/python3
-/usr/lib/python3.12/venv
-Bash Locate a Python environment with torch installed
-IN
-find / -maxdepth 6 -iname "site-packages" 2>/dev/null | grep -v proc
-echo "---conda---"
-find / -maxdepth 4 -iname "conda*" 2>/dev/null | grep -v proc
-echo "---pip3 show torch---"
-pip3 show torch 2>&1 | head -5
-echo "---check for other python versions---"
-ls /usr/bin/python*
-compgen -c python 2>/dev/null | sort -u
-
-OUT
-/home/gpu/miniconda3/lib/python3.14/site-packages
-/home/gpu/miniconda3/pkgs/ply-3.11-pyhd8ed1ab_3/site-packages
-/home/gpu/miniconda3/pkgs/smmap-3.0.5-pyh44b312d_0/site-packages
-/home/gpu/miniconda3/pkgs/mypy_extensions-1.1.0-pyha770c72_0/site-packages
-/home/gpu/miniconda3/pkgs/zipp-3.23.0-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/conda-anaconda-telemetry-0.3.0-pyhd3eb1b0_1/site-packages
-/home/gpu/miniconda3/pkgs/jeepney-0.7.1-pyhd3eb1b0_0/site-packages
-/home/gpu/miniconda3/pkgs/colorama-0.4.6-pyhd8ed1ab_1/site-packages
-/home/gpu/miniconda3/pkgs/pip-26.1.2-pyh8b19718_0/site-packages
-/home/gpu/miniconda3/pkgs/conda-libmamba-solver-26.6.0-pyh3785b3c_0/site-packages
-/home/gpu/miniconda3/pkgs/deprecated-1.2.18-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/trimesh-4.1.8-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/gitpython-3.1.45-pyhff2d567_0/site-packages
-/home/gpu/miniconda3/pkgs/dataclasses-json-0.6.7-pyhd8ed1ab_1/site-packages
-/home/gpu/miniconda3/pkgs/cycler-0.12.1-pyhd8ed1ab_1/site-packages
-/home/gpu/miniconda3/pkgs/typing_extensions-4.14.1-pyhe01879c_0/site-packages
-/home/gpu/miniconda3/pkgs/packaging-26.2-pyhc364b38_0/site-packages
-/home/gpu/miniconda3/pkgs/imageio-2.37.0-pyhfb79c49_0/site-packages
-/home/gpu/miniconda3/pkgs/wheel-0.45.1-pyhd8ed1ab_1/site-packages
-/home/gpu/miniconda3/pkgs/gitdb-4.0.12-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/attrs-25.3.0-pyh71513ae_0/site-packages
-/home/gpu/miniconda3/pkgs/certifi-2025.8.3-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/imageio-ffmpeg-0.6.0-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/setuptools-80.9.0-pyhff2d567_0/site-packages
-/home/gpu/miniconda3/pkgs/setuptools-75.3.0-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/python-installer-1.0.0-pyhd3eb1b0_0/site-packages
-/home/gpu/miniconda3/pkgs/pip-26.0.1-pyhc872135_1/site-packages
-/home/gpu/miniconda3/pkgs/pip-26.1.2-pyh0d26453_0/site-packages
-/home/gpu/miniconda3/pkgs/python-dateutil-2.9.0.post0-pyhe01879c_2/site-packages
-/home/gpu/miniconda3/pkgs/marshmallow-3.20.2-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/wheel-0.47.0-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/importlib_resources-6.5.2-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/anaconda-anon-usage-0.8.1-pyhb46e38b_100/site-packages
-/home/gpu/miniconda3/pkgs/toml-0.10.2-pyhd8ed1ab_1/site-packages
-/home/gpu/miniconda3/pkgs/pip-24.3.1-pyh8b19718_0/site-packages
-/home/gpu/miniconda3/pkgs/typing_inspect-0.9.0-pyhd8ed1ab_1/site-packages
-/home/gpu/miniconda3/pkgs/wheel-0.45.1-pyhd8ed1ab_0/site-packages
-/home/gpu/miniconda3/pkgs/setuptools-83.0.0-pyh332efcf_0/site-packages
-/home/gpu/miniconda3/pkgs/six-1.17.0-pyhe01879c_1/site-packages
-/home/gpu/miniconda3/pkgs/munkres-1.1.4-pyhd8ed1ab_1/site-packages
-/home/gpu/miniconda3/pkgs/pip-25.2-pyh8b19718_0/site-packages
-/home/gpu/miniconda3/pkgs/pyparsing-3.2.3-pyhe01879c_2/site-packages
-/home/gpu/miniconda3/pkgs/tomli-2.2.1-pyhe01879c_2/site-packages
-/home/gpu/miniconda3/pkgs/tqdm-4.67.1-pyhd8ed1ab_1/site-packages
-/home/gpu/miniconda3/pkgs/tomli-w-1.2.0-pyhd3eb1b0_0/site-packages
----conda---
-/home/gpu/miniconda3/condarc.d
-/home/gpu/miniconda3/condabin
-/home/gpu/miniconda3/conda-meta
-/home/gpu/.cache/conda
-/home/gpu/.cache/conda-anaconda-tos
----pip3 show torch---
-/bin/bash: line 12: pip3: command not found
----check for other python versions---
-/usr/bin/python3
-/usr/bin/python3.12
-python3
-python3.12
-pythoncalls-bpfcc
-pythonflow-bpfcc
-pythongc-bpfcc
-pythonstat-bpfcc
-Bash List conda environments and check which has torch
-IN
-source /home/gpu/miniconda3/etc/profile.d/conda.sh 2>/dev/null; conda env list 2>/dev/null
-echo "---"
-for e in $(conda env list 2>/dev/null | grep -v "^#" | awk '{print $1}'); do
-  echo "env: $e"
-  conda run -n "$e" python -c "import torch; print('torch', torch.__version__)" 2>&1 | tail -1
-done
-
-OUT
-# conda environments:
-#
-# * -> active
-# + -> frozen
-base                     /home/gpu/miniconda3
-eloftr                   /home/gpu/miniconda3/envs/eloftr
-habitat                  /home/gpu/miniconda3/envs/habitat
-sam2                     /home/gpu/miniconda3/envs/sam2
-sam3                     /home/gpu/miniconda3/envs/sam3
-
----
-env: base
-ERROR conda.cli.main_run:execute(148): `conda run python -c import torch; print('torch', torch.__version__)` failed. (See above for error)
-env: eloftr
-ERROR conda.cli.main_run:execute(148): `conda run python -c import torch; print('torch', torch.__version__)` failed. (See above for error)
-env: habitat
-ERROR conda.cli.main_run:execute(148): `conda run python -c import torch; print('torch', torch.__version__)` failed. (See above for error)
-env: sam2
-torch 2.13.0+cu130
-env: sam3
-torch 2.10.0+cu128
-Bash Inspect belief_adapter.pt checkpoint using sam2 conda env with torch
-IN
-source /home/gpu/miniconda3/etc/profile.d/conda.sh
-conda run -n sam2 python -c "
-import torch
-ckpt = torch.load('/home/gpu/Desktop/pineapple/mars-habitatsim/navdp/belief_adapter.pt', map_location='cpu', weights_only=False)
-if isinstance(ckpt, dict):
-    for k,v in ckpt.items():
-        if hasattr(v,'keys'):
-            print(k, '-> dict with', len(v), 'keys; sample:', list(v.keys())[:8])
-        else:
-            print(k, '=', v if not hasattr(v,'shape') else v.shape)
-"
-
-OUT
-adapter -> dict with 5 keys; sample: ['alpha', 'proj.0.weight', 'proj.0.bias', 'proj.2.weight', 'proj.2.bias']
-belief_feat_dim = 3
-dim = 512
-num_tokens = 4
-r_scale = 10.0
-AskUserQuestion
-OUT
-Your questions have been answered: "The mean (mu) in SubgoalBeliefBank has no tunable knobs of its own — it's either snapped to a fresh measurement or deterministically dead-reckoned by the reported odometry (verified in belief_bank.py: no constructor param touches mu directly). So 'testing the mean' really means testing how well mu tracks the true goal under different measurement/odometry noise conditions, while 'testing covariance' means testing sigma_init/sigma_visible/odom_noise/decay_factor/large_uncertainty. Should the experiment harness scope include the learned RelationalBelief refinement layer too?"="Kalman bank only (Recommended)", "What should decide which parameter set is 'best'?"="Calibration + task performance (Recommended)", "What scenario data should the sweep run against?"="Synthetic only (Recommended)". You can now continue with these answers in mind.
-Write i-am-supposed-to-rosy-metcalfe.md
-196 lines
-Claude’s Plan i-am-supposed-to-rosy-metcalfe.md
-User approved the plan
-Update Todos
-
-Create belief_exp/ directory scaffold
-
-Write common.py (sys.path bootstrap, p_controller, ego_motion_true)
-
-Write scenario.py (closed-loop episode simulator using SubgoalBeliefBank/RouteManager)
-
-Write metrics.py (calibration + task performance scoring)
-
-Write sweep.py (paired random-search CLI driver)
-
-Write inspect_one.py (single-config trace CLI)
-
-Write README.md
-
-Run verification steps 1-4
-Bash Create belief_exp directory scaffold
-IN
-mkdir -p /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/results
-ls /home/gpu/Desktop/pineapple/mars-habitatsim/
-
-OUT
-annotations
-assets
-belief_exp
-command.txt
-conda_env.py
-generate_rock_env.py
-hm2obj.py
-ht_vel_client.py
-ht_vel_server.py
-kb_teleop.py
-labels.txt
-log_reader.py
-marsyard2022.mtl
-marsyard2022_terrain_hm.png
-marsyard2022_terrain_texture.png
-navdp
-obj2glb.py
-pix2vid.py
-qwen_vlm_client.py
-qwen_vlm_server.py
-qwen_vlm_smoke_test.py
-README.md
-rgbd_drive.py
-rgbd_test.py
-rock_envs
-rollout_navdp2.py
-rollout_navdp_policy.py
-rollout_navdp.py
-round1_walk_rgbd.py
-run_navdp_rollout.sh
-run_qwen_vla_rollout.sh
-run_vlm_nav_interactive.sh
-sam
-sam2_auto_masks_folder.py
-sam_annotation_adapter.py
-sam_vla
-test_goal_pixel_ratio.py
-test_qwen_vlm_persistent.py
-test_resolve_vlm_selection.py
-usage
-verify_vlm_nav_setup.py
-vlm_nav_demo.py
-vlm_nav_interactive.py
-vlm_query.py
-Good, directory created. Now let's write the modules.
-
-Write common.py
-85 lines
-Write scenario.py
-203 lines
-Write metrics.py
-79 lines
-Write sweep.py
-235 lines
-Write inspect_one.py
-98 lines
-Write README.md
-110 lines
-Now let's run the verification steps.
-
-Update Todos
-
-Create belief_exp/ directory scaffold
-
-Write common.py (sys.path bootstrap, p_controller, ego_motion_true)
-
-Write scenario.py (closed-loop episode simulator using SubgoalBeliefBank/RouteManager)
-
-Write metrics.py (calibration + task performance scoring)
-
-Write sweep.py (paired random-search CLI driver)
-
-Write inspect_one.py (single-config trace CLI)
-
-Write README.md
-
-Run verification steps 1-4
-Bash Run inspect_one.py smoke test with default params
-IN
-source /home/gpu/miniconda3/etc/profile.d/conda.sh
-conda run -n sam2 python /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/inspect_one.py --seed 0 2>&1 | head -80
-
-OUT
-  t  vis  pause   true_x   true_y     mu_x     mu_y     err   sig_x   sig_y  conf
----------------------------------------------------------------------------------
-  0    Y           3.988    1.177    4.119    1.271   0.161   0.224   0.224  1.00
-  1    .           3.950    0.363    4.136    0.547   0.263   0.265   0.265  0.95
-  2    .           3.765    0.017    4.077    0.311   0.429   0.300   0.300  0.90
-  3    .           3.564   -0.173    3.920    0.078   0.436   0.332   0.332  0.86
-  4    .           3.368   -0.220    3.733    0.020   0.437   0.361   0.361  0.81
-  5    .           3.179   -0.232    3.499    0.067   0.438   0.387   0.387  0.77
-  6    .           2.991   -0.272    3.337    0.096   0.505   0.412   0.412  0.74
-  7    .           2.805   -0.328    3.165   -0.012   0.480   0.436   0.436  0.70
-  8    .           2.629   -0.321    3.021   -0.057   0.473   0.458   0.458  0.66
-  9    .           2.460   -0.289    2.907   -0.192   0.458   0.480   0.480  0.63
- 10    .           2.302   -0.183    2.726   -0.150   0.426   0.500   0.500  0.60
- 11    .           2.141   -0.101    2.475   -0.143   0.337   0.520   0.520  0.57
- 12    Y           1.980   -0.021    2.023    0.049   0.082   0.224   0.224  1.00
- 13    Y           1.770   -0.051    1.944   -0.100   0.181   0.224   0.224  1.00
- 14    Y           1.561    0.006    1.624   -0.215   0.229   0.224   0.224  1.00
- 15    Y           1.346    0.130    1.528   -0.002   0.225   0.224   0.224  1.00
- 16    Y           1.136    0.131    1.155    0.068   0.066   0.224   0.224  1.00
- 17    Y           0.931    0.093    0.989    0.222   0.142   0.224   0.224  1.00
- 18    Y           0.731   -0.020    0.688   -0.094   0.085   0.224   0.224  1.00
- 19    Y           0.523    0.029    0.389   -0.111   0.194   0.224   0.224  1.00
-
-RouteManager advanced at step 19; final true dist = 0.524
-
-metrics over 1 episode(s):
-        mean_err_visible = 0.1517
-       mean_err_occluded = 0.4255
-         calibration_nll = -1.9143
-         coverage_1sigma = 0.9250
-         coverage_2sigma = 1.0000
-      coverage_deviation = 0.2878
-         mean_final_dist = 0.5236
-            advance_rate = 1.0000
-   mean_steps_to_advance = 19.0000
-      false_advance_rate = 0.0000
-              n_episodes = 1.0000
-Bash Compare calibration metrics for overconfident vs well-matched sigma_visible
-IN
-source /home/gpu/miniconda3/etc/profile.d/conda.sh
-echo "=== overconfident sigma_visible (1e-4) with real obs noise 0.3 ==="
-conda run -n sam2 python /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/inspect_one.py --sigma-visible 1e-4 --env-obs-noise 0.3 --episodes 30 --seed 1 2>&1 | tail -15
-echo
-echo "=== well-matched sigma_visible (~0.09, matches obs_noise variance) ==="
-conda run -n sam2 python /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/inspect_one.py --sigma-visible 0.09 --env-obs-noise 0.3 --episodes 30 --seed 1 2>&1 | tail -15
-
-OUT
-=== overconfident sigma_visible (1e-4) with real obs noise 0.3 ===
-
-never advanced within max_steps; final true dist = 0.713
-
-metrics over 30 episode(s):
-        mean_err_visible = 0.3708
-       mean_err_occluded = 0.8504
-         calibration_nll = 402.6870
-         coverage_1sigma = 0.3880
-         coverage_2sigma = 0.5067
-      coverage_deviation = 0.7426
-         mean_final_dist = 0.6093
-            advance_rate = 0.7333
-   mean_steps_to_advance = 25.2273
-      false_advance_rate = 0.0455
-              n_episodes = 30.0000
-
-=== well-matched sigma_visible (~0.09, matches obs_noise variance) ===
-
-never advanced within max_steps; final true dist = 2.009
-
-metrics over 30 episode(s):
-        mean_err_visible = 0.3711
-       mean_err_occluded = 0.8088
-         calibration_nll = -0.9173
-         coverage_1sigma = 0.7753
-         coverage_2sigma = 0.9742
-      coverage_deviation = 0.1123
-         mean_final_dist = 1.0962
-            advance_rate = 0.5333
-   mean_steps_to_advance = 25.7500
-      false_advance_rate = 0.0000
-              n_episodes = 30.0000
-Bash Run small smoke-test sweep (20 configs x 20 episodes)
-IN
-source /home/gpu/miniconda3/etc/profile.d/conda.sh
-time conda run -n sam2 python /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/sweep.py --configs-n 20 --episodes-per-config 20 --out /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/results/smoke_test.csv 2>&1 | tail -40
-
-OUT
-[1/20] configs evaluated
-[2/20] configs evaluated
-[3/20] configs evaluated
-[4/20] configs evaluated
-[5/20] configs evaluated
-[6/20] configs evaluated
-[7/20] configs evaluated
-[8/20] configs evaluated
-[9/20] configs evaluated
-[10/20] configs evaluated
-[11/20] configs evaluated
-[12/20] configs evaluated
-[13/20] configs evaluated
-[14/20] configs evaluated
-[15/20] configs evaluated
-[16/20] configs evaluated
-[17/20] configs evaluated
-[18/20] configs evaluated
-[19/20] configs evaluated
-[20/20] configs evaluated
-
-wrote 20 configs to /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/results/smoke_test.csv
-
-combined_score calibration_sc     task_score     sigma_init  sigma_visible     odom_noise   decay_factor large_uncertai success_radius sigma_ale_thre
------------------------------------------------------------------------------------------------------------------------------------------------------
-        0.8569         1.5718         0.1419         4.2603         0.0424         0.0187         0.9182      2486.2937         0.3164         0.8724
-        0.7982         1.2606         0.3358         0.1262         0.0444         0.0097         0.8973      4486.3655         0.8206         0.6868
-        0.7168         0.9653         0.4683         0.2753         0.0257         0.1106         0.8449        88.7318         0.4307         1.2136
-        0.5951         0.4049         0.7852         1.1061         0.0112         0.0452         0.8032      1640.1063         0.6102         1.8653
-        0.5066         0.6465         0.3666         4.6590         0.0935         0.0010         0.9538      4523.7795         0.6719         0.7074
-        0.4099         0.4492         0.3706         3.5155         0.0118         0.0782         0.8827      2283.3789         0.2080         0.7936
-        0.3768         0.6199         0.1337         0.1360         0.1285         0.0043         0.9398      3859.8716         0.3015         1.7431
-        0.3001         0.5229         0.0773         0.1333         0.0132         0.0998         0.9262       492.1680         0.3308         1.3801
-        0.1651        -0.3172         0.6474         0.2163         0.2360         0.0133         0.9968       116.1065         0.9704         1.6217
-        0.1139        -0.4215         0.6494         0.1295         0.2688         0.0014         0.8685       362.7166         0.9728         1.1682
-
-Best config, ready to paste:
-SubgoalBeliefBank([goal_id], sigma_init=4.26, sigma_visible=0.04242, odom_noise=0.01869, decay_factor=0.9182, large_uncertainty=2486)
-RouteManager(route, success_radius=0.3164)
-gate.sigma_ale_threshold = 0.8724
-
-real	0m3.845s
-user	0m5.125s
-sys	0m0.390s
-Bash Inspect CSV header and confirm navdp/ untouched via git status
-IN
-head -3 /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/results/smoke_test.csv
-echo "---"
-git status --short
-
-OUT
-sigma_init,sigma_visible,odom_noise,decay_factor,large_uncertainty,success_radius,sigma_ale_threshold,mean_err_visible,mean_err_occluded,calibration_nll,coverage_1sigma,coverage_2sigma,coverage_deviation,mean_final_dist,advance_rate,mean_steps_to_advance,false_advance_rate,n_episodes,calibration_score,task_score,combined_score
-4.2603388920012355,0.04242355063279966,0.018688552360099586,0.9181909161210206,2486.293650589535,0.31637883054922544,0.8723696398214406,0.21578624201613628,0.8081662122635321,-1.143288657273864,0.7178387650085764,0.9245283018867925,0.06511046312178392,0.598249039798975,0.75,24.533333333333335,0.06666666666666667,20.0,1.5718464993899335,0.14185527435404663,0.8568508868719901
-0.12619083378829712,0.044352455840107094,0.009748168020621348,0.8972810598198594,4486.365458211075,0.8205529504814628,0.6868289891665958,0.21317715106063231,0.8591658424293092,-0.9536311707447201,0.6857976653696498,0.8998054474708171,0.05779221789883271,0.9498060330748558,0.9,23.11111111111111,0.05555555555555555,20.0,1.2606081694016376,0.3358173878802586,0.7982127786409481
----
-?? belief_exp/
-All verification checks pass. Let me remove the smoke-test artifact (keep results/ clean) and run the full sweep as the last verification step.
-
-Bash Run full sweep (200 configs x 60 episodes) as final verification
-IN
-rm /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/results/smoke_test.csv
-source /home/gpu/miniconda3/etc/profile.d/conda.sh
-time conda run -n sam2 python /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/sweep.py --configs-n 200 --episodes-per-config 60 2>&1 | tail -35
-
-OUT
-[60/200] configs evaluated
-[70/200] configs evaluated
-[80/200] configs evaluated
-[90/200] configs evaluated
-[100/200] configs evaluated
-[110/200] configs evaluated
-[120/200] configs evaluated
-[130/200] configs evaluated
-[140/200] configs evaluated
-[150/200] configs evaluated
-[160/200] configs evaluated
-[170/200] configs evaluated
-[180/200] configs evaluated
-[190/200] configs evaluated
-[200/200] configs evaluated
-
-wrote 200 configs to /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/results/sweep_20260720_153509.csv
-
-combined_score calibration_sc     task_score     sigma_init  sigma_visible     odom_noise   decay_factor large_uncertai success_radius sigma_ale_thre
------------------------------------------------------------------------------------------------------------------------------------------------------
-        0.9720         1.3299         0.6142         0.2049         0.0318         0.0210         0.8285        53.2655         0.5471         1.5482
-        0.9392         1.2693         0.6092         0.4413         0.0359         0.0205         0.9300       115.2778         0.5757         1.9851
-        0.9113         1.2309         0.5917         0.1822         0.0277         0.0307         0.9489        63.0438         0.4151         0.8012
-        0.9105         1.2270         0.5939         0.1592         0.0437         0.0148         0.9298       235.2048         0.3990         1.8249
-        0.8922         1.1866         0.5977         0.2976         0.0490         0.0148         0.9930       169.8616         0.7284         1.5436
-        0.8570         1.1257         0.5883         1.6199         0.0382         0.0322         0.9861      1171.0895         0.4938         1.8304
-        0.8170         1.1508         0.4833         2.6935         0.0513         0.0080         0.8269        84.2189         0.6178         1.1806
-        0.8098         1.0477         0.5720         0.2250         0.0577         0.0160         0.8249       414.0410         0.8244         1.4410
-        0.7516         0.9827         0.5205         0.8447         0.0559         0.0324         0.8027       105.6469         0.4351         1.3931
-        0.7444         0.9497         0.5391         1.1052         0.0355         0.0447         0.8964      4988.5314         0.8208         1.6782
-
-Best config, ready to paste:
-SubgoalBeliefBank([goal_id], sigma_init=0.2049, sigma_visible=0.03183, odom_noise=0.02098, decay_factor=0.8285, large_uncertainty=53.27)
-RouteManager(route, success_radius=0.5471)
-gate.sigma_ale_threshold = 1.548
-
-real	0m23.767s
-user	0m25.067s
-sys	0m0.370s
-Bash Final check: navdp/ untouched, list all belief_exp files
-IN
-git status --short
-echo "---"
-find /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp -type f | sort
-
-OUT
-?? belief_exp/
----
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/common.py
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/inspect_one.py
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/metrics.py
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/__pycache__/common.cpython-310.pyc
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/__pycache__/metrics.cpython-310.pyc
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/__pycache__/scenario.cpython-310.pyc
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/README.md
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/results/sweep_20260720_153509.csv
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/scenario.py
-/home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/sweep.py
-Bash Clean up bytecode cache
-IN
-rm -rf /home/gpu/Desktop/pineapple/mars-habitatsim/belief_exp/__pycache__
-
-OUT
-(Bash completed with no output)
-Update Todos
-
-Create belief_exp/ directory scaffold
-
-Write common.py (sys.path bootstrap, p_controller, ego_motion_true)
-
-Write scenario.py (closed-loop episode simulator using SubgoalBeliefBank/RouteManager)
-
-Write metrics.py (calibration + task performance scoring)
-
-Write sweep.py (paired random-search CLI driver)
-
-Write inspect_one.py (single-config trace CLI)
-
-Write README.md
-
-Run verification steps 1-4
-Built and verified belief_exp/ (sibling to navdp/, nothing under navdp/ touched — git status confirms only belief_exp/ is new).
-
-Files: common.py (imports the real SubgoalBeliefBank/RouteManager, tiny P-controller), scenario.py (closed-loop episode simulator driving the real classes), metrics.py (calibration + task-performance scoring), sweep.py (paired random-search CLI → leaderboard CSV), inspect_one.py (single-config step trace), README.md (full glossary).
-
-All verification steps passed:
-
-inspect_one.py default run — mu tracks the goal when visible, drifts smoothly and Sigma grows monotonically while occluded, resets to sigma_visible on re-sighting. Matches SubgoalBeliefBank internals exactly.
-Calibration sanity check worked as designed: forcing sigma_visible=1e-4 against real observation noise 0.3 gave NLL=402.7 and only 39%/51% coverage (nominal 68%/95%) — badly overconfident. A matched sigma_visible=0.09 gave NLL=-0.92 and 78%/97% coverage — well calibrated. Interesting side-finding worth flagging to your mentor: the overconfident config actually advanced the route faster (task metrics looked better) precisely because it was wrong in a way that looked confident — exactly the failure mode coverage_deviation/false_advance_rate exist to catch, and why the leaderboard reports calibration and task-performance separately rather than one blind number.
-Smoke sweep (20×20) and full sweep (200 configs × 60 paired episodes, ~24s) both ran cleanly, produced non-degenerate leaderboards, and wrote complete CSVs to belief_exp/results/.
-Run it yourself with:
-
-
-conda run -n sam2 python belief_exp/inspect_one.py
-conda run -n sam2 python belief_exp/sweep.py --configs-n 200 --episodes-per-config 60
-(needs a torch-enabled env — sam2/sam3 — because navdp.extensions transitively imports torch; plain python3 won't have it. Details and full param/metric glossary are in belief_exp/README.md.)
-
-
-The exploration commands can be of X primary types:
-1. "Explore the area": in which case the agent should move around the environment to find the goal, or a suitable goal(as per the task requirements or passed in args). The agent should move forward n+-variable units, turn left/right randomly, and repeat until the goal is found. The agent should also be able to backtrack if it hits a dead end.
-2. "Explore the left/right": in which case the agent should turn left or right and explore that direction. The agent should move forward n+-variable units, turn left/right randomly, and repeat until the goal is found. The agent should also be able to backtrack if it hits a dead end.
-3. "This area is explored": the agent should stop at that point, not proceed further in the front direction, decide to turn left/right randomly and continue forward n+-variable units, and repeat until the goal is found. 
-
-During the previous steps, it is clear there is an underlying pattern the agent follows to explore the environment. In that case, keep the underlying exploration pattern as a function and repeat the exploration pattern until the goal is found. The agent should also be able to backtrack if it hits a dead end or obstacle. Based on the given prompt, let the VLM decide the exploration pattern and the agent should follow the exploration pattern until the goal is found. Give it functions to explore the environment, explore left/right, and mark areas as explored. The agent should be able to backtrack if it hits a dead end. The exploration pattern should be determined by the VLM based on the current state of the environment and the goal location. If an obstacle is found, cbf would be active.
-
-Apply the ghost mask implementation to show the direction to follow when cbf is active. In this case VLM outputs only left/right, so draw the mask using the following rules:
-1. If goal belief is exactly on the front/the goal is visible and exactly in the front, but the VLM CBF output is left, then draw the ghost mask on the extreme left side of the screen.
-2. If goal belief is exactly on the front/the goal is visible and exactly in the front, but the VLM CBF output is right, then draw the ghost mask on the extreme right side of the screen.
-3. If the goal belief is on either sides but the obstacle does not show on the screen, it means the obstacle is out of path, hence smoothly transition the goal mask to move to the side where the belief is. 
+            self.uncertainty_panel.configure(border_color="#38bdf8")
+            self.uncertainty_title.configure(
+                text="UNCERTAINTY HALT -- choose a heading", text_color="#38bdf8"
+            )
+        self.uncertainty_desc_label.configure(
+            text=d.uncertainty_line or "Waiting for VLM sweep description..."
+        )
+
+    def _draw_camera(self, vis_rgb) -> None:
+        # Letterbox the (possibly non-square) frame into whatever size the
+        # hero canvas currently is, so the view actually scales with the
+        # window instead of sitting at a fixed pixel size.
+        cw = self.cam_canvas.winfo_width()
+        ch = self.cam_canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        img = Image.fromarray(vis_rgb).convert("RGB")
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih)
+        dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        img = img.resize((dw, dh))
+        if self._pending_click_norm is not None:
+            img = self._draw_pending_click(img, dw, dh)
+        self._cam_photo = ImageTk.PhotoImage(img)
+        x0, y0 = (cw - dw) // 2, (ch - dh) // 2
+        self.cam_canvas.delete("frame")
+        self.cam_canvas.create_image(
+            x0, y0, anchor="nw", image=self._cam_photo, tags="frame"
+        )
+        self._cam_img_box = (x0, y0, x0 + dw, y0 + dh)
+
+    def _draw_pending_click(self, img: Image.Image, dw: int, dh: int) -> Image.Image:
+        # Not-yet-confirmed marker at the last click, cyan to read as distinct
+        # from the gold confirmed-goal marker the controller reprojects into
+        # vis_rgb every frame once a click is confirmed (rover_controller's
+        # draw_point_marker).
+        nx, ny = self._pending_click_norm
+        x, y = nx * dw, ny * dh
+        r = max(6, min(dw, dh) // 48)
+        draw = ImageDraw.Draw(img)
+        draw.line([(x - r, y), (x + r, y)], fill="#00e5ff", width=2)
+        draw.line([(x, y - r), (x, y + r)], fill="#00e5ff", width=2)
+        draw.ellipse([x - r, y - r, x + r, y + r], outline="#00e5ff", width=2)
+        return img
+
+    def _draw_plot(self, d) -> None:
+        self.plot.delete("all")
+        S, R = self._plot_size, self.PLOT_RANGE
+
+        def to_px(
+            forward, left
+        ):  # body frame (fwd, left) -> canvas (origin at rover, facing up)
+            return S / 2 - (left / R) * (S / 2), S - (forward / R) * S * 0.92 - 20
+
+        self.plot.create_line(0, S - 20, S, S - 20, fill=PLOT_AXIS)
+        self.plot.create_oval(
+            S / 2 - 5, S - 25, S / 2 + 5, S - 15, fill=PLOT_ROVER, outline=""
+        )  # rover
+
+        if d.obstacle_point is not None:
+            ox, oy = to_px(d.obstacle_point[0], d.obstacle_point[1])
+            self.plot.create_oval(
+                ox - 5, oy - 5, ox + 5, oy + 5, outline=PLOT_OBSTACLE, width=2
+            )
+
+        if d.trajectory is not None and len(d.trajectory) > 1:
+            pts = [to_px(float(p[0]), float(p[1])) for p in d.trajectory]
+            self.plot.create_line(
+                *[c for xy in pts for c in xy], fill=PLOT_TRAJECTORY, width=3
+            )
+
+        if d.belief_g is not None:
+            gx, gy = to_px(d.belief_g[0], d.belief_g[1])
+            self.plot.create_text(
+                gx, gy, text="*", fill=PLOT_GOAL, font=("TkDefaultFont", 26)
+            )
+
+    def tick_forever(self) -> None:
+        self.root.mainloop()
+
+def build_controller(args: argparse.Namespace) -> RoverController:
+navdp_upstream_ckpt = args.navdp_upstream_ckpt or \_default_navdp_upstream_ckpt()
+if not navdp_upstream_ckpt:
+raise ValueError(
+"--navdp-upstream-ckpt is required (no checkpoint found at the default "
+"navdp/navdp-cross-modal.ckpt either)"
+)
+return RoverController(
+scene_path=args.scene_path,
+heightmap_path=args.heightmap_path,
+navdp_upstream_ckpt=navdp_upstream_ckpt,
+navdp_upstream_root=args.navdp_upstream_root,
+navdp_root=args.navdp_root,
+rock_field_path=args.rock_field,
+flag_seed=args.flag_seed,
+num_flags=args.num_flags,
+flag_min_spacing=args.flag_min_spacing,
+flag_boundary_margin=args.flag_boundary_margin,
+start_x=args.start_x,
+start_z=args.start_z,
+start_yaw_deg=args.start_yaw,
+dt=args.dt,
+hz=args.hz,
+cbf_enabled=not args.no_cbf,
+cbf_d_safe=args.cbf_d_safe,
+cbf_gamma=args.cbf_gamma,
+cbf_deadzone=args.cbf_deadzone,
+max_forward_speed=args.max_linear,
+max_yaw_rate=args.max_angular,
+navdp_upstream_port=args.navdp_upstream_port,
+navdp_upstream_lookahead=args.navdp_upstream_lookahead,
+navdp_upstream_replan_every=args.navdp_upstream_replan_every,
+random_goal_bearing_deg=args.random_goal_bearing_deg,
+random_goal_dist_range=(args.random_goal_min_dist, args.random_goal_max_dist),
+seg_backend=args.seg_backend,
+seg_checkpoint=args.seg_checkpoint,
+seg_overlay=args.seg_overlay,
+annotations_dir=args.annotations_dir,
+annotation_categories=args.annotation_categories,
+dino_model_id=args.dino_model_id,
+dino_device=args.dino_device,
+dino_box_threshold=args.dino_box_threshold,
+dino_text_threshold=args.dino_text_threshold,
+uncertainty_enabled=not args.no_uncertainty_halt,
+uncertainty_cov_threshold=args.cov_threshold,
+uncertainty_cov_growth=args.cov_growth,
+uncertainty_cov_growth_rate=args.cov_growth_rate,
+uncertainty_search_dist=args.uncertainty_search_dist,
+)
+
+def parse_args(argv=None) -> argparse.Namespace:
+ap = argparse.ArgumentParser(
+description=**doc**, formatter_class=argparse.RawDescriptionHelpFormatter
+)
+ap.add_argument(
+"--scene-path", default=str(REPO_ROOT / "assets" / "marsyard2022.glb")
+)
+ap.add_argument(
+"--heightmap-path", default=str(REPO_ROOT / "marsyard2022_terrain_hm_1025.tif")
+)
+ap.add_argument(
+"--rock-field", default=None, help="rock_field.json manifest (optional)"
+)
+ap.add_argument(
+"--flag-seed",
+type=int,
+default=None,
+help="enable randomized flag-marker placement (assets/flags/\*.glb) seeded with "
+"this value -- same seed gives the same layout every run; unset (default) "
+"places no flags",
+)
+ap.add_argument(
+"--num-flags",
+type=int,
+default=6,
+help="flags to place when --flag-seed is set",
+)
+ap.add_argument(
+"--flag-min-spacing",
+type=float,
+default=1.5,
+help="minimum meters between placed flags",
+)
+ap.add_argument(
+"--flag-boundary-margin",
+type=float,
+default=2.0,
+help="keep placed flags this many meters clear of the scene bounds",
+)
+ap.add_argument(
+"--navdp-upstream-ckpt",
+default=None,
+help="Path to the upstream NavDP .ckpt (default: navdp/navdp-cross-modal.ckpt if present)",
+)
+ap.add_argument(
+"--navdp-upstream-root",
+default=None,
+help="Path to the vendored InternRobotics/NavDP checkout (default: $NAVDP_UPSTREAM_ROOT)",
+)
+ap.add_argument("--navdp-upstream-port", type=int, default=None)
+ap.add_argument("--navdp-upstream-lookahead", type=int, default=3)
+ap.add_argument("--navdp-upstream-replan-every", type=int, default=1)
+ap.add_argument(
+"--navdp-root",
+default=None,
+help="Path to this repo's own navdp/ package (default: ./navdp or $NAVDP_ROOT) -- only "
+"needed for the CBF safety layer's generic obstacle/avoidance math, unrelated to which "
+"driving policy is active",
+)
+ap.add_argument("--start-x", type=float, default=7.1) # 7.1, 7.6, 2.2, 7.5
+ap.add_argument("--start-z", type=float, default=7.7) # 7.7, 7.1, -1.9, 6.9
+ap.add_argument(
+"--start-yaw", type=float, default=34.0, help="degrees"
+) # 34, 41, 161, 34
+ap.add_argument("--dt", type=float, default=0.1)
+ap.add_argument("--hz", type=float, default=10.0, help="controller tick rate")
+ap.add_argument("--max-linear", type=float, default=0.6)
+ap.add_argument("--max-angular", type=float, default=0.6)
+ap.add_argument(
+"--no-cbf", action="store_true", help="disable CBF cone-mode obstacle avoidance"
+)
+ap.add_argument("--cbf-d-safe", type=float, default=0.75)
+ap.add_argument("--cbf-gamma", type=float, default=0.3)
+ap.add_argument("--cbf-deadzone", type=float, default=0.6)
+ap.add_argument("--random-goal-bearing-deg", type=float, default=60.0)
+ap.add_argument("--random-goal-min-dist", type=float, default=4.0)
+ap.add_argument("--random-goal-max-dist", type=float, default=8.0)
+ap.add_argument(
+"--seg-backend",
+choices=["lora", "legacy"],
+default="lora",
+help="segmentation checkpoint used by 'Segment' goal resolution: 'lora' (default) is "
+"sam_lora_runs/exp10/best, LoRA-finetuned on mesh_tight_bound2-overlay frames; "
+"'legacy' is the original single-checkpoint model (best_model.pth)",
+)
+ap.add_argument(
+"--seg-checkpoint",
+default=None,
+help="override the checkpoint path (legacy: a .pth file) or dir (lora: a "
+"finetune_sam2_lora.py out-dir, e.g. sam_lora_runs/exp10/best) for --seg-backend",
+)
+ap.add_argument(
+"--seg-overlay",
+choices=["mesh", "none"],
+default="mesh",
+help="'mesh' (default) composites --annotations-dir's hull meshes into a separate "
+"frame fed only to the segmentation model, matching what the default lora checkpoint "
+"was trained on -- never shown in the GUI or sent to the goal-selection VLM. "
+"'none' segments the plain camera frame",
+)
+ap.add_argument(
+"--annotations-dir",
+default=str(REPO_ROOT / "annotations" / "mesh_tight_bound2"),
+help="hull-mesh annotation dir used by --seg-overlay=mesh (default: "
+"annotations/mesh_tight_bound2, the dataset sam_lora_runs/exp10 was trained on)",
+)
+ap.add_argument(
+"--annotation-categories",
+nargs="+",
+default=None,
+help="restrict --seg-overlay=mesh to these hull categories (default: all)",
+)
+ap.add_argument(
+"--dino-model-id",
+default=dino_grounding_resolver.DEFAULT_DINO_MODEL_ID,
+help="GroundingDINO checkpoint for open-vocabulary target grounding "
+"('Ground Target' / a Command-panel GO_TO/FIND step) -- HF "
+"AutoModelForZeroShotObjectDetection id, lazily loaded on first use",
+)
+ap.add_argument(
+"--dino-device",
+default=dino_grounding_resolver.DEFAULT_DINO_DEVICE,
+help="device GroundingDINO loads onto (default cuda)",
+)
+ap.add_argument(
+"--dino-box-threshold",
+type=float,
+default=dino_grounding_resolver.DEFAULT_BOX_THRESHOLD,
+)
+ap.add_argument(
+"--dino-text-threshold",
+type=float,
+default=dino_grounding_resolver.DEFAULT_TEXT_THRESHOLD,
+)
+ap.add_argument(
+"--no-uncertainty-halt",
+action="store_true",
+help="disable the uncertainty-halt heading-request prompt (vl_direction's "
+"'uncertainty' mode against the resolved goal's real BeliefGoalTracker -- see "
+"--cov-threshold/--cov-growth). Default on; only spins up its own Qwen VLM "
+"subprocess (distinct from --seg-backend's) once this halt actually fires",
+)
+ap.add_argument(
+"--cov-threshold",
+type=float,
+default=vl_dir_config.DEFAULT_COVARIANCE_THRESHOLD,
+help="belief-uncertainty value (BeliefGoalTracker.uncertainty_value(), grows "
+"while a resolved goal mask stays unseen) at which MODE_RESOLVE driving halts "
+f"and a heading is requested (default {vl_dir_config.DEFAULT_COVARIANCE_THRESHOLD})",
+)
+ap.add_argument(
+"--cov-growth",
+type=float,
+default=0.01,
+help="base per-tick belief-uncertainty growth while the goal mask is unseen "
+"(default 0.01); lower this to trigger the halt sooner for testing",
+)
+ap.add_argument(
+"--cov-growth-rate",
+type=float,
+default=0.0,
+help="accelerating-drift factor: growth speeds up the longer the goal has been "
+"unseen (default 0.0, i.e. flat per-tick growth unless overridden)",
+)
+ap.add_argument(
+"--uncertainty-search-dist",
+type=float,
+default=4.0,
+help="meters driven along a human-submitted heading before falling back to the "
+"(still-uncertain) dead-reckoned belief and, if still unseen, halting again "
+"(default 4.0)",
+)
+return ap.parse_args(argv)
+
+def main(argv=None) -> None:
+args = parse_args(argv)
+controller = build_controller(args)
+controller.start()
+
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("dark-blue")
+    root = ctk.CTk()
+    app = NavGuiApp(
+        root, controller, max_linear=args.max_linear, max_angular=args.max_angular
+    )
+    try:
+        app.tick_forever()
+    finally:
+        controller.shutdown()
+
+if **name** == "**main**":
+main()
