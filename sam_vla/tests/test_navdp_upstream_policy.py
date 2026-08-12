@@ -43,7 +43,9 @@ def test_act_verbose_replans_every_step_by_default_and_forwards_goal_body():
 
     calls = []
 
-    def fake_pointgoal_step(base_url, rgb, depth, goal_forward, goal_left, timeout):
+    def fake_pointgoal_step(
+        base_url, rgb, depth, goal_forward, goal_left, timeout, obstacle_pixels=None
+    ):
         calls.append((goal_forward, goal_left))
         trajectory = np.tile(np.array([1.0, 0.0], dtype=np.float32), (4, 1))
         return trajectory, np.array([0.5], dtype=np.float32)
@@ -66,7 +68,9 @@ def test_act_verbose_replan_every_caches_trajectory_between_calls():
 
     call_count = {"n": 0}
 
-    def fake_pointgoal_step(base_url, rgb, depth, goal_forward, goal_left, timeout):
+    def fake_pointgoal_step(
+        base_url, rgb, depth, goal_forward, goal_left, timeout, obstacle_pixels=None
+    ):
         call_count["n"] += 1
         trajectory = np.array(
             [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]], dtype=np.float32

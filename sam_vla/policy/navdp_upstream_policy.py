@@ -1,11 +1,13 @@
-"""Policy backend wrapping the real, published NavDP model (Cai et al.,
-arXiv 2505.08712, github.com/InternRobotics/NavDP) via its HTTP server --
-next.md's "Integration project" Phase 3. Architecturally unrelated to this
-repo's own navdp/ package beyond sharing a name; see navdp_policy.py's
-NavdpPolicy for that one (an in-house S2DiT/VL3-DP model trained on this
-project's own data, action-chunk-of-velocities output). This class is
-additive, not a replacement -- both are selectable via run_navdp_rollout.py's
---policy-backend flag.
+"""Policy backend wrapping upstream NavDP's HTTP server -- either the real,
+published NavDP model (Cai et al., arXiv 2505.08712,
+github.com/InternRobotics/NavDP) or this project's S2Diff-guided fork of it,
+selected via server_variant (see navdp_upstream_server_manager.py's
+docstring for how the two differ) -- next.md's "Integration project" Phase
+3. Architecturally unrelated to this repo's own navdp/ package beyond
+sharing a name; see navdp_policy.py's NavdpPolicy for that one (an in-house
+S2DiT/VL3-DP model trained on this project's own data, action-chunk-of-
+velocities output). This class is additive, not a replacement -- both are
+selectable via run_navdp_rollout.py's --policy-backend flag.
 
 Same act_verbose(obs, semantic, goal_spec, step) -> (Action, dict) shape as
 NavdpPolicy for interface parity (NavigationPolicy, base_policy.py), but
@@ -48,6 +50,11 @@ class NavdpUpstreamPolicy:  # implements NavigationPolicy via act_verbose
         request_timeout: float = 30.0,
         default_goal_forward: float = 5.0,
         default_goal_left: float = 0.0,
+        server_variant: str = "navdp",
+        device: str = "cuda:0",
+        planner_mode: str = "s2diff",
+        remove_critic: bool = True,
+        s2diff_extra_args: Optional[dict] = None,
     ):
         self._server = NavdpUpstreamServerManager(
             checkpoint_path=checkpoint_path,
@@ -57,8 +64,14 @@ class NavdpUpstreamPolicy:  # implements NavigationPolicy via act_verbose
             batch_size=1,
             image_hw=image_hw,
             hfov_deg=hfov_deg,
+            server_variant=server_variant,
+            device=device,
+            planner_mode=planner_mode,
+            remove_critic=remove_critic,
+            s2diff_extra_args=s2diff_extra_args,
         )
         self._started = False
+        self._obstacle_pixels: Optional[list] = None
         # Lookahead/replan cadence: next.md's own open question flags there is
         # no principled default yet ("start from whatever NavdpPolicy's own
         # replan_every default is and tune empirically") -- these mirror
@@ -84,6 +97,13 @@ class NavdpUpstreamPolicy:  # implements NavigationPolicy via act_verbose
         it isn't threaded through act_verbose's own signature instead."""
         self._goal_forward = float(forward)
         self._goal_left = float(left)
+
+    def set_obstacle_pixels(self, obstacle_pixels: Optional[list]) -> None:
+        """Optional per-step [[u, v], ...] obstacle pixels for
+        server_variant="s2diff"'s S2Diff guidance (see
+        navdp_upstream_client.pointgoal_step's docstring); ignored by the
+        plain "navdp" variant. Unset (None) means unguided sampling."""
+        self._obstacle_pixels = obstacle_pixels
 
     def start(self) -> None:
         """Explicit early start, for callers that want the (slow, one-time)
@@ -116,6 +136,7 @@ class NavdpUpstreamPolicy:  # implements NavigationPolicy via act_verbose
                 self._goal_forward,
                 self._goal_left,
                 timeout=self.request_timeout,
+                obstacle_pixels=self._obstacle_pixels,
             )
             self._last_trajectory = trajectory_xy
             self._last_all_values = all_values
@@ -159,6 +180,10 @@ if __name__ == "__main__":
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--navdp-upstream-root", default=None)
     ap.add_argument("--port", type=int, default=None)
+    ap.add_argument(
+        "--server-variant", choices=["navdp", "s2diff"], default="navdp"
+    )
+    ap.add_argument("--planner-mode", choices=["pure-navdp", "s2diff", "gradient"], default="s2diff")
     args = ap.parse_args()
 
     from sam_vla.core.types import Pose
@@ -167,6 +192,8 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint,
         navdp_upstream_root=args.navdp_upstream_root,
         port=args.port,
+        server_variant=args.server_variant,
+        planner_mode=args.planner_mode,
     )
     policy.set_goal_body(forward=3.0, left=0.5)
     obs = Observation(

@@ -1,5 +1,7 @@
-"""HTTP client for the vendored upstream InternRobotics/NavDP server
-(baselines/navdp/navdp_server.py) -- next.md's "Integration project" Phase 2.
+"""HTTP client for the vendored upstream InternRobotics/NavDP server --
+navdp_server.py (official) or navdp_s2diff_server.py (this project's
+obstacle-guided fork of it, see navdp_upstream_server_manager.py's
+docstring) -- next.md's "Integration project" Phase 2.
 
 Pure module: no torch import, so it's importable from the habitat conda env
 (unlike sam_vla.policy.navdp_policy, which needs this repo's own navdp/'s
@@ -33,6 +35,7 @@ from __future__ import annotations
 import io
 import json
 import math
+from typing import Optional
 
 import numpy as np
 import requests
@@ -75,6 +78,7 @@ def pointgoal_step(
     goal_forward: float,
     goal_left: float,
     timeout: float = 30.0,
+    obstacle_pixels: Optional[list] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """One /pointgoal_step call. goal_forward is clamped to [0, 10],
     goal_left to [-10, 10] (policy_agent.py's process_pointgoal -- the server
@@ -83,14 +87,36 @@ def pointgoal_step(
     (forward, left) waypoints, all_values [n_candidates] critic scores --
     informational only, the server already used them internally to pick
     the returned candidate and to force a stop when all_values.max() is
-    below its own stop_threshold)."""
+    below its own stop_threshold).
+
+    obstacle_pixels: a flat [[u, v], ...] list of pixel coordinates for this
+    (sole, batch_size=1 -- see module docstring) batch item. Only
+    navdp_s2diff_server.py's /pointgoal_step reads this (its S2Diff guidance
+    steers sampled trajectories away from these pixels' projected obstacle
+    points); navdp_server.py's route ignores unknown goal_data keys
+    entirely. It's still sent unconditionally rather than only for the
+    s2diff variant, because navdp_s2diff_server.py's request decoder raises
+    ValueError if the key is missing at all -- even in its --planner-mode
+    pure-navdp mode -- so omitting it would 400 against that server
+    regardless of mode. Defaults to no obstacle points, which degrades
+    s2diff guidance to unguided sampling; pass real projected obstacle
+    pixels to get actual avoidance."""
     goal_x = float(np.clip(goal_forward, 0.0, 10.0))
     goal_y = float(np.clip(goal_left, -10.0, 10.0))
+    obstacle_pixels_batch = [list(obstacle_pixels) if obstacle_pixels else []]
     files = {
         "image": ("rgb.jpg", encode_rgb_jpeg(rgb), "image/jpeg"),
         "depth": ("depth.png", encode_depth_png16(depth_m), "image/png"),
     }
-    data = {"goal_data": json.dumps({"goal_x": [goal_x], "goal_y": [goal_y]})}
+    data = {
+        "goal_data": json.dumps(
+            {
+                "goal_x": [goal_x],
+                "goal_y": [goal_y],
+                "obstacle_pixels": obstacle_pixels_batch,
+            }
+        )
+    }
     resp = requests.post(
         f"{base_url}/pointgoal_step", files=files, data=data, timeout=timeout
     )

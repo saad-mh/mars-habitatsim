@@ -1,15 +1,36 @@
-"""Spawns and supervises the *upstream* NavDP server subprocess
-(InternRobotics/NavDP's baselines/navdp/navdp_server.py, a Flask HTTP app) --
-the real, published NavDP diffusion-policy-plus-critic model, not this repo's
-own navdp/ package (see next.md's "Integration project" section: NavdpPolicy
-and navdp/ stay untouched; this is a new, parallel policy backend).
+"""Spawns and supervises the *upstream* NavDP server subprocess -- either
+InternRobotics/NavDP's own baselines/navdp/navdp_server.py (the real,
+published NavDP diffusion-policy-plus-critic model, not this repo's own
+navdp/ package -- see next.md's "Integration project" section: NavdpPolicy
+and navdp/ stay untouched; this is a new, parallel policy backend) or this
+project's own baselines/navdp/navdp_s2diff_server.py (same NavDP_Agent/
+checkpoint, wrapped with S2Diff obstacle-guided sampling -- see that file's
+S2DiffPointGoalAgent). `server_variant` ("navdp" | "s2diff") picks which one
+gets spawned; both live in the same vendored checkout, so this manager stays
+"free to use between the official navdp vs a custom navdp server" rather
+than being hardcoded to one.
 
 Modeled on qwen_server_manager.QwenServerManager's spawn/poll/load_ms shape,
 but upstream's server speaks plain HTTP/JSON (confirmed by reading
-baselines/navdp/navdp_server.py from github.com/InternRobotics/NavDP@master),
+baselines/navdp/navdp_server.py and navdp_s2diff_server.py from
+github.com/InternRobotics/NavDP@master and this repo's own fork of it),
 not the length-prefixed local socket protocol qwen_server/internvl_server
 use, and it has no cheap ping route -- /navigator_reset IS the health check,
 same call next.md's Phase 1 plan says to use.
+
+The two variants' /navigator_reset responses differ (confirmed by reading
+both files directly, not guessed): navdp_server.py always returns
+{"algo": "navdp"}; navdp_s2diff_server.py returns {"algo": planner_name()},
+which depends on --planner-mode/--remove-critic (e.g.
+"navdp-hlc-s2diff-no-critic" by default) and is never the literal string
+"navdp" -- so the health check must know which variant it's polling and
+compute the *expected* algo string per variant (_expected_algo below),
+mirroring navdp_s2diff_server.py's own planner_name() function exactly,
+rather than hardcoding "navdp" for both (that mismatch previously made
+start() time out and raise even when the s2diff server had booted fine and
+answered 200 -- confirmed by reading a real run's server log, where
+/navigator_reset returned 200 seconds before this manager's own timeout
+fired).
 
 Two-phase start() (WHY, not obvious from a first read of navdp_server.py):
 Flask's dev server (`app.run(...)`, no `threaded=True`) handles one request
@@ -53,6 +74,26 @@ _DEFAULT_PORT = 8766  # distinct from QWEN_SERVER_PORT (8765)
 # qwen_vlm have Flask + this exact pin).
 _NAVDP_UPSTREAM_CONDA_ENV = "navdp"
 
+# Filenames are relative to <navdp_upstream_root>/baselines/navdp -- see this
+# module's docstring for how the two variants' /navigator_reset responses
+# differ.
+_SERVER_FILENAMES = {"navdp": "navdp_server.py", "s2diff": "navdp_s2diff_server.py"}
+
+
+def _expected_algo(server_variant: str, planner_mode: str, remove_critic: bool) -> str:
+    """Mirrors navdp_s2diff_server.py's own planner_name() exactly (read
+    directly from that file, not guessed) so the health check knows what
+    /navigator_reset will actually answer for the args we're about to pass
+    it. navdp_server.py (the "navdp" variant) has no such logic -- it always
+    answers {"algo": "navdp"}."""
+    if server_variant == "navdp":
+        return "navdp"
+    if planner_mode == "pure-navdp":
+        return "navdp-pure-critic"
+    if planner_mode == "gradient":
+        return "navdp-hlc-gradient-no-critic" if remove_critic else "navdp-hlc-gradient"
+    return "navdp-hlc-s2diff-no-critic" if remove_critic else "navdp-hlc-s2diff"
+
 
 def _resolve_navdp_upstream_python() -> str:
     override = os.environ.get("NAVDP_UPSTREAM_PYTHON")
@@ -78,13 +119,19 @@ def _resolve_navdp_upstream_python() -> str:
     return candidate
 
 
-def resolve_navdp_upstream_root(raw: Optional[str]) -> Path:
+def resolve_navdp_upstream_root(
+    raw: Optional[str], server_variant: str = "navdp"
+) -> Path:
     """Locates the vendored InternRobotics/NavDP checkout (git-cloned
     separately per next.md's Integration-project Phase 0 -- never vendored
     into this repo's own git history, same "external, read-from dependency"
     discipline this repo already applies to its own navdp/ and belief_exp's
     README). raw > $NAVDP_UPSTREAM_ROOT; unlike this repo's own navdp/, there
-    is no in-repo fallback path since nothing here vendors it by default."""
+    is no in-repo fallback path since nothing here vendors it by default.
+    Checks for whichever server file server_variant needs, so a checkout
+    that only has one of the two variants' server scripts fails fast here
+    rather than at spawn time."""
+    filename = _SERVER_FILENAMES[server_variant]
     candidates = []
     if raw:
         candidates.append(Path(raw))
@@ -93,12 +140,12 @@ def resolve_navdp_upstream_root(raw: Optional[str]) -> Path:
         candidates.append(Path(env))
     for c in candidates:
         c = c.expanduser().resolve()
-        if (c / "baselines" / "navdp" / "navdp_s2diff_server.py").exists():
+        if (c / "baselines" / "navdp" / filename).exists():
             return c
     raise FileNotFoundError(
-        "Could not find the vendored InternRobotics/NavDP checkout (expected "
-        "baselines/navdp/navdp_s2diff_server.py). Pass navdp_upstream_root=/path/to/NavDP "
-        "or set NAVDP_UPSTREAM_ROOT"
+        f"Could not find the vendored InternRobotics/NavDP checkout (expected "
+        f"baselines/navdp/{filename} for server_variant={server_variant!r}). Pass "
+        "navdp_upstream_root=/path/to/NavDP or set NAVDP_UPSTREAM_ROOT"
     )
 
 
@@ -141,15 +188,36 @@ class NavdpUpstreamServerManager:
         image_hw: tuple[int, int] = (480, 640),
         hfov_deg: float = 90.0,
         start_timeout: float = _START_TIMEOUT,
+        server_variant: str = "navdp",
+        device: str = "cuda:0",
+        planner_mode: str = "s2diff",
+        remove_critic: bool = True,
+        s2diff_extra_args: Optional[dict] = None,
     ):
+        if server_variant not in _SERVER_FILENAMES:
+            raise ValueError(
+                f"server_variant must be one of {sorted(_SERVER_FILENAMES)}, "
+                f"got {server_variant!r}"
+            )
         self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
-        self.navdp_upstream_root = resolve_navdp_upstream_root(navdp_upstream_root)
+        self.server_variant = server_variant
+        self.navdp_upstream_root = resolve_navdp_upstream_root(
+            navdp_upstream_root, server_variant=server_variant
+        )
         self.port = port if port is not None else _DEFAULT_PORT
         self.stop_threshold = float(stop_threshold)
         self.batch_size = int(batch_size)
         self.image_hw = image_hw
         self.hfov_deg = float(hfov_deg)
         self.start_timeout = float(start_timeout)
+        # s2diff-only launch knobs (see navdp_s2diff_server.py's argparse for
+        # what these gate); s2diff_extra_args passes through anything else
+        # (e.g. guidance-strength, safe-distance) without this constructor
+        # having to mirror every one of that file's ~30 CLI flags.
+        self.device = str(device)
+        self.planner_mode = str(planner_mode)
+        self.remove_critic = bool(remove_critic)
+        self.s2diff_extra_args = dict(s2diff_extra_args or {})
         self.base_url = f"http://127.0.0.1:{self.port}"
         self._process: Optional[subprocess.Popen] = None
         self._owns_process = False
@@ -171,6 +239,9 @@ class NavdpUpstreamServerManager:
 
     def _reset(self, timeout: float) -> bool:
         height, width = self.image_hw
+        expected_algo = _expected_algo(
+            self.server_variant, self.planner_mode, self.remove_critic
+        )
         try:
             resp = requests.post(
                 f"{self.base_url}/navigator_reset",
@@ -179,9 +250,35 @@ class NavdpUpstreamServerManager:
                 ),
                 timeout=timeout,
             )
-            return resp.ok and resp.json().get("algo") == "navdp"
+            return resp.ok and resp.json().get("algo") == expected_algo
         except (requests.RequestException, ValueError):
             return False
+
+    def _argv(self) -> list:
+        filename = _SERVER_FILENAMES[self.server_variant]
+        argv = [
+            _resolve_navdp_upstream_python(),
+            filename,
+            "--port",
+            str(self.port),
+            "--checkpoint",
+            self.checkpoint_path,
+        ]
+        if self.server_variant == "s2diff":
+            argv += [
+                "--device",
+                self.device,
+                "--planner-mode",
+                self.planner_mode,
+                "--remove-critic" if self.remove_critic else "--no-remove-critic",
+            ]
+            for flag, value in self.s2diff_extra_args.items():
+                flag = f"--{flag.lstrip('-')}"
+                if isinstance(value, bool):
+                    argv.append(flag if value else flag.replace("--", "--no-", 1))
+                else:
+                    argv += [flag, str(value)]
+        return argv
 
     def start(self) -> None:
         t0 = time.monotonic()
@@ -208,14 +305,7 @@ class NavdpUpstreamServerManager:
         # exactly what stranded an earlier smoke-test run for hours.
         self._log_file = open(self.log_path, "ab")
         self._process = subprocess.Popen(
-            [
-                _resolve_navdp_upstream_python(),
-                "navdp_s2diff_server.py",
-                "--port",
-                str(self.port),
-                "--checkpoint",
-                self.checkpoint_path,
-            ],
+            self._argv(),
             cwd=str(server_dir),
             stdout=self._log_file,
             stderr=subprocess.STDOUT,
@@ -242,10 +332,14 @@ class NavdpUpstreamServerManager:
 
         remaining = max(deadline - time.time(), _RESET_CALL_TIMEOUT)
         if not self._reset(timeout=remaining):
+            expected_algo = _expected_algo(
+                self.server_variant, self.planner_mode, self.remove_critic
+            )
             raise RuntimeError(
                 "navdp_server's port opened but /navigator_reset did not return "
-                f"{{'algo': 'navdp'}} within {remaining:.0f}s -- checkpoint load may "
-                f"have failed (checkpoint={self.checkpoint_path!r}); check {self.log_path}"
+                f"{{'algo': {expected_algo!r}}} within {remaining:.0f}s (server_variant="
+                f"{self.server_variant!r}) -- checkpoint load may have failed "
+                f"(checkpoint={self.checkpoint_path!r}); check {self.log_path}"
             )
         self.load_ms = (time.monotonic() - t0) * 1000.0
         print(f"[NavdpUpstreamServerManager] server is up ({self.load_ms:.0f}ms)")
@@ -273,17 +367,26 @@ if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(
-        description="Smoke-start the vendored upstream navdp_server.py subprocess."
+        description="Smoke-start a vendored upstream navdp server subprocess "
+        "(either variant)."
     )
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--navdp-upstream-root", default=None)
     ap.add_argument("--port", type=int, default=None)
+    ap.add_argument(
+        "--server-variant", choices=sorted(_SERVER_FILENAMES), default="navdp"
+    )
+    ap.add_argument("--planner-mode", choices=["pure-navdp", "s2diff", "gradient"], default="s2diff")
+    ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
 
     manager = NavdpUpstreamServerManager(
         checkpoint_path=args.checkpoint,
         navdp_upstream_root=args.navdp_upstream_root,
         port=args.port,
+        server_variant=args.server_variant,
+        planner_mode=args.planner_mode,
+        device=args.device,
     )
     manager.start()
     print(f"load_ms={manager.load_ms:.0f}")

@@ -231,6 +231,8 @@ class RoverController:
         navdp_upstream_port: Optional[int] = None,
         navdp_upstream_lookahead: int = 3,
         navdp_upstream_replan_every: int = 1,
+        navdp_upstream_server_variant: str = "navdp",
+        navdp_upstream_planner_mode: str = "s2diff",
         world_margin: float = 2.0,
         random_goal_bearing_deg: float = 60.0,
         random_goal_dist_range: tuple = (4.0, 8.0),
@@ -241,6 +243,7 @@ class RoverController:
         dino_device: str = dino_grounding_resolver.DEFAULT_DINO_DEVICE,
         dino_box_threshold: float = dino_grounding_resolver.DEFAULT_BOX_THRESHOLD,
         dino_text_threshold: float = dino_grounding_resolver.DEFAULT_TEXT_THRESHOLD,
+        mission_sweep_yaws: int = 8,
         annotations_dir: Optional[str] = DEFAULT_ANNOTATIONS_DIR,
         annotation_categories: Optional[Sequence[str]] = None,
         uncertainty_enabled: bool = True,
@@ -287,6 +290,8 @@ class RoverController:
         self.navdp_upstream_port = navdp_upstream_port
         self.navdp_upstream_lookahead = int(navdp_upstream_lookahead)
         self.navdp_upstream_replan_every = int(navdp_upstream_replan_every)
+        self.navdp_upstream_server_variant = navdp_upstream_server_variant
+        self.navdp_upstream_planner_mode = navdp_upstream_planner_mode
         self.random_goal_bearing_deg = float(random_goal_bearing_deg)
         self.random_goal_dist_range = tuple(random_goal_dist_range)
         self.world_limit = max(SIZE_X, SIZE_Z) / 2.0 - float(world_margin)
@@ -311,6 +316,14 @@ class RoverController:
         self.dino_device = dino_device
         self.dino_box_threshold = float(dino_box_threshold)
         self.dino_text_threshold = float(dino_text_threshold)
+
+        # In-place 360deg scan a GO_TO/FIND mission sub-goal runs (see
+        # _start_mission_subgoal) before the existing single-frame
+        # _do_resolve -- the search/scan behaviour mission.py's GoalKind.FIND
+        # docstring already promises but _start_mission_subgoal previously
+        # never actually did (a target outside the current single frame
+        # just failed to resolve and got skipped).
+        self.mission_sweep_yaws = int(mission_sweep_yaws)
 
         self.uncertainty_enabled = bool(uncertainty_enabled)
         self.uncertainty_cov_threshold = float(uncertainty_cov_threshold)
@@ -589,6 +602,8 @@ class RoverController:
             replan_every=self.navdp_upstream_replan_every,
             max_forward_speed=self.max_forward_speed,
             max_yaw_rate=self.max_yaw_rate,
+            server_variant=self.navdp_upstream_server_variant,
+            planner_mode=self.navdp_upstream_planner_mode,
         )
         with self._lock:
             self.display.status_text = "NavDP policy is being loaded"
@@ -723,7 +738,13 @@ class RoverController:
                         self._mission = pending_mission
                     goal_objects, obstacle_objects, goal_spec = (
                         self._start_mission_subgoal(
-                            env, step, mask_dir, goal_objects, obstacle_objects, goal_spec
+                            env,
+                            step,
+                            mask_dir,
+                            goal_objects,
+                            obstacle_objects,
+                            goal_spec,
+                            belief_tracker,
                         )
                     )
 
@@ -941,7 +962,13 @@ class RoverController:
                             self._mission.advance()
                     goal_objects, obstacle_objects, goal_spec = (
                         self._start_mission_subgoal(
-                            env, step, mask_dir, goal_objects, obstacle_objects, goal_spec
+                            env,
+                            step,
+                            mask_dir,
+                            goal_objects,
+                            obstacle_objects,
+                            goal_spec,
+                            belief_tracker,
                         )
                     )
 
@@ -1260,7 +1287,7 @@ class RoverController:
             self._pending_mission = mission
 
     def _start_mission_subgoal(
-        self, env, step, mask_dir, goal_objects, obstacle_objects, goal_spec
+        self, env, step, mask_dir, goal_objects, obstacle_objects, goal_spec, belief_tracker
     ):
         """Kicks off whichever driving mode the active Mission's current
         sub-goal needs (see nav.mission.Mission) -- called once when a new
@@ -1269,7 +1296,13 @@ class RoverController:
         controller thread. A GO_TO/FIND resolve that fails (DINO doesn't
         ground the target, or grounds it with no valid depth) is skipped
         rather than left stuck forever -- one bad step in a multi-part
-        instruction shouldn't stall the rest of it."""
+        instruction shouldn't stall the rest of it.
+
+        `belief_tracker` is the one live tracker _run's tick loop calls
+        propagate()/observe() on for the rest of the episode -- passed in
+        (not constructed here) so the GO_TO/FIND branch's sweep-seeded
+        sighting below feeds the SAME instance the driving loop already
+        uses, instead of a disconnected one nobody reads."""
         while True:
             with self._lock:
                 mission = self._mission
@@ -1286,6 +1319,59 @@ class RoverController:
                 return goal_objects, obstacle_objects, goal_spec
 
             if goal.kind in (GoalKind.GO_TO, GoalKind.FIND):
+                # Search/scan for every remaining GO_TO/FIND target in this
+                # mission (mission.py's GoalKind.FIND docstring: "search/scan
+                # until a target appears") -- restricted to exactly this
+                # list, no open-ended DINO prompts -- before trying the
+                # existing single-frame resolve below, which only ever sees
+                # whatever's already in the current frame. A target that
+                # was off-frame at mission-start (the common FIND case) would
+                # otherwise just fail to resolve and get skipped.
+                remaining_targets = [
+                    g.target
+                    for g in mission.goals[mission.idx :]
+                    if g.kind in (GoalKind.GO_TO, GoalKind.FIND)
+                ]
+                sweep_trackers = {t: self._new_belief_tracker() for t in remaining_targets}
+                try:
+                    dino_grounding_resolver.sweep_and_seed_beliefs(
+                        env,
+                        remaining_targets,
+                        sweep_trackers,
+                        hfov_deg=HFOV_DEG,
+                        num_yaws=self.mission_sweep_yaws,
+                        dino_model_id=self.dino_model_id,
+                        dino_device=self.dino_device,
+                        dino_box_threshold=self.dino_box_threshold,
+                        dino_text_threshold=self.dino_text_threshold,
+                    )
+                except Exception as exc:
+                    print(f"[mission] sweep over {remaining_targets!r} failed: {exc}")
+                else:
+                    found = [t for t in remaining_targets if sweep_trackers[t].belief_g is not None]
+                    print(f"[mission] sweep over {remaining_targets!r} found: {found!r}")
+
+                current_tracker = sweep_trackers[goal.target]
+                if current_tracker.belief_g is not None:
+                    # Turn to face the sweep's live (rotation-corrected, not
+                    # first-sighting-stale) bearing so the single-frame
+                    # resolve below actually has the target in view -- same
+                    # sign convention as goal_math.heading_ahead_point's
+                    # theta = yaw + heading_deg (bearing() uses the same
+                    # atan2(left, forward) this module's body_frame_goal
+                    # does). Propagate the sweep tracker by that exact turn
+                    # too (ordinary BeliefGoalTracker.propagate, one more
+                    # step) so its belief_g stays correct for the
+                    # observe_body_point seed below.
+                    bearing = current_tracker.bearing()
+                    pose = self.display.pose
+                    current_tracker.propagate(
+                        Action(v_fwd=0.0, v_lat=0.0, yaw_rate=bearing), dt=1.0
+                    )
+                    env.step(
+                        Pose(x=pose.x, y=0.0, z=pose.z, yaw=pose.yaw + bearing)
+                    )
+
                 goal_objects, obstacle_objects, goal_spec = self._do_resolve(
                     env,
                     step,
@@ -1311,6 +1397,18 @@ class RoverController:
                             f"[mission] resolved: {goal_spec.instruction_text}"
                         )
                 if resolved:
+                    if current_tracker.belief_g is not None:
+                        # Seed the live tracker from the sweep's own sighting
+                        # rather than leave belief_g at whatever it was
+                        # before this sub-goal (possibly None, possibly a
+                        # stale point from the PREVIOUS sub-goal) -- the
+                        # per-tick MODE_RESOLVE loop only re-observes via the
+                        # live goal mask, which never renders on this
+                        # GPU/driver (see CLAUDE.md's dynamic-object-render
+                        # bug), so without this the belief would just sit on
+                        # whatever it last held instead of this sighting.
+                        forward, left = (float(v) for v in current_tracker.belief_g)
+                        belief_tracker.observe_body_point(forward, left)
                     return goal_objects, obstacle_objects, goal_spec
                 print(f"[mission] step {goal.raw!r} failed to resolve -- skipping")
                 with self._lock:

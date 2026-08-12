@@ -801,7 +801,7 @@ class NavGuiApp:
         if in_flight:
             self.uncertainty_panel.configure(border_color="#f59e0b")
             self.uncertainty_title.configure(
-                text="REQUESTING VLM SWEEP...", text_color="#f59e0b"
+                text="REQUESTING VLM SWEEP", text_color="#f59e0b"
             )
         else:
             self.uncertainty_panel.configure(border_color="#38bdf8")
@@ -809,7 +809,7 @@ class NavGuiApp:
                 text="UNCERTAINTY HALT -- choose a heading", text_color="#38bdf8"
             )
         self.uncertainty_desc_label.configure(
-            text=d.uncertainty_line or "Waiting for VLM sweep description..."
+            text=d.uncertainty_line or "Waiting for VLM sweep description"
         )
 
     def _draw_camera(self, vis_rgb) -> None:
@@ -917,6 +917,8 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         navdp_upstream_port=args.navdp_upstream_port,
         navdp_upstream_lookahead=args.navdp_upstream_lookahead,
         navdp_upstream_replan_every=args.navdp_upstream_replan_every,
+        navdp_upstream_server_variant=args.navdp_upstream_server_variant,
+        navdp_upstream_planner_mode=args.navdp_upstream_planner_mode,
         random_goal_bearing_deg=args.random_goal_bearing_deg,
         random_goal_dist_range=(args.random_goal_min_dist, args.random_goal_max_dist),
         seg_backend=args.seg_backend,
@@ -988,6 +990,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--navdp-upstream-port", type=int, default=None)
     ap.add_argument("--navdp-upstream-lookahead", type=int, default=3)
     ap.add_argument("--navdp-upstream-replan-every", type=int, default=1)
+    ap.add_argument(
+        "--navdp-upstream-server-variant",
+        choices=["navdp", "s2diff"],
+        default="navdp",
+        help="'navdp' spawns InternRobotics/NavDP's own baselines/navdp/navdp_server.py; "
+        "'s2diff' spawns this project's obstacle-guided navdp_s2diff_server.py fork instead "
+        "(same checkpoint, see navdp_upstream_server_manager.py's docstring)",
+    )
+    ap.add_argument(
+        "--navdp-upstream-planner-mode",
+        choices=["pure-navdp", "s2diff", "gradient"],
+        default="s2diff",
+        help="server_variant=s2diff only: which guidance mode navdp_s2diff_server.py runs",
+    )
     ap.add_argument(
         "--navdp-root",
         default=None,

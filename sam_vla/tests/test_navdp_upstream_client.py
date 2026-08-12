@@ -85,7 +85,11 @@ def test_pointgoal_step_clips_goal_and_parses_trajectory():
 
     assert captured["url"] == "http://127.0.0.1:8766/pointgoal_step"
     sent_goal = json.loads(captured["data"]["goal_data"])
-    assert sent_goal == {"goal_x": [10.0], "goal_y": [-10.0]}  # clamped per policy_agent.py
+    assert sent_goal == {
+        "goal_x": [10.0],
+        "goal_y": [-10.0],  # clamped per policy_agent.py
+        "obstacle_pixels": [[]],  # unset by default -- see pointgoal_step's docstring
+    }
     assert set(captured["files"].keys()) == {"image", "depth"}
 
     assert trajectory_xy.shape == (predict_size, 2)
