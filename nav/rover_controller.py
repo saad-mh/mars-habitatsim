@@ -76,7 +76,7 @@ from typing import Optional, Sequence
 import numpy as np
 
 from sam_vla.core.belief_tracking import BeliefGoalTracker
-from sam_vla.core.ghost_mask import draw_ghost_mask
+from sam_vla.core.ghost_mask import draw_ghost_mask, project_body_point_to_pixel
 from sam_vla.core.goal_geometry import (
     MESH_GOAL_ID,
     MESH_OBST_ID,
@@ -88,7 +88,6 @@ from sam_vla.core.goal_geometry import (
 )
 from sam_vla.core.pose_integrator import integrate_mars
 from sam_vla.core.types import Action, GoalSpec, Pose
-from sam_vla.core.uncertainty_motion import yaw_rate_toward_heading
 from sam_vla.env.habitat_env import HFOV_DEG, MarsHabitatEnv
 from sam_vla.env.terrain import SIZE_X, SIZE_Z
 from sam_vla.goal_resolution import dino_grounding_resolver, first_frame_resolver
@@ -122,9 +121,10 @@ MODE_IDLE = "idle"
 MODE_POINT = "point"
 MODE_RESOLVE = "resolve"
 MODE_MANUAL = "manual"
-# In-place rotation toward self._mission_target_yaw -- only ever entered by a
-# Mission's TURN sub-goal (see _start_mission_subgoal), not user-reachable
-# directly.
+# Drives NavdpUpstreamPolicy toward a ghost point placed along the bearing to
+# self._mission_target_yaw (see TURN_GHOST_* below) rather than spinning in
+# place -- only ever entered by a Mission's TURN sub-goal (see
+# _start_mission_subgoal), not user-reachable directly.
 MODE_TURN = "turn"
 # Holding state between a completed SAM2/Qwen resolve and the user accepting
 # it -- entered by _do_resolve instead of MODE_RESOLVE, left via
@@ -138,6 +138,21 @@ POINT_GOAL_REACHED_M = 0.7
 
 # Ground-truth yaw error at which a MODE_TURN sub-goal counts as reached
 TURN_GOAL_REACHED_RAD = math.radians(3.0)
+
+# MODE_TURN no longer spins in place -- it drives NavdpUpstreamPolicy toward a
+# body-frame "ghost point" set via policy.set_goal_body(forward, left), same
+# point-goal mechanism MODE_POINT/MODE_RESOLVE already use. The point sits
+# TURN_GHOST_LOOKAHEAD_M ahead along the remaining-yaw-error bearing, clamped
+# to +/- half the camera's HFOV so forward stays positive (always drivable/
+# projectable) -- full remaining turn pins it to the frame edge, and it
+# slides to dead center as the turn completes. Deliberately not routed
+# through any depth/3D backprojection: project_body_point_to_pixel always
+# resolves to the single horizontal line at the frame's vertical center, so
+# the on-screen position is a deterministic function of the clamped bearing
+# alone.
+TURN_GHOST_LOOKAHEAD_M = 3.0
+TURN_GHOST_MAX_BEARING_RAD = math.radians(HFOV_DEG / 2.0)
+TURN_GHOST_RADIUS_PX = 18.0
 
 # World-space radius of the ghost-mask circle drawn over a DINO-grounded
 # open-vocabulary target (see _do_resolve/self._ground_target_world) --
@@ -800,6 +815,7 @@ class RoverController:
                 goal_bearing: Optional[float] = None
                 unresolved = False
                 dist_to_goal: Optional[float] = None
+                turn_ghost_body: Optional[tuple[float, float]] = None
 
                 if self._uncertainty_halted:
                     # Frozen awaiting a human heading -- same "ignore drive
@@ -827,6 +843,33 @@ class RoverController:
                         trajectory = getattr(policy, "_last_trajectory", None)
                 elif mode == MODE_RESOLVE:
                     seen = belief_tracker.observe(goal_mask, obs.depth)
+                    if not seen and self._ground_target_world is not None:
+                        # DINO-grounded targets never actually re-seed belief
+                        # via observe() above: register_object_mask's MESH_GOAL_ID
+                        # object renders 0px on this GPU/driver (see CLAUDE.md's
+                        # dynamic-object-render-bug note), so goal_mask is always
+                        # empty and uncertainty grows unbounded even while the
+                        # ghost mask is visibly on-screen. Fall back to seeding
+                        # belief straight from the ground-truth world position
+                        # (same mechanism MODE_POINT's observe_body_point uses),
+                        # gated on the exact same in-frame test project_world_to_pixel
+                        # runs below to decide whether to draw the ghost mask at
+                        # all -- so belief resets precisely when the ghost mask
+                        # is showing, not on some independent visibility notion.
+                        gx, gy, gz = self._ground_target_world
+                        if (
+                            project_world_to_pixel(
+                                obs.pose,
+                                (gx, gy, gz),
+                                HFOV_DEG,
+                                obs.rgb.shape[1],
+                                obs.rgb.shape[0],
+                            )
+                            is not None
+                        ):
+                            forward, left = body_frame_goal(obs.pose, (gx, gz))
+                            belief_tracker.observe_body_point(forward, left)
+                            seen = True
                     if seen and self._uncertainty_search_goal is not None:
                         # Goal re-sighted mid-search -- observe() above
                         # already reset uncertainty_value() to the sighted
@@ -855,12 +898,12 @@ class RoverController:
                                     self.display.uncertainty_searching = False
                             else:
                                 forward, left = search_forward, search_left
-                        # "Reached" is decided purely by the Qwen touch-bottom
-                        # check below -- no ground-truth/belief-distance gate
-                        # here anymore, so the policy always drives while not
-                        # searching (the searching sub-flow's own heading-
-                        # reached fallback above is untouched, that's a
-                        # different mechanic).
+                        # "Reached" detection (Qwen touch-bottom query) is
+                        # removed for now -- no ground-truth/belief-distance
+                        # gate here either, so the policy just always drives
+                        # while not searching (the searching sub-flow's own
+                        # heading-reached fallback above is untouched, that's
+                        # a different mechanic).
                         policy.set_goal_body(forward, left)
                         action, _vla_result = policy.act_verbose(
                             obs, semantic, goal_spec, step
@@ -872,59 +915,6 @@ class RoverController:
                         # belief otherwise -- not always belief_g's own
                         # (possibly stale) bearing.
                         goal_bearing = math.atan2(left, forward)
-
-                        if not searching:
-                            # Sole "reached goal" signal for MODE_RESOLVE,
-                            # by design -- Qwen looks at the current frame
-                            # with the goal mask overlaid in green and judges
-                            # whether that region touches the bottom edge
-                            # (see build_goal_touching_bottom_prompt), no
-                            # geometric/distance check involved at all.
-                            # Synchronous/every-tick: accepts the per-tick
-                            # Qwen round-trip latency rather than throttling
-                            # or backgrounding it.
-                            call_started = time.monotonic()
-                            try:
-                                touch_overlay = overlay_semantic_masks(
-                                    obs.rgb, semantic
-                                )
-                                touching_bottom, vlm_result = (
-                                    qwen_client.check_goal_touching_bottom_verbose(
-                                        touch_overlay, step
-                                    )
-                                )
-                                reasoning = vlm_result.get("reasoning", "")
-                            except Exception as exc:
-                                print(
-                                    f"[goal touch-bottom check] step={step} "
-                                    f"FAILED after {time.monotonic() - call_started:.2f}s: {exc}"
-                                )
-                                touching_bottom = False
-                                reasoning = ""
-                            else:
-                                # Always logged, not just on stop -- this is
-                                # the one place to watch to confirm the VLM
-                                # (not some other path) is driving the
-                                # reached-goal decision, and the elapsed
-                                # time is the per-tick cost this synchronous
-                                # call adds to the control loop.
-                                print(
-                                    f"[goal touch-bottom check] step={step} "
-                                    f"stop={touching_bottom} "
-                                    f"elapsed={time.monotonic() - call_started:.2f}s "
-                                    f"reasoning={reasoning!r}"
-                                )
-                            if touching_bottom:
-                                print(
-                                    f"[goal touch-bottom check] STOPPING at step {step}"
-                                )
-                                with self._lock:
-                                    self._mode = MODE_IDLE
-                                    self.display.goal_reached = True
-                                mode = MODE_IDLE
-                                goal_objects, obstacle_objects = self._clear_masks(
-                                    env, goal_objects, obstacle_objects
-                                )
                     else:
                         # Never sighted the goal mask yet this episode -- hold
                         # rather than drive on NavdpUpstreamPolicy's hidden
@@ -932,13 +922,6 @@ class RoverController:
                         # next.md's Integration-project Phase 5).
                         unresolved = True
                 elif mode == MODE_TURN and self._mission_target_yaw is not None:
-                    yaw_rate = yaw_rate_toward_heading(
-                        obs.pose.yaw,
-                        self._mission_target_yaw,
-                        turn_kp=1.4,
-                        max_yaw_rate=self.max_yaw_rate,
-                    )
-                    action = Action(v_fwd=0.0, v_lat=0.0, yaw_rate=yaw_rate)
                     yaw_err = (
                         self._mission_target_yaw - obs.pose.yaw + math.pi
                     ) % (2.0 * math.pi) - math.pi
@@ -948,6 +931,26 @@ class RoverController:
                             self.display.goal_reached = True
                         mode = MODE_IDLE
                         self._mission_target_yaw = None
+                    else:
+                        # Ghost point proportional to how much turn is left
+                        # -- see TURN_GHOST_* docstring above. Clamping the
+                        # bearing (not just the resulting pixel) keeps
+                        # forward strictly positive, so this is always a
+                        # normal in-front point goal for the policy, never
+                        # a behind-the-camera one.
+                        turn_bearing = max(
+                            -TURN_GHOST_MAX_BEARING_RAD,
+                            min(TURN_GHOST_MAX_BEARING_RAD, yaw_err),
+                        )
+                        forward = TURN_GHOST_LOOKAHEAD_M * math.cos(turn_bearing)
+                        left = TURN_GHOST_LOOKAHEAD_M * math.sin(turn_bearing)
+                        turn_ghost_body = (forward, left)
+                        goal_bearing = turn_bearing
+                        policy.set_goal_body(forward, left)
+                        action, _vla_result = policy.act_verbose(
+                            obs, semantic, goal_spec, step
+                        )
+                        trajectory = getattr(policy, "_last_trajectory", None)
 
                 if self._mission is not None and self.display.goal_reached:
                     # Ground-truth "reached" edge for the mission's current
@@ -1050,6 +1053,21 @@ class RoverController:
                     if ground_proj is not None:
                         gu, gv, gr = ground_proj
                         vis_rgb = draw_ghost_mask(vis_rgb, gu, gv, gr)
+                if turn_ghost_body is not None:
+                    # Same single-horizontal-line projection MODE_TURN's
+                    # driving goal was built from -- forward > 0 is
+                    # guaranteed by the bearing clamp above, so this always
+                    # resolves to a real pixel, never None in practice.
+                    turn_pixel = project_body_point_to_pixel(
+                        turn_ghost_body[0],
+                        turn_ghost_body[1],
+                        HFOV_DEG,
+                        obs.rgb.shape[0],
+                        obs.rgb.shape[1],
+                    )
+                    if turn_pixel is not None:
+                        tu, tv = turn_pixel
+                        vis_rgb = draw_ghost_mask(vis_rgb, tu, tv, TURN_GHOST_RADIUS_PX)
 
                 with self._lock:
                     d = self.display
@@ -1714,5 +1732,5 @@ class RoverController:
             label = goal_spec.instruction_text if goal_spec is not None else "?"
             return f"RESOLVE '{label}'  dist={dist_txt}"
         if mode == MODE_TURN:
-            return "TURN IN PLACE"
+            return "TURN"
         return mode
