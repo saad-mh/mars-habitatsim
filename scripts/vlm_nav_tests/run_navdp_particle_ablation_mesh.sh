@@ -110,15 +110,15 @@ set_layout() {
     case "$1" in
         head_on)
             START_X=0; START_Z=8; START_YAW_DEG=0
-            GOAL_X=0; GOAL_Z=-8; OBSTACLES=(0,0)
+            GOAL_X=0; GOAL_Z=-8; OBSTACLE_WORLD_XZ=0,0
             ;;
         offset_left)
             START_X=0; START_Z=8; START_YAW_DEG=0
-            GOAL_X=6; GOAL_Z=-8; OBSTACLES=(3,0)
+            GOAL_X=6; GOAL_Z=-8; OBSTACLE_WORLD_XZ=3,0
             ;;
         offset_right)
             START_X=0; START_Z=8; START_YAW_DEG=0
-            GOAL_X=-6; GOAL_Z=-8; OBSTACLES=(-3,0)
+            GOAL_X=-6; GOAL_Z=-8; OBSTACLE_WORLD_XZ=-3,0
             ;;
         *)
             echo "Unknown layout: $1" >&2
@@ -149,7 +149,7 @@ run_episode() {
         --start-x "${START_X}" --start-z "${START_Z}"
         --start-yaw-deg "${START_YAW_DEG}"
         --goal-x "${GOAL_X}" --goal-z "${GOAL_Z}"
-        --obstacle-world-xz "${OBSTACLES[@]}"
+        "--obstacle-world-xz=${OBSTACLE_WORLD_XZ}"
         --evaluation-layout "${layout}"
         --seed "${seed}" --output "${output}"
         "$@"

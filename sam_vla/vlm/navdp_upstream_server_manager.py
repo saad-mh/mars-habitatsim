@@ -93,11 +93,11 @@ def resolve_navdp_upstream_root(raw: Optional[str]) -> Path:
         candidates.append(Path(env))
     for c in candidates:
         c = c.expanduser().resolve()
-        if (c / "baselines" / "navdp" / "navdp_server.py").exists():
+        if (c / "baselines" / "navdp" / "navdp_s2diff_server.py").exists():
             return c
     raise FileNotFoundError(
         "Could not find the vendored InternRobotics/NavDP checkout (expected "
-        "baselines/navdp/navdp_server.py). Pass navdp_upstream_root=/path/to/NavDP "
+        "baselines/navdp/navdp_s2diff_server.py). Pass navdp_upstream_root=/path/to/NavDP "
         "or set NAVDP_UPSTREAM_ROOT"
     )
 
@@ -210,7 +210,7 @@ class NavdpUpstreamServerManager:
         self._process = subprocess.Popen(
             [
                 _resolve_navdp_upstream_python(),
-                "navdp_server.py",
+                "navdp_s2diff_server.py",
                 "--port",
                 str(self.port),
                 "--checkpoint",

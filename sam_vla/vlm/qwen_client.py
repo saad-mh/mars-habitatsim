@@ -243,6 +243,36 @@ def parse_nav_command_verbose(
     return result["directions"], result["goals"], result
 
 
+def _check_goal_touching_bottom_result(rgb: np.ndarray, frame_idx: int) -> dict:
+    response = _send_request(
+        "check_goal_touching_bottom",
+        {"image_b64": _encode_image(rgb), "frame_idx": frame_idx},
+    )
+    if "error" in response:
+        raise ValueError(f"check_goal_touching_bottom failed: {response['error']}")
+    return response["result"]
+
+
+def check_goal_touching_bottom(rgb: np.ndarray, frame_idx: int) -> bool:
+    """Reached-goal VLM check for nav/mission.py's sub-goal stepper,
+    additive to nav/rover_controller.py's existing ground-truth
+    belief-distance reached check. `rgb` is expected to already carry the
+    green goal-mask overlay (see
+    perception.semantic_overlay.overlay_semantic_masks), same convention as
+    drive_direction_verbose. Returns True when Qwen judges the green region
+    to be touching the bottom edge of the frame."""
+    return _check_goal_touching_bottom_result(rgb, frame_idx)["stop"]
+
+
+def check_goal_touching_bottom_verbose(
+    rgb: np.ndarray, frame_idx: int
+) -> tuple[bool, dict]:
+    """Same as check_goal_touching_bottom, but also returns the raw VLM
+    result dict for logging."""
+    result = _check_goal_touching_bottom_result(rgb, frame_idx)
+    return result["stop"], result
+
+
 if __name__ == "__main__":
     import sys
 

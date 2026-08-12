@@ -18,12 +18,29 @@ import math
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from sam_vla.core.goal_geometry import FLAG_SEMANTIC_ID
 from sam_vla.env.terrain import SIZE_X, SIZE_Z, Terrain
 
 ExcludeZone = Tuple[float, float, float]  # (x, z, radius)
+
+# habitat-sim's renderer does not honor these .glb's material.doubleSided=true --
+# only the winding-order-front face of the flag "steag" (cloth) mesh ever renders;
+# the back is effectively invisible (confirmed by rendering a test flag through a
+# full yaw sweep: the far side reads ~10x dimmer than the front, not just mirrored).
+# So instead of fixing that at the render layer (would mean patching the .glb
+# geometry itself), every flag is yawed so its one renderable face points at a
+# fixed target -- see `_facing_yaw`.
+#
+# FLAG_LOCAL_FRONT_ANGLE_RAD is that face's outward-normal bearing in the flag's
+# own local frame *before* any placement yaw is applied (i.e. at yaw=0), derived
+# from the .glb's baked node transforms + mesh normals (local mesh normal run
+# through the inverse-transpose of the accumulated node rotation/scale, matching
+# all five color variants to within 0.01 degree despite red/green/blue/yellow and
+# white using different glTF node-transform encodings). Verified empirically too:
+# rendering a real flag through a yaw sweep peaks exactly where this predicts.
+FLAG_LOCAL_FRONT_ANGLE_RAD = math.radians(-15.762769488168031)
 
 FLAGS_DIR = Path(__file__).resolve().parent.parent.parent / "assets" / "flags"
 # Keys are the clean color names; values are the exact on-disk asset paths
@@ -75,11 +92,25 @@ def _in_exclude_zone(x: float, z: float, exclude_zones: Sequence[ExcludeZone]) -
     return any(math.hypot(x - ex, z - ez) < er for ex, ez, er in exclude_zones)
 
 
-def generate_flag_field(config: FlagFieldConfig, terrain: Terrain) -> List[FlagSpec]:
+def _facing_yaw(flag_x: float, flag_z: float, target_x: float, target_z: float) -> float:
+    """Yaw that points the flag's one renderable face at (target_x, target_z) --
+    see FLAG_LOCAL_FRONT_ANGLE_RAD."""
+    target_angle = math.atan2(target_z - flag_z, target_x - flag_x)
+    return FLAG_LOCAL_FRONT_ANGLE_RAD - target_angle
+
+
+def generate_flag_field(
+    config: FlagFieldConfig, terrain: Terrain, face_target: Optional[Tuple[float, float]] = None
+) -> List[FlagSpec]:
     """Rejection-sample `config.num_flags` non-overlapping flag positions within
     the scene bounds, each dropped onto the terrain height under it and
     assigned a random color from FLAG_COLORS. Deterministic given
-    `config.seed` -- same config + same terrain => same flags, every call."""
+    `config.seed` -- same config + same terrain => same flags, every call.
+
+    `face_target` (typically the rover's spawn (x, z)) orients every flag's
+    renderable face toward that point instead of a random yaw -- see
+    FLAG_LOCAL_FRONT_ANGLE_RAD for why a random yaw would otherwise leave most
+    flags' one visible face pointed away from wherever the rover starts."""
     rng = random.Random(config.seed)
     half_x = SIZE_X / 2.0 - config.boundary_margin
     half_z = SIZE_Z / 2.0 - config.boundary_margin
@@ -112,7 +143,10 @@ def generate_flag_field(config: FlagFieldConfig, terrain: Terrain) -> List[FlagS
             continue
 
         x, z = placement
-        yaw = rng.uniform(0.0, 2.0 * math.pi)
+        if face_target is not None:
+            yaw = _facing_yaw(x, z, face_target[0], face_target[1])
+        else:
+            yaw = rng.uniform(0.0, 2.0 * math.pi)
         y = terrain.local_height_max(x, z, FLAG_FOOTPRINT_RADIUS)
         color = rng.choice(colors)
 

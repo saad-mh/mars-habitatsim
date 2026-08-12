@@ -170,7 +170,7 @@ class MarsHabitatEnv:
                 boundary_margin=self._flag_boundary_margin,
                 exclude_zones=[(x, z, self._flag_spawn_clearance)],
             )
-            self.flags = generate_flag_field(flag_config, self._terrain)
+            self.flags = generate_flag_field(flag_config, self._terrain, face_target=(x, z))
             register_flags(self._sim, self.flags)
 
         if self._annotations_dir is not None:

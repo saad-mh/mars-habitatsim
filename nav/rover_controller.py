@@ -12,9 +12,14 @@ plus snapshot() for a GUI to poll at its own refresh rate. No zenoh, no
 second conda-env process for the sim itself: MarsHabitatEnv runs in-process
 here (the `habitat` conda env already has everything this module imports --
 see CLAUDE.md's env table), the real NavDP model and the Qwen VLM used for
-one-shot goal resolution are the only subprocesses, spawned automatically by
+salience-pick auto-resolve/nav-command-parsing/uncertainty-halt prompts are
+the only subprocesses, spawned automatically by
 NavdpUpstreamPolicy/QwenServerManager exactly as sam_vla.run_navdp_rollout
-already does.
+already does. Open-vocabulary target grounding (Ground Target / a mission's
+GO_TO/FIND step) runs in-process instead, via
+sam_vla.goal_resolution.dino_grounding_resolver (navdp.extensions.
+GroundingDINODetector, lazily loaded onto self.dino_device on first use --
+no subprocess/server of its own).
 
 Driving modes:
   idle    -- zero action, no policy call.
@@ -322,12 +327,12 @@ class RoverController:
         self._world_goal: Optional[tuple] = None
         self._pending_resolve = False
         # None -> first_frame_resolver's SAM2+Qwen-salience path (rocks etc,
-        # unchanged). Set -> qwen_grounding_resolver's direct-Qwen-bbox path
+        # unchanged). Set -> dino_grounding_resolver's direct-DINO-bbox path
         # for open-vocabulary targets (flags, the home-base cuboid) SAM2
         # wasn't trained on. Persists across a Rerun of the same resolve
         # (see request_rerun_segmentation), cleared on Reset.
         self._resolve_target_text: Optional[str] = None
-        # World position of the last Qwen-grounded target (see _do_resolve),
+        # World position of the last DINO-grounded target (see _do_resolve),
         # for the ghost-mask overlay drawn every frame in _run. Only ever
         # touched from _run's own background thread (_do_resolve/_clear_masks
         # write it, _run's render section reads it, all on that one thread) --
@@ -829,26 +834,76 @@ class RoverController:
                                     self.display.uncertainty_searching = False
                             else:
                                 forward, left = search_forward, search_left
-                        if not searching and math.hypot(forward, left) < POINT_GOAL_REACHED_M:
-                            with self._lock:
-                                self._mode = MODE_IDLE
-                                self.display.goal_reached = True
-                            mode = MODE_IDLE
-                            goal_objects, obstacle_objects = self._clear_masks(
-                                env, goal_objects, obstacle_objects
-                            )
-                        else:
-                            policy.set_goal_body(forward, left)
-                            action, _vla_result = policy.act_verbose(
-                                obs, semantic, goal_spec, step
-                            )
-                            trajectory = getattr(policy, "_last_trajectory", None)
-                            # CBF's steering hint must track whichever target
-                            # is actually being driven to -- the searched
-                            # heading while searching, the dead-reckoned
-                            # belief otherwise -- not always belief_g's own
-                            # (possibly stale) bearing.
-                            goal_bearing = math.atan2(left, forward)
+                        # "Reached" is decided purely by the Qwen touch-bottom
+                        # check below -- no ground-truth/belief-distance gate
+                        # here anymore, so the policy always drives while not
+                        # searching (the searching sub-flow's own heading-
+                        # reached fallback above is untouched, that's a
+                        # different mechanic).
+                        policy.set_goal_body(forward, left)
+                        action, _vla_result = policy.act_verbose(
+                            obs, semantic, goal_spec, step
+                        )
+                        trajectory = getattr(policy, "_last_trajectory", None)
+                        # CBF's steering hint must track whichever target
+                        # is actually being driven to -- the searched
+                        # heading while searching, the dead-reckoned
+                        # belief otherwise -- not always belief_g's own
+                        # (possibly stale) bearing.
+                        goal_bearing = math.atan2(left, forward)
+
+                        if not searching:
+                            # Sole "reached goal" signal for MODE_RESOLVE,
+                            # by design -- Qwen looks at the current frame
+                            # with the goal mask overlaid in green and judges
+                            # whether that region touches the bottom edge
+                            # (see build_goal_touching_bottom_prompt), no
+                            # geometric/distance check involved at all.
+                            # Synchronous/every-tick: accepts the per-tick
+                            # Qwen round-trip latency rather than throttling
+                            # or backgrounding it.
+                            call_started = time.monotonic()
+                            try:
+                                touch_overlay = overlay_semantic_masks(
+                                    obs.rgb, semantic
+                                )
+                                touching_bottom, vlm_result = (
+                                    qwen_client.check_goal_touching_bottom_verbose(
+                                        touch_overlay, step
+                                    )
+                                )
+                                reasoning = vlm_result.get("reasoning", "")
+                            except Exception as exc:
+                                print(
+                                    f"[goal touch-bottom check] step={step} "
+                                    f"FAILED after {time.monotonic() - call_started:.2f}s: {exc}"
+                                )
+                                touching_bottom = False
+                                reasoning = ""
+                            else:
+                                # Always logged, not just on stop -- this is
+                                # the one place to watch to confirm the VLM
+                                # (not some other path) is driving the
+                                # reached-goal decision, and the elapsed
+                                # time is the per-tick cost this synchronous
+                                # call adds to the control loop.
+                                print(
+                                    f"[goal touch-bottom check] step={step} "
+                                    f"stop={touching_bottom} "
+                                    f"elapsed={time.monotonic() - call_started:.2f}s "
+                                    f"reasoning={reasoning!r}"
+                                )
+                            if touching_bottom:
+                                print(
+                                    f"[goal touch-bottom check] STOPPING at step {step}"
+                                )
+                                with self._lock:
+                                    self._mode = MODE_IDLE
+                                    self.display.goal_reached = True
+                                mode = MODE_IDLE
+                                goal_objects, obstacle_objects = self._clear_masks(
+                                    env, goal_objects, obstacle_objects
+                                )
                     else:
                         # Never sighted the goal mask yet this episode -- hold
                         # rather than drive on NavdpUpstreamPolicy's hidden
@@ -1379,15 +1434,16 @@ class RoverController:
         # that specific bbox's depth backprojection is what silently dropped
         # the goal mask below, as opposed to the VLM never picking one).
         if target_text:
-            # qwen_grounding_resolver's result shape (found/u/v/reasoning),
+            # dino_grounding_resolver's result shape (found/u/v/score/reasoning),
             # not select_goal's (goal_index) -- dets here are SAM2's
-            # obstacle-only detections (see qwen_grounding_resolver), not
-            # goal candidates, so labeled accordingly to avoid implying
-            # they were candidates Qwen picked among.
+            # obstacle-only detections (see dino_grounding_resolver), not
+            # goal candidates, so labeled accordingly to avoid implying they
+            # were candidates DINO picked among.
             print(
-                f"[nav resolve] qwen ground_object(target={target_text!r}): "
+                f"[nav resolve] dino ground_object(target={target_text!r}): "
                 f"found={vlm_result.get('found')}, "
                 f"u={vlm_result.get('u')}, v={vlm_result.get('v')}, "
+                f"score={vlm_result.get('score')}, "
                 f"reasoning={vlm_result.get('reasoning', '')!r}, "
                 f"{len(dets)} SAM2 obstacle detection(s)"
             )
@@ -1457,7 +1513,7 @@ class RoverController:
         goal_objects, obstacle_objects = self._clear_masks(
             env, goal_objects, obstacle_objects
         )
-        # Ghost-mask overlay for a Qwen-grounded target (register_object_mask
+        # Ghost-mask overlay for a DINO-grounded target (register_object_mask
         # above is a live 3D mesh, but dynamically registered objects render
         # 0px on this GPU/driver -- see CLAUDE.md's known-issues memory --
         # so it alone gives no visual confirmation grounding worked. This is
@@ -1465,7 +1521,7 @@ class RoverController:
         # project_world_point_with_pixel_radius + ghost_mask.draw_ghost_mask,
         # which (unlike register_object_mask) is a real 2D image overlay and
         # does render. _clear_masks (just above) already reset this to None;
-        # only set it back when this was actually a Qwen-grounded resolve
+        # only set it back when this was actually a DINO-grounded resolve
         # with a valid position -- the classic SAM2 auto-resolve path
         # (target_text=None) keeps relying on the mesh-mask overlay as
         # before. Excludes used_fallback: that promotes an *obstacle* rock's

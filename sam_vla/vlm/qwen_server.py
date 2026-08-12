@@ -16,6 +16,7 @@ from sam_vla.vlm.qwen_model_runner import load_qwen_model, run_qwen_inference
 from sam_vla.vlm.qwen_prompts import (
     build_direction_prompt,
     build_drive_action_prompt,
+    build_goal_touching_bottom_prompt,
     build_ground_object_prompt,
     build_goal_vocabulary_prompt,
     build_parse_nav_command_prompt,
@@ -24,6 +25,7 @@ from sam_vla.vlm.qwen_prompts import (
 from sam_vla.vlm.qwen_response_parser import (
     parse_direction_response,
     parse_drive_action_response,
+    parse_goal_touching_bottom_response,
     parse_ground_object_response,
     parse_goal_vocabulary_response,
     parse_nav_command_response,
@@ -134,6 +136,20 @@ def _handle_parse_nav_command(model, processor, payload: dict) -> dict:
     return {"result": result}
 
 
+def _handle_check_goal_touching_bottom(model, processor, payload: dict) -> dict:
+    """Reached-goal check for nav/mission.py's sub-goal stepper -- see
+    build_goal_touching_bottom_prompt. `image_b64` is expected to already
+    carry the green goal-mask overlay (see
+    perception.semantic_overlay.overlay_semantic_masks), same convention as
+    _handle_drive_direction."""
+    image = _decode_image(payload["image_b64"])
+    frame_idx = payload["frame_idx"]
+    prompt = build_goal_touching_bottom_prompt(frame_idx)
+    raw_text = run_qwen_inference(model, processor, image, prompt)
+    result = parse_goal_touching_bottom_response(raw_text)
+    return {"result": result}
+
+
 def _handle_generate(model, processor, payload: dict) -> dict:
     # Same "generate" wire format as vl_direction/qwen_server.py
     # (free prompt + raw text out, no task-specific parsing) so this one
@@ -165,6 +181,8 @@ def _dispatch(model, processor, message: dict) -> dict:
         return _handle_parse_nav_command(model, processor, payload)
     if mode == "ground_object":
         return _handle_ground_object(model, processor, payload)
+    if mode == "check_goal_touching_bottom":
+        return _handle_check_goal_touching_bottom(model, processor, payload)
     if mode == "generate":
         return _handle_generate(model, processor, payload)
     raise ValueError(f"unknown mode: {mode!r}")

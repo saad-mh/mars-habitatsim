@@ -159,6 +159,20 @@ def parse_ground_object_response(raw_text: str) -> dict:
     }
 
 
+def parse_goal_touching_bottom_response(raw_text: str) -> dict:
+    """Parse a build_goal_touching_bottom_prompt response: a plain boolean
+    'stop' signal, same isinstance(bool) validation as
+    parse_ground_object_response's 'found'."""
+    parsed = _load_json_object(raw_text)
+
+    stop = parsed.get("stop")
+    if not isinstance(stop, bool):
+        raise ValueError(
+            f"Missing or non-boolean 'stop' in response\nraw_text={raw_text!r}"
+        )
+    return {"stop": stop, "reasoning": parsed.get("reasoning", "")}
+
+
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 

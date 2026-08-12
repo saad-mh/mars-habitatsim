@@ -264,6 +264,30 @@ def build_direction_prompt(instruction_text: str, frame_idx: int) -> str:
     )
 
 
+def build_goal_touching_bottom_prompt(frame_idx: int) -> str:
+    """Reached-goal check for nav/mission.py's sub-goal stepper: the current
+    goal region is overlaid in green (see perception.semantic_overlay), same
+    overlay convention as build_direction_prompt, and the model is asked
+    purely whether that green region touches the bottom edge of the frame --
+    the rover-relative signal that the goal is now directly in front of/
+    underneath the rover, not just visible somewhere in the shot. Additive
+    to nav/rover_controller.py's existing ground-truth belief-distance
+    reached check, not a replacement for it."""
+    return (
+        "You are a reached-goal detector for a Mars rover. The image is the "
+        f"rover's current camera frame (frame {frame_idx}). The navigation "
+        "goal is highlighted with a GREEN overlay.\n\n"
+        "Look at whether the GREEN overlay region touches the bottom edge "
+        "of the image -- that happens once the rover has driven close "
+        "enough that the goal is directly in front of or underneath it, not "
+        "merely visible somewhere in the frame.\n\n"
+        "Respond with ONLY a JSON object, no other text, in this exact "
+        "format:\n"
+        '{"stop": <bool, true if the green overlay touches the bottom edge '
+        'of the frame>, "reasoning": <str>}'
+    )
+
+
 if __name__ == "__main__":
     dummy_detections = [
         {

@@ -4,18 +4,18 @@ the in-house, single-process equivalent of Nav_new/MARS/launch_mars.sh's
 DINO+NavDP GUI, driving the actual published NavDP model instead of this
 repo's own custom S2DiT+NavDP model (see rover_controller.py's docstring).
 
-UI follows the same customtkinter conventions as
-scripts/habitat_tests/kb_teleop_vl.py: dark theme, grouped CTkFrame panels,
-and state-only panels (segmentation review, click-to-goal confirm) that
-appear/disappear via pack()/pack_forget() instead of sitting on screen
-disabled -- mirrors that script's uncertainty-halt panel.
-
 Run via nav/launch_nav.sh, or directly:
     conda activate habitat
     cd mars-habitatsim
     python -m nav.gui [--scene-path ...] [--heightmap-path ...] [--cbf/--no-cbf] ...
 
-TODO: remove qwen grounding and instead ground from grounding DiNO, probably create the mechanism from @sam_vla/run_navdp_dino_rollout.py .
+Open-vocabulary target grounding ("Ground Target" / a Command-panel GO_TO/FIND
+step) uses GroundingDINO (navdp.extensions.GroundingDINODetector, see
+sam_vla.goal_resolution.dino_grounding_resolver) instead of Qwen VLM
+point-grounding -- ported from scripts/vlm_nav_tests/qwen_search_dino.py's
+own DINO usage, --dino-* flags below configure it. The SAM2+Qwen-salience
+"Segment" path and the Qwen-based free-text Command-splitting/uncertainty-halt
+prompts are unrelated and still use Qwen.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import tkinter as tk
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 
+from sam_vla.goal_resolution import dino_grounding_resolver
 from vl_direction import config as vl_dir_config
 
 from nav.rover_controller import MODE_REVIEW_SEGMENTATION, MODE_TURN, RoverController
@@ -272,10 +273,10 @@ class NavGuiApp:
         ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10))
 
         # -- open-vocabulary target grounding: unlike "Segment" (SAM2 +
-        # Qwen-salience over rock detections), this asks Qwen to localize a
-        # named object directly -- for classes SAM2/SAM2-LoRA wasn't trained
-        # on (flags, the home-base blue cuboid). See
-        # sam_vla.goal_resolution.qwen_grounding_resolver / this panel's
+        # Qwen-salience over rock detections), this asks GroundingDINO to
+        # localize a named object directly -- for classes SAM2/SAM2-LoRA
+        # wasn't trained on (flags, the home-base blue cuboid). See
+        # sam_vla.goal_resolution.dino_grounding_resolver / this panel's
         # ground_target() below. Feeds the same Confirm/Rerun/Pick-manually
         # review flow "Segment" does -- only how the goal bbox is produced
         # differs. -- #
@@ -309,9 +310,7 @@ class NavGuiApp:
         self.command_entry = ctk.CTkEntry(
             command_panel, placeholder_text='"go to a flag then return to home"'
         )
-        self.command_entry.grid(
-            row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 4)
-        )
+        self.command_entry.grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 4))
         self.command_entry.bind("<Return>", lambda e: self.submit_command())
         ctk.CTkButton(
             command_panel, text="Send", width=60, command=self.submit_command
@@ -925,6 +924,10 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         seg_overlay=args.seg_overlay,
         annotations_dir=args.annotations_dir,
         annotation_categories=args.annotation_categories,
+        dino_model_id=args.dino_model_id,
+        dino_device=args.dino_device,
+        dino_box_threshold=args.dino_box_threshold,
+        dino_text_threshold=args.dino_text_threshold,
         uncertainty_enabled=not args.no_uncertainty_halt,
         uncertainty_cov_threshold=args.cov_threshold,
         uncertainty_cov_growth=args.cov_growth,
@@ -1044,6 +1047,28 @@ def parse_args(argv=None) -> argparse.Namespace:
         nargs="+",
         default=None,
         help="restrict --seg-overlay=mesh to these hull categories (default: all)",
+    )
+    ap.add_argument(
+        "--dino-model-id",
+        default=dino_grounding_resolver.DEFAULT_DINO_MODEL_ID,
+        help="GroundingDINO checkpoint for open-vocabulary target grounding "
+        "('Ground Target' / a Command-panel GO_TO/FIND step) -- HF "
+        "AutoModelForZeroShotObjectDetection id, lazily loaded on first use",
+    )
+    ap.add_argument(
+        "--dino-device",
+        default=dino_grounding_resolver.DEFAULT_DINO_DEVICE,
+        help="device GroundingDINO loads onto (default cuda)",
+    )
+    ap.add_argument(
+        "--dino-box-threshold",
+        type=float,
+        default=dino_grounding_resolver.DEFAULT_BOX_THRESHOLD,
+    )
+    ap.add_argument(
+        "--dino-text-threshold",
+        type=float,
+        default=dino_grounding_resolver.DEFAULT_TEXT_THRESHOLD,
     )
     ap.add_argument(
         "--no-uncertainty-halt",
