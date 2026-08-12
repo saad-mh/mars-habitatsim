@@ -920,23 +920,39 @@ class RoverController:
                                     self.display.uncertainty_searching = False
                             else:
                                 forward, left = search_forward, search_left
-                        # "Reached" detection (Qwen touch-bottom query) is
-                        # removed for now -- no ground-truth/belief-distance
-                        # gate here either, so the policy just always drives
-                        # while not searching (the searching sub-flow's own
-                        # heading-reached fallback above is untouched, that's
-                        # a different mechanic).
-                        policy.set_goal_body(forward, left)
-                        action, _vla_result = policy.act_verbose(
-                            obs, semantic, goal_spec, step
-                        )
-                        trajectory = getattr(policy, "_last_trajectory", None)
-                        # CBF's steering hint must track whichever target
-                        # is actually being driven to -- the searched
-                        # heading while searching, the dead-reckoned
-                        # belief otherwise -- not always belief_g's own
-                        # (possibly stale) bearing.
-                        goal_bearing = math.atan2(left, forward)
+                        # "Reached" detection (Qwen touch-bottom query) was
+                        # removed; this is the ground-truth-adjacent
+                        # replacement -- same distance threshold MODE_POINT
+                        # uses (POINT_GOAL_REACHED_M), checked against
+                        # belief_tracker.distance() (the belief-tracked
+                        # position, since a resolved/grounded goal never has
+                        # a ground-truth one) rather than the possibly
+                        # search-heading-overridden local forward/left.
+                        # Gated on not-searching: the search sub-flow's own
+                        # heading-reached fallback above is a different
+                        # mechanic -- it just resumes belief tracking, it
+                        # doesn't complete the goal. Setting goal_reached
+                        # here feeds the same self._mission advance-on-
+                        # goal_reached edge MODE_POINT/MODE_TURN already
+                        # drive, so a mission's GO_TO/FIND sub-goal (and the
+                        # belief bank behind it) now advances too.
+                        if not searching and belief_tracker.distance() < POINT_GOAL_REACHED_M:
+                            with self._lock:
+                                self._mode = MODE_IDLE
+                                self.display.goal_reached = True
+                            mode = MODE_IDLE
+                        else:
+                            policy.set_goal_body(forward, left)
+                            action, _vla_result = policy.act_verbose(
+                                obs, semantic, goal_spec, step
+                            )
+                            trajectory = getattr(policy, "_last_trajectory", None)
+                            # CBF's steering hint must track whichever target
+                            # is actually being driven to -- the searched
+                            # heading while searching, the dead-reckoned
+                            # belief otherwise -- not always belief_g's own
+                            # (possibly stale) bearing.
+                            goal_bearing = math.atan2(left, forward)
                     else:
                         # Never sighted the goal mask yet this episode -- hold
                         # rather than drive on NavdpUpstreamPolicy's hidden
@@ -1476,6 +1492,19 @@ class RoverController:
         current_goal_spec,
         target_text: Optional[str] = None,
     ):
+        # A new detection task (DINO-grounded or plain SAM2 "Segment")
+        # invalidates whatever the previous one left registered -- drop it
+        # up front, before running the new detector, rather than waiting for
+        # a successful result to overwrite it. This also means a FAILED new
+        # resolve (below) now leaves the rover with no masks at all instead
+        # of the stale previous target, which used to survive a failed
+        # resolve deliberately; that tradeoff was intentionally accepted so
+        # "new task requested" always reads as "old detections gone", even
+        # when the new one doesn't pan out.
+        goal_objects, obstacle_objects = self._clear_masks(
+            env, goal_objects, obstacle_objects
+        )
+
         obs_r = env.get_observation(frame_idx=step)
         # detect_rgb (if any) is a separate frame with the mesh_tight_bound2
         # annotation hulls composited in, fed only to the segmentation
@@ -1516,8 +1545,10 @@ class RoverController:
             print(f"[nav resolve] failed: {exc}")
             with self._lock:
                 self.display.status_text = f"resolve failed: {exc}"
-            # Leave the mode/masks/goal_spec exactly as they were -- a failed
-            # resolve shouldn't clobber whatever was previously resolved.
+            # goal_objects/obstacle_objects are already emptied (cleared
+            # above, before this detector call) -- only goal_spec falls back
+            # to whatever was previously resolved, since there's no new one
+            # to replace it with.
             return goal_objects, obstacle_objects, current_goal_spec
 
         # resolve_verbose's raw VLM result/detections were previously discarded
@@ -1602,9 +1633,6 @@ class RoverController:
                     used_fallback = True
                     break
 
-        goal_objects, obstacle_objects = self._clear_masks(
-            env, goal_objects, obstacle_objects
-        )
         # Ghost-mask overlay for a DINO-grounded target (register_object_mask
         # above is a live 3D mesh, but dynamically registered objects render
         # 0px on this GPU/driver -- see CLAUDE.md's known-issues memory --
@@ -1612,14 +1640,14 @@ class RoverController:
         # read every frame in _run's render loop and reprojected via
         # project_world_point_with_pixel_radius + ghost_mask.draw_ghost_mask,
         # which (unlike register_object_mask) is a real 2D image overlay and
-        # does render. _clear_masks (just above) already reset this to None;
-        # only set it back when this was actually a DINO-grounded resolve
-        # with a valid position -- the classic SAM2 auto-resolve path
-        # (target_text=None) keeps relying on the mesh-mask overlay as
-        # before. Excludes used_fallback: that promotes an *obstacle* rock's
-        # position as the goal when the grounded point's own depth was
-        # invalid, which would otherwise show the ghost mask over a rock
-        # instead of the actual requested target.
+        # does render. The clear at the top of this function already reset
+        # this to None; only set it back when this was actually a
+        # DINO-grounded resolve with a valid position -- the classic SAM2
+        # auto-resolve path (target_text=None) keeps relying on the
+        # mesh-mask overlay as before. Excludes used_fallback: that promotes
+        # an *obstacle* rock's position as the goal when the grounded
+        # point's own depth was invalid, which would otherwise show the
+        # ghost mask over a rock instead of the actual requested target.
         if target_text and goal_position is not None and not used_fallback:
             self._ground_target_world = goal_position
         new_goal_objects: list = []
