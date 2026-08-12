@@ -58,6 +58,16 @@ FLAG_COLORS = {
 # sampling radius) -- flags are non-collidable, this is not a physics size.
 FLAG_FOOTPRINT_RADIUS = 0.3
 
+# The no-`--flag-seed` default: four flags in a fixed diamond around the
+# rover's spawn pose, one per quadrant (front-left/front-right/back-left/
+# back-right, each 45 degrees off the spawn heading's forward/back axis),
+# all the same distance out -- so a mission prompt like "go left find a
+# flag" always has something to actually find, with no seed needed. Angles
+# are offsets added to the spawn yaw using the same (-sin, -cos) forward
+# convention as sam_vla.env.home_base.home_base_xz (see its docstring).
+DEFAULT_FLAG_BEARINGS_DEG = (-45.0, 45.0, 135.0, -135.0)
+DEFAULT_FLAG_DISTANCE_M = 6.0
+
 
 @dataclass
 class FlagFieldConfig:
@@ -163,6 +173,35 @@ def generate_flag_field(
             )
         )
 
+    return flags
+
+
+def generate_default_flag_field(
+    terrain: Terrain,
+    start_x: float,
+    start_z: float,
+    start_yaw: float,
+    distance: float = DEFAULT_FLAG_DISTANCE_M,
+) -> List[FlagSpec]:
+    """The unseeded default: place one flag at each of DEFAULT_FLAG_BEARINGS_DEG,
+    `distance` meters from (start_x, start_z), facing back toward the spawn
+    point same as generate_flag_field's face_target. Colors cycle through
+    FLAG_COLORS in a fixed order rather than being randomized, so this is
+    fully deterministic -- no seed to vary it."""
+    colors = list(FLAG_COLORS.keys())
+    flags: List[FlagSpec] = []
+    for i, bearing_deg in enumerate(DEFAULT_FLAG_BEARINGS_DEG):
+        angle = start_yaw + math.radians(bearing_deg)
+        x = start_x - distance * math.sin(angle)
+        z = start_z - distance * math.cos(angle)
+        yaw = _facing_yaw(x, z, start_x, start_z)
+        y = terrain.local_height_max(x, z, FLAG_FOOTPRINT_RADIUS)
+        color = colors[i % len(colors)]
+        flags.append(
+            FlagSpec(
+                id=i, x=x, y=y, z=z, yaw=yaw, color=color, mesh_path=str(FLAG_COLORS[color])
+            )
+        )
     return flags
 
 

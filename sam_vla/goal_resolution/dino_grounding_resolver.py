@@ -85,6 +85,11 @@ def _to_prompt(target_text: str) -> str:
 # grounded, not a distinct one -- see _drop_goal_overlap.
 _GOAL_OVERLAP_IOU_THRESHOLD = 0.3
 
+# Above this IoU, two different queries' best boxes in the same detect_in_frame
+# tick are treated as the same physical object rather than two distinct
+# sightings -- see detect_in_frame's cross-query suppression.
+_CROSS_QUERY_IOU_THRESHOLD = 0.5
+
 
 def _iou_norm(a: tuple, b: tuple) -> float:
     """IoU of two normalized (0-1) xyxy boxes."""
@@ -322,25 +327,49 @@ def detect_in_frame(
     to opportunistically check the current frame against several goal texts at once
     (e.g. nav/rover_controller.py's periodic multi-goal belief sweep during an
     active Mission, checking for goals other than the one currently being driven
-    to). Returns {query: (forward, left)} in belief_tracking's body-frame
-    convention, via the same _bbox_to_body median-depth-over-the-box conversion
-    sweep_and_seed_beliefs uses -- omits any query with no detection this frame, or
-    whose best detection had no valid depth."""
+    to). Returns {query: (forward, left, score)} in belief_tracking's body-frame
+    convention (plus DINO's own box score, so a caller can log/inspect how
+    confident the hit actually was), via the same _bbox_to_body
+    median-depth-over-the-box conversion sweep_and_seed_beliefs uses -- omits
+    any query with no detection this frame, or whose best detection had no
+    valid depth.
+
+    Cross-query suppression: raising box_threshold alone does NOT catch DINO
+    confidently grounding two different queries onto the SAME physical box --
+    observed live with "white flag"/"green flag": once the green flag left
+    frame, DINO put a >0.9-score "white flag" box and a >0.7-score "green
+    flag" box on the exact same white-flag pixels, both comfortably above any
+    reasonable box_threshold. When two queries' best boxes this tick overlap
+    above _CROSS_QUERY_IOU_THRESHOLD, only the higher-scoring query's hit is
+    kept -- the rest are dropped rather than seeding a belief at a location a
+    higher-confidence query already claims."""
     detector = _get_detector(
         model_id=dino_model_id,
         device=dino_device,
         box_threshold=dino_box_threshold,
         text_threshold=dino_text_threshold,
     )
-    hits: Dict[str, tuple] = {}
+    best_by_query: dict = {}
     for query in queries:
         dets = detector.detect(rgb, text_prompt=_to_prompt(query))
-        if not dets:
+        if dets:
+            best_by_query[query] = max(dets, key=lambda d: d.score)
+
+    suppressed = set()
+    items = list(best_by_query.items())
+    for i, (query_a, det_a) in enumerate(items):
+        for query_b, det_b in items[i + 1 :]:
+            if _iou_norm(det_a.box, det_b.box) >= _CROSS_QUERY_IOU_THRESHOLD:
+                loser = query_a if det_a.score < det_b.score else query_b
+                suppressed.add(loser)
+
+    hits: Dict[str, tuple] = {}
+    for query, best in best_by_query.items():
+        if query in suppressed:
             continue
-        best = max(dets, key=lambda d: d.score)
         point = _bbox_to_body(best.box, depth, hfov_deg)
         if point is not None:
-            hits[query] = point
+            hits[query] = (point[0], point[1], best.score)
     return hits
 
 

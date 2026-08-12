@@ -180,11 +180,30 @@ def build_parse_nav_command_prompt(command_text: str) -> str:
         f'Rover command: "{command_text}"\n\n'
         "Break this command into two ordered lists:\n"
         '  "directions": plain movement instructions, each normalized to '
-        'exactly one of "left", "right", "back", "front" (e.g. "go left" '
-        '-> "left", "turn around" -> "back", "keep going straight" -> '
-        '"front"). Only include an entry here for movement with no named '
-        "target -- a command to navigate toward a specific object (even "
-        '"go back to home base") belongs in "goals", not here.\n'
+        'exactly one of "turn_left", "turn_right", "turn_back", "go_left", '
+        '"go_right", "go_front". Two different verbs matter here, and they '
+        "mean different things -- do not blur them:\n"
+        '    - "turn_left" / "turn_right" / "turn_back": the command says to '
+        'turn, face, or rotate in place, with NO forward movement implied '
+        '(e.g. "turn left" -> "turn_left", "turn around" -> "turn_back", '
+        '"face the other way" -> "turn_back", "face right" -> "turn_right").\n'
+        '    - "go_left" / "go_right" / "go_front": the command says to '
+        "actually move/head/drive in a direction (e.g. \"go left\" -> "
+        '"go_left", "move right" -> "go_right", "head left" -> "go_left", '
+        '"keep going straight" -> "go_front", "drive forward" -> '
+        '"go_front"). These mean turn to face that way (already true for '
+        "go_front) AND THEN keep driving forward -- never downgrade one of "
+        'these to the turn_* form just because it looks similar.\n'
+        '  Only include an entry here for movement with no named target -- '
+        "a command to navigate toward a specific object (even \"go back to "
+        'home base") belongs in "goals", not here. This includes bare '
+        '"come back" / "go back" / "return" with no object named after it '
+        "-- these mean drive all the way back to the start point, not spin "
+        'in place, so they ALWAYS belong in "goals" as "home base", never '
+        'in "directions" as "turn_back". Only use "turn_back" when the '
+        "command explicitly says to turn/face backward in place with no "
+        'sense of travelling anywhere (e.g. "turn around", "face the other '
+        'way").\n'
         '  "goals": short phrases naming a specific target object to find '
         'or navigate to (e.g. "white flag", "flag on the right", "home '
         'base"), kept as close to the original wording as possible while '
@@ -202,11 +221,19 @@ def build_parse_nav_command_prompt(command_text: str) -> str:
         "imply a direction that was not actually stated.\n\n"
         "Examples:\n"
         '  "go left find a flag and come back to home base" -> '
-        '{"directions": ["left"], "goals": ["flag", "home base"]}\n'
+        '{"directions": ["go_left"], "goals": ["flag", "home base"]}\n'
+        '  "go left find a flag and come back" -> '
+        '{"directions": ["go_left"], "goals": ["flag", "home base"]}\n'
+        '  "turn left then find a flag" -> '
+        '{"directions": ["turn_left"], "goals": ["flag"]}\n'
+        '  "turn around" -> '
+        '{"directions": ["turn_back"], "goals": []}\n'
+        '  "keep going straight" -> '
+        '{"directions": ["go_front"], "goals": []}\n'
         '  "find the white flag and then go to the flag on the right" -> '
         '{"directions": [], "goals": ["white flag", "flag on the right"]}\n'
         '  "turn right then go straight" -> '
-        '{"directions": ["right", "front"], "goals": []}\n'
+        '{"directions": ["turn_right", "go_front"], "goals": []}\n'
         '  "go to the flag" -> '
         '{"directions": [], "goals": ["flag"]}\n'
         '  "head to the flag now" -> '

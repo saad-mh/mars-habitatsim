@@ -252,6 +252,7 @@ class RoverController:
         world_margin: float = 2.0,
         random_goal_bearing_deg: float = 60.0,
         random_goal_dist_range: tuple = (4.0, 8.0),
+        go_direction_distance_m: float = 4.0,
         seg_backend: str = "lora",
         seg_checkpoint: Optional[str] = None,
         seg_overlay: str = "mesh",
@@ -313,6 +314,7 @@ class RoverController:
         self.navdp_upstream_planner_mode = navdp_upstream_planner_mode
         self.random_goal_bearing_deg = float(random_goal_bearing_deg)
         self.random_goal_dist_range = tuple(random_goal_dist_range)
+        self.go_direction_distance_m = float(go_direction_distance_m)
         self.world_limit = max(SIZE_X, SIZE_Z) / 2.0 - float(world_margin)
 
         # Segmentation backend used by the "resolve" mode's SAM2 detection
@@ -814,6 +816,26 @@ class RoverController:
                 if pending_mission is not None:
                     with self._lock:
                         self._mission = pending_mission
+                    # Record the rover's spawn point as a "home base" entry in
+                    # the persistent belief bank (goal_beliefs) the moment a
+                    # mission is dispatched, keyed the same way _sweep_goal_beliefs
+                    # keys everything else -- so home is remembered right from
+                    # the prompt, not only once a RETURN sub-goal is reached.
+                    # This is bookkeeping only: RETURN's own drive (below) still
+                    # goes straight to the ground-truth (self.start_x, self.start_z)
+                    # every tick via MODE_POINT, which is exact and never needs
+                    # correcting -- this entry just makes home visible in the
+                    # same belief bank flags/other goals live in.
+                    home_forward, home_left = body_frame_goal(
+                        self.display.pose, (self.start_x, self.start_z)
+                    )
+                    goal_beliefs.setdefault(
+                        "home base", self._new_belief_tracker()
+                    ).observe_body_point(home_forward, home_left)
+                    self._event_log.log(
+                        "home_base_seeded",
+                        world=(round(self.start_x, 2), round(self.start_z, 2)),
+                    )
                     goal_objects, obstacle_objects, goal_spec, belief_tracker = (
                         self._start_mission_subgoal(
                             env,
@@ -1616,6 +1638,26 @@ class RoverController:
                     self.display.goal_reached = False
                 return goal_objects, obstacle_objects, goal_spec, belief_tracker
 
+            if goal.kind == GoalKind.ADVANCE:
+                # "go left"/"go right"/"go straight" -- unlike TURN (rotate
+                # only), this actually drives: a world-frame point
+                # go_direction_distance_m straight ahead along whatever
+                # heading the rover is CURRENTLY facing (the preceding TURN
+                # sub-goal, if any, has already finished by the time this
+                # runs -- see nav.mission._direction_subgoals). Same
+                # ground-truth MODE_POINT mechanism RETURN/random-goal
+                # driving already use (CBF obstacle avoidance included), just
+                # aimed at a point instead of the spawn.
+                pose = self.display.pose
+                dist = self.go_direction_distance_m
+                tx = pose.x - dist * math.sin(pose.yaw)
+                tz = pose.z - dist * math.cos(pose.yaw)
+                with self._lock:
+                    self._world_goal = (tx, tz)
+                    self._mode = MODE_POINT
+                    self.display.goal_reached = False
+                return goal_objects, obstacle_objects, goal_spec, belief_tracker
+
     def _sweep_goal_beliefs(self, mission, rgb, depth, goal_beliefs) -> None:
         """Opportunistic multi-goal check against the current frame while a
         Mission is driving normally (no rotation, unlike
@@ -1649,7 +1691,7 @@ class RoverController:
             dino_box_threshold=self.dino_box_threshold,
             dino_text_threshold=self.dino_text_threshold,
         )
-        for query, (forward, left) in hits.items():
+        for query, (forward, left, score) in hits.items():
             goal_beliefs.setdefault(
                 query, self._new_belief_tracker(mission_sweep=True)
             ).observe_body_point(forward, left)
@@ -1657,11 +1699,16 @@ class RoverController:
             # whatever _start_mission_subgoal later did with the belief it seeded
             # -- logged explicitly so a periodic sweep is actually observable/
             # debuggable from the event log instead of inferred after the fact.
+            # score is DINO's own box confidence for this query's best box --
+            # logged so a confident cross-class mixup (e.g. "green flag"
+            # grounding onto the white flag once the real one leaves frame)
+            # is distinguishable from a low-confidence noise hit.
             self._event_log.log(
                 "mission_sweep_hit",
                 name=query,
                 forward=round(float(forward), 2),
                 left=round(float(left), 2),
+                score=round(float(score), 3),
             )
 
     def _new_belief_tracker(self, *, mission_sweep: bool = False) -> BeliefGoalTracker:
@@ -1927,6 +1974,7 @@ class RoverController:
                 method="dino" if target_text else "sam2+qwen",
                 world=(round(gx, 2), round(gy, 2), round(gz, 2)),
                 fallback=used_fallback,
+                score=vlm_result.get("score"),
             )
         else:
             status_msg = (

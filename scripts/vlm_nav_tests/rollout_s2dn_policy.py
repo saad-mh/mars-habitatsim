@@ -20,6 +20,7 @@ import requests
 from habitat_sim.agent import AgentConfiguration
 from PIL import Image, ImageDraw
 
+from belief_heading_recovery import belief_heading_recovery_action
 from belief_pixel_goal import GaussianGoalBelief
 
 
@@ -1265,6 +1266,19 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--belief-ghost-covariance-scale", type=float, default=2.0)
     argument_parser.add_argument("--belief-ghost-maximum-radius", type=int, default=80)
     argument_parser.add_argument(
+        "--belief-heading-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    argument_parser.add_argument("--belief-recovery-bearing-deg", type=float, default=35.0)
+    argument_parser.add_argument("--belief-recovery-yaw-gain", type=float, default=1.5)
+    argument_parser.add_argument(
+        "--belief-recovery-maximum-yaw-rate", type=float, default=0.70
+    )
+    argument_parser.add_argument(
+        "--belief-recovery-maximum-forward-speed", type=float, default=0.12
+    )
+    argument_parser.add_argument(
         "--qwen-model-id", default="Qwen/Qwen2.5-VL-3B-Instruct"
     )
     argument_parser.add_argument("--qwen-device", default="auto")
@@ -1675,6 +1689,7 @@ def main() -> None:
                 "belief_goal_time_since_seen",
                 "belief_goal_bearing_rad",
                 "belief_goal_pixel_sigma",
+                "belief_heading_recovery_active",
                 "selected_trajectory",
                 "all_trajectories",
                 "all_values",
@@ -1894,6 +1909,7 @@ def main() -> None:
             )
             homotopy_decision = None
             forced_circulation_sign = 0.0
+            obstacle_relevant_for_homotopy = False
             if homotopy_selector is not None:
                 homotopy_obstacle_mask = (
                     (obstacle_mask > 0)
@@ -1911,6 +1927,7 @@ def main() -> None:
                 homotopy_decision = homotopy_selector.step(
                     np.asarray(qwen_overlay.convert("RGB")), homotopy_obstacle_mask
                 )
+                obstacle_relevant_for_homotopy = homotopy_decision.obstacle_relevant
                 forced_circulation_sign = homotopy_decision.circulation_sign
                 if homotopy_decision.queried_qwen:
                     event = {
@@ -1960,6 +1977,16 @@ def main() -> None:
                     yaw_gain=args.yaw_gain,
                 )
             )
+            action, belief_recovery_active = belief_heading_recovery_action(
+                action,
+                belief_bearing=belief_goal_bearing,
+                obstacle_relevant=obstacle_relevant_for_homotopy,
+                enabled=args.belief_pixel_goal and args.belief_heading_recovery,
+                activation_bearing=math.radians(args.belief_recovery_bearing_deg),
+                yaw_gain=args.belief_recovery_yaw_gain,
+                maximum_yaw_rate=args.belief_recovery_maximum_yaw_rate,
+                maximum_forward_speed=args.belief_recovery_maximum_forward_speed,
+            )
 
             next_position, next_yaw = integrate_mars(position, yaw, action, dt)
             previous_executed_action = action.copy()
@@ -1999,6 +2026,7 @@ def main() -> None:
             rows["belief_goal_time_since_seen"].append(belief_goal_time_since_seen)
             rows["belief_goal_bearing_rad"].append(belief_goal_bearing)
             rows["belief_goal_pixel_sigma"].append(belief_goal_pixel_sigma)
+            rows["belief_heading_recovery_active"].append(belief_recovery_active)
             rows["selected_trajectory"].append(result.trajectory)
             rows["all_trajectories"].append(result.all_trajectories)
             rows["all_values"].append(result.all_values)
@@ -2060,6 +2088,7 @@ def main() -> None:
                     f"t={step} goal={goal_distance:.2f}m qwen_side={side_label} pixels={len(obstacle_pixels)} "
                     f"goal_src={belief_goal_source} "
                     f"goal_sigma_px={belief_goal_pixel_sigma:.1f} "
+                    f"recover={int(belief_recovery_active)} "
                     f"pred={result.selected_minimum_clearance:.2f}m "
                     f"actual={surface_clearance:.2f}m "
                     f"mode={result.selected_circulation_sign:+.0f} "
@@ -2082,6 +2111,7 @@ def main() -> None:
                 f"qwen_side={homotopy_decision.side if homotopy_decision else 'AUTO'} "
                 f"goal_src={belief_goal_source} "
                 f"goal_sigma_px={belief_goal_pixel_sigma:.1f} "
+                f"recover={int(belief_recovery_active)} "
                 f"pixels={len(obstacle_pixels)} valid={result.valid_obstacle_points} "
                 f"selected={result.selected_index} fallback={result.fallback_stop} "
                 f"escape={result.escape_turn} mode={result.selected_circulation_sign:+.0f} "
@@ -2172,6 +2202,11 @@ def main() -> None:
                     "belief_translation_process_std": args.belief_translation_process_std,
                     "belief_yaw_process_std_deg": args.belief_yaw_process_std_deg,
                     "belief_covariance_controls_navdp_mask_size": False,
+                    "belief_heading_recovery": args.belief_heading_recovery,
+                    "belief_recovery_obstacle_gated": True,
+                    "belief_recovery_bearing_deg": args.belief_recovery_bearing_deg,
+                    "belief_recovery_maximum_yaw_rate": args.belief_recovery_maximum_yaw_rate,
+                    "belief_recovery_maximum_forward_speed": args.belief_recovery_maximum_forward_speed,
                     "particle_noise_schedule": args.particle_noise_schedule,
                     "progressive_guidance": args.progressive_guidance,
                     "mesh_obstacle_count": len(mesh_centroids),

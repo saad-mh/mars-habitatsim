@@ -1130,6 +1130,7 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         navdp_upstream_planner_mode=args.navdp_upstream_planner_mode,
         random_goal_bearing_deg=args.random_goal_bearing_deg,
         random_goal_dist_range=(args.random_goal_min_dist, args.random_goal_max_dist),
+        go_direction_distance_m=args.go_direction_distance,
         seg_backend=args.seg_backend,
         seg_checkpoint=args.seg_checkpoint,
         seg_overlay=args.seg_overlay,
@@ -1166,16 +1167,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument(
         "--flag-seed",
         type=int,
-        default=7,  # 1
-        help="enable randomized flag-marker placement (assets/flags/*.glb) seeded with "
-        "this value -- same seed gives the same layout every run; unset (default) "
-        "places no flags",
+        default=None,
+        help="randomize flag-marker placement (assets/flags/*.glb) seeded with this "
+        "value -- same seed gives the same layout every run; unset (default) places "
+        "a fixed 4-flag diamond around the rover's spawn point instead",
     )
     ap.add_argument(
         "--num-flags",
         type=int,
         default=6,
-        help="flags to place when --flag-seed is set",
+        help="flags to place when --flag-seed is set (unseeded default is always 4)",
     )
     ap.add_argument(
         "--flag-min-spacing",
@@ -1224,10 +1225,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         "driving policy is active",
     )
     ap.add_argument(
-        "--start-x", type=float, default=-15.7
+        "--start-x", type=float, default=-5.5
     )  # 7.1, 7.6, 2.2, 7.5, # 1.7, # -5.5, 15.7
     ap.add_argument(
-        "--start-z", type=float, default=1.5
+        "--start-z", type=float, default=2.2
     )  # 7.7, 7.1, -1.9, 6.9, # 0.7 # 2.2, 1.5
     ap.add_argument(
         "--start-yaw", type=float, default=86.0, help="degrees"
@@ -1369,6 +1370,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="meters driven along a human-submitted heading before falling back to the "
         "(still-uncertain) dead-reckoned belief and, if still unseen, halting again "
         "(default 4.0)",
+    )
+    ap.add_argument(
+        "--go-direction-distance",
+        type=float,
+        default=4.0,
+        help="meters driven forward by a mission's ADVANCE step -- 'go left'/'go right'/"
+        "'go straight' style commands (turn if needed, then drive this far), as opposed "
+        "to 'turn left'/'turn right' which only rotate in place (default 4.0)",
     )
     return ap.parse_args(argv)
 

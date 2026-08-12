@@ -172,6 +172,18 @@ class MarsHabitatEnv:
             )
             self.flags = generate_flag_field(flag_config, self._terrain, face_target=(x, z))
             register_flags(self._sim, self.flags)
+        else:
+            # No seed given: fall back to a fixed four-flag diamond around
+            # spawn (see flag_placement.generate_default_flag_field) instead
+            # of leaving the yard empty -- a "go left find a flag" mission
+            # prompt always has something to find.
+            from sam_vla.env.flag_placement import (
+                generate_default_flag_field,
+                register_flags,
+            )
+
+            self.flags = generate_default_flag_field(self._terrain, x, z, yaw)
+            register_flags(self._sim, self.flags)
 
         if self._annotations_dir is not None:
             self.annotation_mesh_id_map = load_mesh_id_map(self._annotations_dir)

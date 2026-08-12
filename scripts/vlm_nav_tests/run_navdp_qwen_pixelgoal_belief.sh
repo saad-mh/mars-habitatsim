@@ -44,6 +44,11 @@ fi
   --belief-ghost-base-radius "${BELIEF_GHOST_BASE_RADIUS:-10}" \
   --belief-ghost-covariance-scale "${BELIEF_GHOST_COVARIANCE_SCALE:-2.0}" \
   --belief-ghost-maximum-radius "${BELIEF_GHOST_MAXIMUM_RADIUS:-80}" \
+  --belief-heading-recovery \
+  --belief-recovery-bearing-deg "${BELIEF_RECOVERY_BEARING_DEG:-35}" \
+  --belief-recovery-yaw-gain "${BELIEF_RECOVERY_YAW_GAIN:-1.5}" \
+  --belief-recovery-maximum-yaw-rate "${BELIEF_RECOVERY_MAXIMUM_YAW_RATE:-0.70}" \
+  --belief-recovery-maximum-forward-speed "${BELIEF_RECOVERY_MAXIMUM_FORWARD_SPEED:-0.12}" \
   --scene "${MARS_SCENE}" \
   --terrain-obj "${MARS_TERRAIN_OBJ}" \
   --terrain-height-mode obj \
@@ -61,10 +66,13 @@ fi
   --candidates "${CANDIDATES:-16}" \
   --particles "${PARTICLES:-4}" \
   --particle-std "${PARTICLE_STD:-0.22}" \
-  --guidance-strength "${GUIDANCE_STRENGTH:-0.85}" \
-  --safe-distance "${SAFE_DISTANCE:-0.42}" \
-  --hard-collision-distance "${HARD_COLLISION_DISTANCE:-0.24}" \
-  --maximum-obstacle-depth "${MAXIMUM_OBSTACLE_DEPTH:-5.0}" \
+  --guidance-strength "${GUIDANCE_STRENGTH:-0.95}" \
+  --safe-distance "${SAFE_DISTANCE:-0.70}" \
+  --hard-collision-distance "${HARD_COLLISION_DISTANCE:-0.45}" \
+  --safety-weight "${SAFETY_WEIGHT:-70.0}" \
+  --barrier-weight "${BARRIER_WEIGHT:-50.0}" \
+  --circulation-activation-distance "${CIRCULATION_ACTIVATION_DISTANCE:-2.20}" \
+  --maximum-obstacle-depth "${MAXIMUM_OBSTACLE_DEPTH:-6.0}" \
   --qwen-homotopy \
   --qwen-device "${QWEN_DEVICE:-auto}" \
   --qwen-homotopy-python "${QWEN_PYTHON:-${HABITAT_PYTHON:-python}}" \

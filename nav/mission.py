@@ -23,13 +23,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Optional
+from typing import List
 
 
 class GoalKind(Enum):
     GO_TO = auto()  # navigate to a landmark (open-vocabulary Qwen grounding)
     RETURN = auto()  # return to the spawn/home point
-    TURN = auto()  # in-place rotation
+    TURN = auto()  # in-place rotation, no forward movement
+    ADVANCE = auto()  # drive forward in the current facing direction, no turn
     FIND = auto()  # same handling as GO_TO -- search/scan until a target appears
     DONE = auto()
 
@@ -41,23 +42,59 @@ class SubGoal:
     raw: str  # the original phrase, for status display
 
 
-# Direction words (qwen_prompts.build_parse_nav_command_prompt's closed
-# vocabulary) that need an in-place turn -- "front" is deliberately excluded,
-# the rover is already facing that way. The actual turn-heading-degrees
-# mapping lives once, in rover_controller.py's MODE_TURN handling.
-_TURN_DIRECTIONS = {"left", "right", "back"}
+# Direction tokens qwen_prompts.build_parse_nav_command_prompt's closed
+# vocabulary emits, split by verb: "turn_*" is an explicit in-place
+# turn/face command with no forward movement ("turn left", "turn around");
+# "go_*" implies actually moving that way ("go left", "head right", "keep
+# going straight") -- turn to face the heading first (skipped for go_front,
+# already facing it), THEN drive forward, see _direction_subgoals. Bare
+# legacy tokens ("left"/"right"/"back", no verb prefix) are accepted too, as
+# a fallback if the VLM ever emits one anyway -- treated as the safer
+# turn-only reading rather than guessing it meant to drive. The actual
+# turn-heading-degrees mapping lives once, in rover_controller.py's
+# MODE_TURN handling.
+_TURN_HEADINGS = {
+    "turn_left": "left",
+    "turn_right": "right",
+    "turn_back": "back",
+    "left": "left",
+    "right": "right",
+    "back": "back",
+}
+_GO_HEADINGS = {
+    "go_left": "left",
+    "go_right": "right",
+    "go_front": None,  # already facing front -- no turn needed, just drive
+}
 
 # Goal phrases naming the spawn point rather than a new landmark -- e.g.
-# "home base", "the spawn point", "go back" -- become RETURN, not GO_TO.
-_RETURN_WORDS = re.compile(r"\b(home|base|spawn)\b", re.I)
+# "home base", "the spawn point", "go back", "return" -- become RETURN, not
+# GO_TO. A safety net independent of qwen_prompts.build_parse_nav_command_prompt's
+# own "come back"/"go back" -> "home base" instruction, in case the VLM ever
+# emits one of those phrases verbatim as a goal instead of normalizing it.
+_RETURN_WORDS = re.compile(r"\b(home|base|spawn|return|come back|go back)\b", re.I)
 
 
-def _direction_subgoal(direction: str) -> Optional[SubGoal]:
-    """One VLM-emitted direction word -> an in-place TURN sub-goal, or None
-    for "front" (the rover is already facing that way -- nothing to turn)."""
-    if direction not in _TURN_DIRECTIONS:
-        return None
-    return SubGoal(GoalKind.TURN, direction, direction)
+def _direction_subgoals(direction: str) -> List[SubGoal]:
+    """One VLM-emitted direction token -> zero, one, or two sub-goals.
+
+    "go_*" is "turn left/right means turn in place, go left/right means
+    turn AND move forward": emits a TURN (skipped for go_front, which needs
+    none) followed by an ADVANCE that actually drives the rover forward
+    once it's facing the right way. "turn_*"/bare legacy tokens are a
+    single in-place TURN with no following drive. Anything unrecognized
+    (e.g. bare "front") -> no sub-goal, same as before this distinction
+    existed."""
+    if direction in _GO_HEADINGS:
+        heading = _GO_HEADINGS[direction]
+        steps: List[SubGoal] = []
+        if heading is not None:
+            steps.append(SubGoal(GoalKind.TURN, heading, direction))
+        steps.append(SubGoal(GoalKind.ADVANCE, heading or "front", direction))
+        return steps
+    if direction in _TURN_HEADINGS:
+        return [SubGoal(GoalKind.TURN, _TURN_HEADINGS[direction], direction)]
+    return []
 
 
 def _goal_subgoal(goal: str) -> SubGoal:
@@ -67,18 +104,16 @@ def _goal_subgoal(goal: str) -> SubGoal:
 
 def parse_parts(directions: List[str], goals: List[str]) -> List[SubGoal]:
     """Turn the VLM's (directions, goals) split into an ordered sub-goal
-    sequence, in two parts: every direction first (each an in-place TURN),
-    then every goal (GO_TO, or RETURN for phrases naming home/base/spawn).
-    Each part preserves the VLM's own within-list ordering (see
-    qwen_prompts.build_parse_nav_command_prompt), but the VLM never orders
-    directions relative to goals across the two lists -- "part 1 then part
-    2" is the closest ordering available, not a reconstruction of the
-    original interleaving."""
+    sequence, in two parts: every direction first (each a TURN and/or
+    ADVANCE, see _direction_subgoals), then every goal (GO_TO, or RETURN for
+    phrases naming home/base/spawn). Each part preserves the VLM's own
+    within-list ordering (see qwen_prompts.build_parse_nav_command_prompt),
+    but the VLM never orders directions relative to goals across the two
+    lists -- "part 1 then part 2" is the closest ordering available, not a
+    reconstruction of the original interleaving."""
     steps: List[SubGoal] = []
     for direction in directions:
-        sub = _direction_subgoal(direction)
-        if sub is not None:
-            steps.append(sub)
+        steps.extend(_direction_subgoals(direction))
     for goal in goals:
         steps.append(_goal_subgoal(goal))
     steps.append(SubGoal(GoalKind.DONE, "", "mission complete"))
