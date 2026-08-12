@@ -48,7 +48,7 @@ fi
   "--obstacle-world-xz-item=${OBSTACLE_X},${OBSTACLE_Z}" \
   --world-obstacle-half-extent "${OBSTACLE_HALF_EXTENT:-0.75}" \
   --world-obstacle-height "${OBSTACLE_HEIGHT:-1.40}" \
-  --robot-radius "${ROBOT_RADIUS:-1.2}" \
+  --robot-radius "${ROBOT_RADIUS:-1.8}" \
   --candidates "${CANDIDATES:-16}" \
   --particles "${PARTICLES:-4}" \
   --particle-std "${PARTICLE_STD:-0.22}" \

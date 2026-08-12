@@ -1629,7 +1629,7 @@ class NavGuiApp:
                 f"<KeyRelease-{key}>",
                 lambda e, d=direction: self._guarded(self.manual_release, d),
             )
-        root.bind("<Escape>", lambda e: self.cancel_pixel_click())
+        root.bind("<Escape>", lambda e: self.clear_all())
 
         # Numpad heading shortcuts for the uncertainty-halt panel below --
         # bound unconditionally (these digits aren't used elsewhere in this
@@ -1928,6 +1928,16 @@ class NavGuiApp:
         self.cancel_pixel_click()
         self._ack("STOP — driving halted")
         self.controller.stop_driving()
+
+    def clear_all(self) -> None:
+        # Escape key: a hard clear, not just stop() -- also strips resolved
+        # goal/obstacle masks, the active mission, and any uncertainty halt,
+        # leaving the rover exactly where it is (unlike reset_rover, which
+        # also teleports it back to spawn). See RoverController.clear_all_goals.
+        self._manual_held.clear()
+        self.cancel_pixel_click()
+        self._ack("cleared — all goals, missions, and masks removed")
+        self.controller.clear_all_goals()
 
     # ---------------- segmentation review (Goal 1) ---------------- #
     def confirm_segmentation(self) -> None:
@@ -2359,11 +2369,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         "needed for the CBF safety layer's generic obstacle/avoidance math, unrelated to which "
         "driving policy is active",
     )
-    ap.add_argument("--start-x", type=float, default=7.1)  # 7.1, 7.6, 2.2, 7.5, # 1.7
-    ap.add_argument("--start-z", type=float, default=7.7)  # 7.7, 7.1, -1.9, 6.9, # 0.7
     ap.add_argument(
-        "--start-yaw", type=float, default=34.0, help="degrees"
-    )  # 34, 41, 161, 34, # 58
+        "--start-x", type=float, default=-5.5
+    )  # 7.1, 7.6, 2.2, 7.5, # 1.7, # -5.5
+    ap.add_argument(
+        "--start-z", type=float, default=2.2
+    )  # 7.7, 7.1, -1.9, 6.9, # 0.7 # 2.2
+    ap.add_argument(
+        "--start-yaw", type=float, default=86.0, help="degrees"
+    )  # 34, 41, 161, 34, # 58 # 86
     ap.add_argument("--dt", type=float, default=0.1)
     ap.add_argument("--hz", type=float, default=10.0, help="controller tick rate")
     ap.add_argument("--max-linear", type=float, default=0.6)

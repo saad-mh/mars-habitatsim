@@ -368,6 +368,7 @@ class RoverController:
         # that cross threads.
         self._ground_target_world: Optional[tuple] = None
         self._pending_reset = False
+        self._pending_clear_all = False
         self._pending_pixel_click: Optional[tuple] = None
         self._pending_confirm_segmentation = False
         self._pending_rerun_segmentation = False
@@ -499,6 +500,18 @@ class RoverController:
     def request_reset(self) -> None:
         with self._lock:
             self._pending_reset = True
+            self._mission = None
+
+    def clear_all_goals(self) -> None:
+        """Hard reset of every goal/mission/mask/uncertainty-halt state back
+        to a blank idle slate -- everything request_reset does *except*
+        teleporting the rover back to spawn (see _env_loop's
+        `do_reset or do_clear_all` block, which shares the rest of that
+        logic). Distinct from stop_driving(), which only clears the active
+        world_goal/mission and leaves resolved masks and uncertainty state
+        alone."""
+        with self._lock:
+            self._pending_clear_all = True
             self._mission = None
 
     def submit_uncertainty_heading(self, angle_deg: float) -> None:
@@ -655,6 +668,7 @@ class RoverController:
                 (
                     do_resolve,
                     do_reset,
+                    do_clear_all,
                     pixel_click,
                     do_confirm_seg,
                     do_rerun_seg,
@@ -665,7 +679,12 @@ class RoverController:
                     resolve_target_text,
                 ) = self._consume_pending()
 
-                if do_reset:
+                if do_reset or do_clear_all:
+                    # Shared by request_reset (do_reset) and clear_all_goals
+                    # (do_clear_all, the Escape-key hard clear) -- everything
+                    # below except the env.step teleport back to spawn, which
+                    # only do_reset wants (clear_all_goals leaves the rover
+                    # exactly where it is).
                     goal_objects, obstacle_objects = self._clear_masks(
                         env, goal_objects, obstacle_objects
                     )
@@ -677,22 +696,25 @@ class RoverController:
                     belief_tracker = self._new_belief_tracker()
                     if avoidance is not None:
                         avoidance = self._new_avoidance()
-                    y = env.get_height_at_xz(self.start_x, self.start_z)
-                    env.step(
-                        Pose(
-                            x=self.start_x,
-                            y=y,
-                            z=self.start_z,
-                            yaw=math.radians(self.start_yaw_deg),
+                    if do_reset:
+                        y = env.get_height_at_xz(self.start_x, self.start_z)
+                        env.step(
+                            Pose(
+                                x=self.start_x,
+                                y=y,
+                                z=self.start_z,
+                                yaw=math.radians(self.start_yaw_deg),
+                            )
                         )
-                    )
                     with self._lock:
                         self._mode = MODE_IDLE
                         self._world_goal = None
                         self._manual_action = Action(0.0, 0.0, 0.0)
                         self._uncertainty_halted = False
                         self._uncertainty_search_goal = None
-                        self.display.status_text = "reset to spawn"
+                        self.display.status_text = (
+                            "reset to spawn" if do_reset else "cleared -- idle"
+                        )
                         self.display.goal_reached = False
                         self.display.click_status = ""
                         self.display.uncertainty_halted = False
@@ -1112,6 +1134,7 @@ class RoverController:
     ) -> tuple[
         bool,
         bool,
+        bool,
         Optional[tuple],
         bool,
         bool,
@@ -1125,6 +1148,7 @@ class RoverController:
             do_resolve = self._pending_resolve
             resolve_target_text = self._resolve_target_text
             do_reset = self._pending_reset
+            do_clear_all = self._pending_clear_all
             pixel_click = self._pending_pixel_click
             do_confirm_seg = self._pending_confirm_segmentation
             do_rerun_seg = self._pending_rerun_segmentation
@@ -1134,6 +1158,7 @@ class RoverController:
             nav_command_text = self._pending_nav_command_text
             self._pending_resolve = False
             self._pending_reset = False
+            self._pending_clear_all = False
             self._pending_pixel_click = None
             self._pending_confirm_segmentation = False
             self._pending_rerun_segmentation = False
@@ -1144,6 +1169,7 @@ class RoverController:
         return (
             do_resolve,
             do_reset,
+            do_clear_all,
             pixel_click,
             do_confirm_seg,
             do_rerun_seg,
