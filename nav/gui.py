@@ -1139,6 +1139,7 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         dino_device=args.dino_device,
         dino_box_threshold=args.dino_box_threshold,
         dino_text_threshold=args.dino_text_threshold,
+        mission_belief_sweep_every=args.mission_belief_sweep_every,
         uncertainty_enabled=not args.no_uncertainty_halt,
         uncertainty_cov_threshold=args.cov_threshold,
         uncertainty_cov_growth=args.cov_growth,
@@ -1221,14 +1222,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         "driving policy is active",
     )
     ap.add_argument(
-        "--start-x", type=float, default=-5.5
-    )  # 7.1, 7.6, 2.2, 7.5, # 1.7, # -5.5
+        "--start-x", type=float, default=-15.7
+    )  # 7.1, 7.6, 2.2, 7.5, # 1.7, # -5.5, 15.7
     ap.add_argument(
-        "--start-z", type=float, default=2.2
-    )  # 7.7, 7.1, -1.9, 6.9, # 0.7 # 2.2
+        "--start-z", type=float, default=1.5
+    )  # 7.7, 7.1, -1.9, 6.9, # 0.7 # 2.2, 1.5
     ap.add_argument(
         "--start-yaw", type=float, default=86.0, help="degrees"
-    )  # 34, 41, 161, 34, # 58 # 86
+    )  # 34, 41, 161, 34, # 58 # 86, 86
     ap.add_argument("--dt", type=float, default=0.1)
     ap.add_argument("--hz", type=float, default=10.0, help="controller tick rate")
     ap.add_argument("--max-linear", type=float, default=0.6)
@@ -1298,6 +1299,17 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--dino-text-threshold",
         type=float,
         default=dino_grounding_resolver.DEFAULT_TEXT_THRESHOLD,
+    )
+    ap.add_argument(
+        "--mission-belief-sweep-every",
+        type=int,
+        default=15,
+        help="while a Command-panel Mission is driving, re-check the current frame "
+        "against every remaining GO_TO/FIND target text every this-many ticks, "
+        "seeding/refreshing a persistent per-goal belief -- so a goal sighted while "
+        "driving toward an earlier one in the same instruction isn't forgotten by "
+        "the time the mission reaches it (default 15; <= 0 disables the periodic "
+        "sweep)",
     )
     ap.add_argument(
         "--no-uncertainty-halt",

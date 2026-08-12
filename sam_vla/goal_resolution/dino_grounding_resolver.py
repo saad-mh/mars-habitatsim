@@ -305,6 +305,45 @@ def _bbox_to_body(box, depth: np.ndarray, hfov_deg: float) -> Optional[tuple]:
     return rng, -right  # (forward, left)
 
 
+def detect_in_frame(
+    rgb: np.ndarray,
+    depth: np.ndarray,
+    queries: List[str],
+    hfov_deg: float,
+    *,
+    dino_model_id: str = DEFAULT_DINO_MODEL_ID,
+    dino_device: str = DEFAULT_DINO_DEVICE,
+    dino_box_threshold: float = DEFAULT_BOX_THRESHOLD,
+    dino_text_threshold: float = DEFAULT_TEXT_THRESHOLD,
+) -> Dict[str, tuple]:
+    """One DINO detection per query against a single, already-captured frame -- no
+    env rotation, unlike sweep_and_detect_objects/sweep_and_seed_beliefs (which turn
+    the agent through a full 360deg scan). For a caller driving normally that wants
+    to opportunistically check the current frame against several goal texts at once
+    (e.g. nav/rover_controller.py's periodic multi-goal belief sweep during an
+    active Mission, checking for goals other than the one currently being driven
+    to). Returns {query: (forward, left)} in belief_tracking's body-frame
+    convention, via the same _bbox_to_body median-depth-over-the-box conversion
+    sweep_and_seed_beliefs uses -- omits any query with no detection this frame, or
+    whose best detection had no valid depth."""
+    detector = _get_detector(
+        model_id=dino_model_id,
+        device=dino_device,
+        box_threshold=dino_box_threshold,
+        text_threshold=dino_text_threshold,
+    )
+    hits: Dict[str, tuple] = {}
+    for query in queries:
+        dets = detector.detect(rgb, text_prompt=_to_prompt(query))
+        if not dets:
+            continue
+        best = max(dets, key=lambda d: d.score)
+        point = _bbox_to_body(best.box, depth, hfov_deg)
+        if point is not None:
+            hits[query] = point
+    return hits
+
+
 def sweep_and_seed_beliefs(
     env,
     goal_queries: List[str],

@@ -101,6 +101,7 @@ from sam_vla.vlm import qwen_client
 from sam_vla.vlm.qwen_config import QWEN_SERVER_HOST, QWEN_SERVER_PORT
 from sam_vla.vlm.qwen_server_manager import QwenServerManager
 
+from nav.event_log import EventLogger
 from nav.goal_math import body_frame_goal, heading_ahead_point, random_ahead_point
 from nav.mission import GoalKind, Mission
 
@@ -134,7 +135,7 @@ MODE_TURN = "turn"
 MODE_REVIEW_SEGMENTATION = "review_segmentation"
 
 # Ground-truth distance at which a point goal counts as reached
-POINT_GOAL_REACHED_M = 0.7
+POINT_GOAL_REACHED_M = 1.5
 
 # Ground-truth yaw error at which a MODE_TURN sub-goal counts as reached
 TURN_GOAL_REACHED_RAD = math.radians(3.0)
@@ -259,6 +260,7 @@ class RoverController:
         dino_box_threshold: float = dino_grounding_resolver.DEFAULT_BOX_THRESHOLD,
         dino_text_threshold: float = dino_grounding_resolver.DEFAULT_TEXT_THRESHOLD,
         mission_sweep_yaws: int = 8,
+        mission_belief_sweep_every: int = 15,
         annotations_dir: Optional[str] = DEFAULT_ANNOTATIONS_DIR,
         annotation_categories: Optional[Sequence[str]] = None,
         uncertainty_enabled: bool = True,
@@ -340,6 +342,16 @@ class RoverController:
         # just failed to resolve and got skipped).
         self.mission_sweep_yaws = int(mission_sweep_yaws)
 
+        # Periodic multi-goal DINO belief sweep while a Mission is driving (see
+        # _sweep_goal_beliefs) -- checks the current frame against every remaining
+        # GO_TO/FIND target text every this-many ticks, seeding/refreshing a
+        # persistent per-goal-text BeliefGoalTracker (goal_beliefs in _env_loop) so
+        # a goal sighted while driving toward an earlier one isn't forgotten by the
+        # time the mission reaches it. <= 0 disables the periodic sweep entirely
+        # (a mission step can still resolve via _do_resolve's own front-facing
+        # check when it starts, same as before this feature existed).
+        self.mission_belief_sweep_every = int(mission_belief_sweep_every)
+
         self.uncertainty_enabled = bool(uncertainty_enabled)
         self.uncertainty_cov_threshold = float(uncertainty_cov_threshold)
         self.uncertainty_cov_growth = float(uncertainty_cov_growth)
@@ -404,6 +416,10 @@ class RoverController:
         self.display.uncertainty_enabled = self.uncertainty_enabled
         self.display.uncertainty_threshold = self.uncertainty_cov_threshold
         self._rng = np.random.default_rng()
+        # Goal-detected/goal-reached event log (nav/logs/, gitignored) --
+        # see EventLogger's docstring. Created once per RoverController (one
+        # log file per GUI process lifetime), not per-episode/reset.
+        self._event_log = EventLogger()
 
     # ------------------------------------------------------------------ #
     # thread-safe command API -- called from the GUI thread
@@ -605,9 +621,7 @@ class RoverController:
                 self.display.status_text = f"FATAL: {exc}"
                 self.display.error_text = str(exc)
 
-    def _env_loop(
-        self, env: MarsHabitatEnv, uncertainty_client=None
-    ) -> None:
+    def _env_loop(self, env: MarsHabitatEnv, uncertainty_client=None) -> None:
         mask_dir = tempfile.mkdtemp(prefix="mars_nav_masks_")
         obs0 = env.get_observation(frame_idx=0)
 
@@ -638,6 +652,16 @@ class RoverController:
         policy.start()
 
         belief_tracker = self._new_belief_tracker()
+        # Persistent per-goal-text belief store for an active Mission (nav.mission.
+        # Mission) -- distinct from belief_tracker above, which stays the ad-hoc
+        # single-target tracker for Ground Target / plain Segment / click-to-goal
+        # (self._mission is None in all of those). While a Mission is active,
+        # belief_tracker is reassigned to alias goal_beliefs[current sub-goal's
+        # target] (see the _start_mission_subgoal call sites below) so the rest of
+        # this loop's MODE_RESOLVE handling needs no changes -- it just always
+        # operates on "whichever tracker is active". See _sweep_goal_beliefs for
+        # how entries other than the active one get seeded/refreshed.
+        goal_beliefs: dict[str, BeliefGoalTracker] = {}
         avoidance = self._new_avoidance() if self.cbf_enabled else None
         # goal/obstacle mask objects registered by the last "resolve" --
         # actually removed (env.remove_object_mask) rather than merely
@@ -694,6 +718,7 @@ class RoverController:
                         self._pending_mission = None
                     self._mission_target_yaw = None
                     belief_tracker = self._new_belief_tracker()
+                    goal_beliefs = {}
                     if avoidance is not None:
                         avoidance = self._new_avoidance()
                     if do_reset:
@@ -773,7 +798,7 @@ class RoverController:
                 if pending_mission is not None:
                     with self._lock:
                         self._mission = pending_mission
-                    goal_objects, obstacle_objects, goal_spec = (
+                    goal_objects, obstacle_objects, goal_spec, belief_tracker = (
                         self._start_mission_subgoal(
                             env,
                             step,
@@ -781,6 +806,7 @@ class RoverController:
                             goal_objects,
                             obstacle_objects,
                             goal_spec,
+                            goal_beliefs,
                             belief_tracker,
                         )
                     )
@@ -789,6 +815,17 @@ class RoverController:
                 semantic = env.get_semantic_frame()
                 goal_mask = (semantic == MESH_GOAL_ID).astype("uint8") * 255
                 obstacle_mask = (semantic == MESH_OBST_ID).astype("uint8") * 255
+
+                with self._lock:
+                    mission_snapshot = self._mission
+                if (
+                    mission_snapshot is not None
+                    and self.mission_belief_sweep_every > 0
+                    and step % self.mission_belief_sweep_every == 0
+                ):
+                    self._sweep_goal_beliefs(
+                        mission_snapshot, obs.rgb, obs.depth, goal_beliefs
+                    )
 
                 if pixel_click is not None:
                     self._handle_pixel_click(obs, pixel_click)
@@ -812,7 +849,10 @@ class RoverController:
 
                 if mode != MODE_RESOLVE:
                     with self._lock:
-                        if self._uncertainty_halted or self._uncertainty_search_goal is not None:
+                        if (
+                            self._uncertainty_halted
+                            or self._uncertainty_search_goal is not None
+                        ):
                             self._uncertainty_halted = False
                             self._uncertainty_search_goal = None
                             self.display.uncertainty_halted = False
@@ -857,6 +897,9 @@ class RoverController:
                             self._world_goal = None
                             self.display.goal_reached = True
                         mode = MODE_IDLE
+                        self._event_log.log(
+                            "goal_reached", kind="point", world=world_goal
+                        )
                     else:
                         policy.set_goal_body(forward, left)
                         action, _vla_result = policy.act_verbose(
@@ -908,7 +951,10 @@ class RoverController:
                             search_forward, search_left = body_frame_goal(
                                 obs.pose, self._uncertainty_search_goal
                             )
-                            if math.hypot(search_forward, search_left) < POINT_GOAL_REACHED_M:
+                            if (
+                                math.hypot(search_forward, search_left)
+                                < POINT_GOAL_REACHED_M
+                            ):
                                 # Reached the searched heading without a
                                 # re-sighting -- fall back to the (still
                                 # uncertain) dead-reckoned belief; the halt
@@ -936,11 +982,19 @@ class RoverController:
                         # goal_reached edge MODE_POINT/MODE_TURN already
                         # drive, so a mission's GO_TO/FIND sub-goal (and the
                         # belief bank behind it) now advances too.
-                        if not searching and belief_tracker.distance() < POINT_GOAL_REACHED_M:
+                        if (
+                            not searching
+                            and belief_tracker.distance() < POINT_GOAL_REACHED_M
+                        ):
                             with self._lock:
                                 self._mode = MODE_IDLE
                                 self.display.goal_reached = True
                             mode = MODE_IDLE
+                            self._event_log.log(
+                                "goal_reached",
+                                kind="resolve",
+                                name=goal_spec.instruction_text,
+                            )
                         else:
                             policy.set_goal_body(forward, left)
                             action, _vla_result = policy.act_verbose(
@@ -960,15 +1014,16 @@ class RoverController:
                         # next.md's Integration-project Phase 5).
                         unresolved = True
                 elif mode == MODE_TURN and self._mission_target_yaw is not None:
-                    yaw_err = (
-                        self._mission_target_yaw - obs.pose.yaw + math.pi
-                    ) % (2.0 * math.pi) - math.pi
+                    yaw_err = (self._mission_target_yaw - obs.pose.yaw + math.pi) % (
+                        2.0 * math.pi
+                    ) - math.pi
                     if abs(yaw_err) < TURN_GOAL_REACHED_RAD:
                         with self._lock:
                             self._mode = MODE_IDLE
                             self.display.goal_reached = True
                         mode = MODE_IDLE
                         self._mission_target_yaw = None
+                        self._event_log.log("goal_reached", kind="turn")
                     else:
                         # Ghost point proportional to how much turn is left
                         # -- see TURN_GHOST_* docstring above. Clamping the
@@ -1000,8 +1055,14 @@ class RoverController:
                     # sub-goal completion, not every tick after.
                     with self._lock:
                         if self._mission is not None:
+                            completed_step = self._mission.current
+                            self._event_log.log(
+                                "mission_subgoal_reached",
+                                step=completed_step.raw,
+                                kind=completed_step.kind.name,
+                            )
                             self._mission.advance()
-                    goal_objects, obstacle_objects, goal_spec = (
+                    goal_objects, obstacle_objects, goal_spec, belief_tracker = (
                         self._start_mission_subgoal(
                             env,
                             step,
@@ -1009,6 +1070,7 @@ class RoverController:
                             goal_objects,
                             obstacle_objects,
                             goal_spec,
+                            goal_beliefs,
                             belief_tracker,
                         )
                     )
@@ -1032,8 +1094,21 @@ class RoverController:
                 new_pose = integrate_mars(obs.pose, action, self.dt)
                 env.step(new_pose)
 
-                if mode in (MODE_POINT, MODE_RESOLVE):
+                if mode in (MODE_POINT, MODE_RESOLVE) and self._mission is None:
                     belief_tracker.propagate(action, self.dt)
+
+                if self._mission is not None:
+                    # Every tracked goal belief (not just the active one) dead-
+                    # reckons against the rover's actual executed motion this tick,
+                    # regardless of which mode that motion happened under -- a
+                    # MODE_TURN/MODE_MANUAL leg still moves the rover, and a
+                    # previously-sighted goal's remembered bearing must still
+                    # decay/rotate with it. belief_tracker (the active goal's
+                    # tracker, aliased into goal_beliefs by _start_mission_subgoal)
+                    # is one of these entries, so it's propagated here instead of
+                    # the ad-hoc-only line above.
+                    for bt in goal_beliefs.values():
+                        bt.propagate(action, self.dt)
 
                 if (
                     uncertainty_session is not None
@@ -1042,7 +1117,8 @@ class RoverController:
                     and not self._uncertainty_request_in_flight
                     and self._uncertainty_search_goal is None
                     and belief_tracker.belief_g is not None
-                    and belief_tracker.uncertainty_value() >= self.uncertainty_cov_threshold
+                    and belief_tracker.uncertainty_value()
+                    >= self.uncertainty_cov_threshold
                 ):
                     self._uncertainty_halted = True
                     with self._lock:
@@ -1242,7 +1318,11 @@ class RoverController:
         guards a stale GUI click racing a halt that's since been cleared by
         a fresh sighting or a mode switch (see the `mode != MODE_RESOLVE`
         cleanup in _env_loop)."""
-        if do_retry and self._uncertainty_halted and not self._uncertainty_request_in_flight:
+        if (
+            do_retry
+            and self._uncertainty_halted
+            and not self._uncertainty_request_in_flight
+        ):
             self._dispatch_uncertainty_request(
                 session, belief_tracker, obs.rgb, retry=True
             )
@@ -1343,32 +1423,52 @@ class RoverController:
         except Exception as exc:
             print(f"[nav command] {text!r} failed: {exc}")
             return
+        self._event_log.log(
+            "mission_started", text=text, directions=directions, goals=goals
+        )
         with self._lock:
             self._pending_mission = mission
 
     def _start_mission_subgoal(
-        self, env, step, mask_dir, goal_objects, obstacle_objects, goal_spec, belief_tracker
+        self,
+        env,
+        step,
+        mask_dir,
+        goal_objects,
+        obstacle_objects,
+        goal_spec,
+        goal_beliefs,
+        belief_tracker,
     ):
         """Kicks off whichever driving mode the active Mission's current
         sub-goal needs (see nav.mission.Mission) -- called once when a new
         Mission is queued (submit_nav_command) and again every time the
         mission-advance edge in _env_loop fires. Only ever called from the
         controller thread. A GO_TO/FIND resolve that fails (DINO doesn't
-        ground the target, or grounds it with no valid depth) is skipped
-        rather than left stuck forever -- one bad step in a multi-part
-        instruction shouldn't stall the rest of it.
+        ground the target in the frame this step starts on) no longer means
+        the step is abandoned outright -- if a previous sighting (this
+        step's own earlier attempt, or _sweep_goal_beliefs picking it up
+        while an earlier leg of the mission was driving) left a confident
+        belief for this exact target text in `goal_beliefs`, resume driving
+        toward that remembered position instead. Only truly skipped (as
+        before this feature existed) when neither a fresh resolve nor a
+        usable prior belief is available.
 
-        `belief_tracker` is the one live tracker _run's tick loop calls
-        propagate()/observe() on for the rest of the episode -- passed in
-        (not constructed here) so the GO_TO/FIND branch's sweep-seeded
-        sighting below feeds the SAME instance the driving loop already
-        uses, instead of a disconnected one nobody reads."""
+        `goal_beliefs` is the persistent dict[goal-text -> BeliefGoalTracker]
+        for the whole Mission (see _env_loop) -- entries survive across
+        sub-goals so a target sighted while driving toward an earlier one
+        isn't forgotten by the time the mission reaches it. `belief_tracker`
+        is the CURRENTLY active tracker (whichever one _env_loop's tick loop
+        is calling propagate()/observe() on); RETURN/TURN/DONE have no goal
+        text of their own and just pass it through unchanged. Both are
+        returned so the caller can rebind its own locals, same pattern
+        goal_spec already uses."""
         while True:
             with self._lock:
                 mission = self._mission
                 goal = mission.current if mission is not None else None
             if goal is None:
-                return goal_objects, obstacle_objects, goal_spec
+                return goal_objects, obstacle_objects, goal_spec, belief_tracker
 
             if goal.kind == GoalKind.DONE:
                 with self._lock:
@@ -1376,7 +1476,8 @@ class RoverController:
                     self._world_goal = None
                     self._mission = None
                 self._mission_target_yaw = None
-                return goal_objects, obstacle_objects, goal_spec
+                self._event_log.log("mission_complete")
+                return goal_objects, obstacle_objects, goal_spec, belief_tracker
 
             if goal.kind in (GoalKind.GO_TO, GoalKind.FIND):
                 # Single front-facing DINO resolve on whatever's already in
@@ -1387,6 +1488,9 @@ class RoverController:
                 # (e.g. a blue cuboid grounding "flag") pick the bearing the
                 # rover then turned to face and re-resolved against. Disabled
                 # for now -- see this session's flag-misdetection debugging.
+                # (_sweep_goal_beliefs below is a different, lower-stakes use
+                # of the same detector -- it only ever seeds a passive belief,
+                # never itself re-orients the rover.)
                 goal_objects, obstacle_objects, goal_spec = self._do_resolve(
                     env,
                     step,
@@ -1412,15 +1516,62 @@ class RoverController:
                             f"[mission] resolved: {goal_spec.instruction_text}"
                         )
                 if resolved:
-                    # No sweep-tracker sighting to seed belief_tracker from
-                    # here -- MODE_RESOLVE's own per-tick fallback
+                    # Fresh sighting -- (re)anchor this goal's persistent
+                    # belief and discard whatever it held before: belief_g is
+                    # reset to None so MODE_RESOLVE's own per-tick fallback
                     # (self._ground_target_world -> body_frame_goal ->
                     # observe_body_point, see the MODE_RESOLVE branch below)
-                    # already re-seeds it from the same ground_target_world
+                    # re-seeds it from the same ground_target_world
                     # _do_resolve just set, as soon as the target is next
-                    # in-frame.
-                    return goal_objects, obstacle_objects, goal_spec
-                print(f"[mission] step {goal.raw!r} failed to resolve -- skipping")
+                    # in-frame -- same reset _do_resolve's ad-hoc caller
+                    # already relies on for its own single shared tracker.
+                    belief_tracker = goal_beliefs.setdefault(
+                        goal.target, self._new_belief_tracker()
+                    )
+                    belief_tracker.belief_g = None
+                    return goal_objects, obstacle_objects, goal_spec, belief_tracker
+
+                prior = goal_beliefs.get(goal.target)
+                if (
+                    prior is not None
+                    and prior.belief_g is not None
+                    and prior.uncertainty_value() < self.uncertainty_cov_threshold
+                ):
+                    # Not in the frame this step started on, but a previous
+                    # sighting (an earlier leg's periodic _sweep_goal_beliefs
+                    # hit, most likely) left a still-confident belief for this
+                    # exact target -- resume driving toward it rather than
+                    # abandoning the step. No mask/obstacle registration here
+                    # (goal_objects/obstacle_objects are already empty --
+                    # _do_resolve's failure path clears them same as always),
+                    # and goal_spec content doesn't matter to the driving
+                    # policy (NavdpUpstreamPolicy.act_verbose only reads the
+                    # body-frame point set via policy.set_goal_body, see this
+                    # module's docstring) -- a placeholder is safe, same one
+                    # _env_loop starts with before any resolve has happened.
+                    with self._lock:
+                        self._mode = MODE_RESOLVE
+                        self.display.status_text = (
+                            f"[mission] resuming toward previously-sighted "
+                            f"'{goal.target}'"
+                        )
+                        self.display.goal_reached = False
+                    placeholder_spec = GoalSpec(
+                        goal_bbox_norm=(0.0, 0.0, 1.0, 1.0),
+                        obstacle_bboxes_norm=[],
+                        instruction_text=(
+                            f"Navigate to the {goal.target} (from memory)."
+                        ),
+                    )
+                    return goal_objects, obstacle_objects, placeholder_spec, prior
+
+                print(
+                    f"[mission] step {goal.raw!r} failed to resolve and no "
+                    "usable prior belief -- skipping"
+                )
+                self._event_log.log(
+                    "mission_subgoal_skipped", step=goal.raw, target=goal.target
+                )
                 with self._lock:
                     if self._mission is mission:
                         self._mission.advance()
@@ -1431,7 +1582,7 @@ class RoverController:
                     self._world_goal = (self.start_x, self.start_z)
                     self._mode = MODE_POINT
                     self.display.goal_reached = False
-                return goal_objects, obstacle_objects, goal_spec
+                return goal_objects, obstacle_objects, goal_spec, belief_tracker
 
             if goal.kind == GoalKind.TURN:
                 pose = self.display.pose
@@ -1445,7 +1596,45 @@ class RoverController:
                 with self._lock:
                     self._mode = MODE_TURN
                     self.display.goal_reached = False
-                return goal_objects, obstacle_objects, goal_spec
+                return goal_objects, obstacle_objects, goal_spec, belief_tracker
+
+    def _sweep_goal_beliefs(self, mission, rgb, depth, goal_beliefs) -> None:
+        """Opportunistic multi-goal check against the current frame while a
+        Mission is driving normally (no rotation, unlike
+        dino_grounding_resolver.sweep_and_seed_beliefs's 360deg scan) --
+        called every self.mission_belief_sweep_every ticks from _env_loop.
+        Checks every GO_TO/FIND target from the mission's CURRENT step
+        onward (already-completed steps aren't worth the DINO call) against
+        this one frame, and seeds/refreshes goal_beliefs for whichever ones
+        hit -- including the currently active goal: its own live-mask/
+        ground-truth-anchor path (self._ground_target_world) already
+        re-derives it every tick when in view, so a sweep hit on it is either
+        redundant (overwritten again next tick) or, when that anchor is
+        itself out of view, the only correction available -- both cases want
+        inclusion, not exclusion. This never changes self._mode/drives the
+        rover by itself; it only ever seeds a passive belief later consumed
+        (or not) by _start_mission_subgoal."""
+        queries = {
+            g.target
+            for g in mission.goals[mission.idx :]
+            if g.kind in (GoalKind.GO_TO, GoalKind.FIND)
+        }
+        if not queries:
+            return
+        hits = dino_grounding_resolver.detect_in_frame(
+            rgb,
+            depth,
+            list(queries),
+            HFOV_DEG,
+            dino_model_id=self.dino_model_id,
+            dino_device=self.dino_device,
+            dino_box_threshold=self.dino_box_threshold,
+            dino_text_threshold=self.dino_text_threshold,
+        )
+        for query, (forward, left) in hits.items():
+            goal_beliefs.setdefault(
+                query, self._new_belief_tracker()
+            ).observe_body_point(forward, left)
 
     def _new_belief_tracker(self) -> BeliefGoalTracker:
         # odom_noise/odom_noise_growth_rate drive uncertainty_value()'s real
@@ -1543,6 +1732,9 @@ class RoverController:
             # previously only visible by reading the (often truncated)
             # sidebar status text.
             print(f"[nav resolve] failed: {exc}")
+            self._event_log.log(
+                "goal_detect_failed", name=target_text, reason=str(exc)
+            )
             with self._lock:
                 self.display.status_text = f"resolve failed: {exc}"
             # goal_objects/obstacle_objects are already emptied (cleared
@@ -1674,10 +1866,23 @@ class RoverController:
                 f"reviewing resolved goal: '{instruction}' -- "
                 "Confirm to drive, Rerun to retry, or Pick Manually"
             )
+            gx, gy, gz = goal_position
+            self._event_log.log(
+                "goal_detected",
+                name=target_text or goal_spec_r.instruction_text,
+                method="dino" if target_text else "sam2+qwen",
+                world=(round(gx, 2), round(gy, 2), round(gz, 2)),
+                fallback=used_fallback,
+            )
         else:
             status_msg = (
                 "resolved goal has no valid depth -- skipping mask "
                 "(Rerun or Pick Manually)"
+            )
+            self._event_log.log(
+                "goal_detect_failed",
+                name=target_text or goal_spec_r.instruction_text,
+                reason="no valid depth",
             )
             # This is the case the user needs to actually see: the VLM did
             # pick a goal (goal_spec_r.instruction_text above reflects it),
