@@ -261,6 +261,8 @@ class RoverController:
         dino_text_threshold: float = dino_grounding_resolver.DEFAULT_TEXT_THRESHOLD,
         mission_sweep_yaws: int = 8,
         mission_belief_sweep_every: int = 15,
+        mission_belief_cov_growth: float = 0.0002,
+        mission_belief_cov_growth_rate: float = 0.0,
         annotations_dir: Optional[str] = DEFAULT_ANNOTATIONS_DIR,
         annotation_categories: Optional[Sequence[str]] = None,
         uncertainty_enabled: bool = True,
@@ -351,6 +353,20 @@ class RoverController:
         # (a mission step can still resolve via _do_resolve's own front-facing
         # check when it starts, same as before this feature existed).
         self.mission_belief_sweep_every = int(mission_belief_sweep_every)
+
+        # Growth rate for beliefs seeded passively by _sweep_goal_beliefs (a goal
+        # other than the one currently being driven to, possibly not seen again for
+        # the rest of that leg -- tens of seconds to minutes). Deliberately much
+        # slower than uncertainty_cov_growth below: that rate is tuned for the
+        # uncertainty-halt's live-tracking use case (a goal briefly losing its mask
+        # for a couple seconds), and reusing it here made any sweep-seeded belief
+        # decay past uncertainty_cov_threshold within ~1s of the sighting -- almost
+        # always before the mission actually reached that goal, defeating the sweep
+        # entirely (see nav/rover_controller.py's _start_mission_subgoal "usable
+        # prior belief" check). Trackers promoted to actively-driven (see
+        # _activate_belief_tracker) switch back to the tight halt-tuned rate.
+        self.mission_belief_cov_growth = float(mission_belief_cov_growth)
+        self.mission_belief_cov_growth_rate = float(mission_belief_cov_growth_rate)
 
         self.uncertainty_enabled = bool(uncertainty_enabled)
         self.uncertainty_cov_threshold = float(uncertainty_cov_threshold)
@@ -1529,6 +1545,7 @@ class RoverController:
                         goal.target, self._new_belief_tracker()
                     )
                     belief_tracker.belief_g = None
+                    self._activate_belief_tracker(belief_tracker)
                     return goal_objects, obstacle_objects, goal_spec, belief_tracker
 
                 prior = goal_beliefs.get(goal.target)
@@ -1563,6 +1580,7 @@ class RoverController:
                             f"Navigate to the {goal.target} (from memory)."
                         ),
                     )
+                    self._activate_belief_tracker(prior)
                     return goal_objects, obstacle_objects, placeholder_spec, prior
 
                 print(
@@ -1633,26 +1651,62 @@ class RoverController:
         )
         for query, (forward, left) in hits.items():
             goal_beliefs.setdefault(
-                query, self._new_belief_tracker()
+                query, self._new_belief_tracker(mission_sweep=True)
             ).observe_body_point(forward, left)
+            # Silent before this: a sweep hit only ever showed up indirectly, as
+            # whatever _start_mission_subgoal later did with the belief it seeded
+            # -- logged explicitly so a periodic sweep is actually observable/
+            # debuggable from the event log instead of inferred after the fact.
+            self._event_log.log(
+                "mission_sweep_hit",
+                name=query,
+                forward=round(float(forward), 2),
+                left=round(float(left), 2),
+            )
 
-    def _new_belief_tracker(self) -> BeliefGoalTracker:
+    def _new_belief_tracker(self, *, mission_sweep: bool = False) -> BeliefGoalTracker:
         # odom_noise/odom_noise_growth_rate drive uncertainty_value()'s real
         # growth while the goal mask is unseen (sam_vla.core.belief_tracking's
         # accelerating-drift formula) -- what the uncertainty halt below
         # compares against uncertainty_cov_threshold. Zero unless the halt is
         # enabled, so a disabled run doesn't silently start dead-reckoning
         # noisier than before.
-        odom_noise = self.uncertainty_cov_growth if self.uncertainty_enabled else 0.0
-        odom_noise_growth_rate = (
-            self.uncertainty_cov_growth_rate if self.uncertainty_enabled else 0.0
-        )
+        #
+        # mission_sweep=True is for trackers _sweep_goal_beliefs seeds passively
+        # for a goal not currently being driven to -- see mission_belief_cov_growth
+        # above for why these need a much slower rate than the actively-driven
+        # tracker's halt-tuned one. Callers that promote such a tracker to actively
+        # driven must switch it back via _activate_belief_tracker.
+        if mission_sweep:
+            odom_noise = (
+                self.mission_belief_cov_growth if self.uncertainty_enabled else 0.0
+            )
+            odom_noise_growth_rate = (
+                self.mission_belief_cov_growth_rate if self.uncertainty_enabled else 0.0
+            )
+        else:
+            odom_noise = self.uncertainty_cov_growth if self.uncertainty_enabled else 0.0
+            odom_noise_growth_rate = (
+                self.uncertainty_cov_growth_rate if self.uncertainty_enabled else 0.0
+            )
         return BeliefGoalTracker(
             hfov_deg=HFOV_DEG,
             goal_range=self.belief_goal_range,
             min_px=self.lost_goal_min_px,
             odom_noise=odom_noise,
             odom_noise_growth_rate=odom_noise_growth_rate,
+        )
+
+    def _activate_belief_tracker(self, bt: BeliefGoalTracker) -> None:
+        """Switch a belief tracker to the tight, halt-tuned growth rate at the
+        moment it becomes the actively-driven belief_tracker (see
+        _start_mission_subgoal's two return points below) -- undoes the loose
+        mission_sweep=True rate a passively-seeded tracker may have started
+        with, so the uncertainty halt still fires on its normal schedule once
+        the rover is actually depending on this belief to drive."""
+        bt.odom_noise = self.uncertainty_cov_growth if self.uncertainty_enabled else 0.0
+        bt.odom_noise_growth_rate = (
+            self.uncertainty_cov_growth_rate if self.uncertainty_enabled else 0.0
         )
 
     def _new_avoidance(self) -> CbfObstacleAvoidance:

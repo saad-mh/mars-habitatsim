@@ -43,7 +43,7 @@ from sam_vla.goal_resolution import first_frame_resolver
 
 DEFAULT_DINO_MODEL_ID = "IDEA-Research/grounding-dino-tiny"
 DEFAULT_DINO_DEVICE = "cuda"
-DEFAULT_BOX_THRESHOLD = 0.35
+DEFAULT_BOX_THRESHOLD = 0.7
 DEFAULT_TEXT_THRESHOLD = 0.25
 
 # Lazily constructed/cached GroundingDINODetector instances, keyed by the

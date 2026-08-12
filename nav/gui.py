@@ -1140,6 +1140,8 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         dino_box_threshold=args.dino_box_threshold,
         dino_text_threshold=args.dino_text_threshold,
         mission_belief_sweep_every=args.mission_belief_sweep_every,
+        mission_belief_cov_growth=args.mission_belief_cov_growth,
+        mission_belief_cov_growth_rate=args.mission_belief_cov_growth_rate,
         uncertainty_enabled=not args.no_uncertainty_halt,
         uncertainty_cov_threshold=args.cov_threshold,
         uncertainty_cov_growth=args.cov_growth,
@@ -1310,6 +1312,25 @@ def parse_args(argv=None) -> argparse.Namespace:
         "driving toward an earlier one in the same instruction isn't forgotten by "
         "the time the mission reaches it (default 15; <= 0 disables the periodic "
         "sweep)",
+    )
+    ap.add_argument(
+        "--mission-belief-cov-growth",
+        type=float,
+        default=0.0002,
+        help="per-tick belief-uncertainty growth for a goal sighted by the "
+        "periodic mission sweep above but not currently being driven to -- kept "
+        "far below --cov-growth (that rate is tuned for a goal briefly losing its "
+        "mask for a couple seconds while actively tracked; reusing it here decayed "
+        "a sweep-seeded belief past --cov-threshold within ~1s, defeating the "
+        "sweep) so a sighting can survive the rest of the leg until the mission "
+        "actually reaches that goal (default 0.0002)",
+    )
+    ap.add_argument(
+        "--mission-belief-cov-growth-rate",
+        type=float,
+        default=0.0,
+        help="accelerating-drift factor for --mission-belief-cov-growth (default "
+        "0.0, i.e. flat per-tick growth unless overridden)",
     )
     ap.add_argument(
         "--no-uncertainty-halt",

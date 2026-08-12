@@ -20,6 +20,8 @@ import requests
 from habitat_sim.agent import AgentConfiguration
 from PIL import Image, ImageDraw
 
+from belief_pixel_goal import GaussianGoalBelief
+
 
 HERE = Path(__file__).resolve().parent
 SIZE_X = 50.0
@@ -1233,6 +1235,36 @@ def parser() -> argparse.ArgumentParser:
         "--goal-mode", choices=["point", "pixel"], default="point"
     )
     argument_parser.add_argument(
+        "--belief-pixel-goal",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the live semantic goal mask to correct a body-frame Gaussian "
+            "belief and its projected mean as NavDP's PixelGoal while occluded."
+        ),
+    )
+    argument_parser.add_argument("--belief-minimum-goal-pixels", type=int, default=10)
+    argument_parser.add_argument("--belief-measurement-std", type=float, default=0.05)
+    argument_parser.add_argument(
+        "--belief-translation-process-std", type=float, default=0.03
+    )
+    argument_parser.add_argument(
+        "--belief-yaw-process-std-deg", type=float, default=1.0
+    )
+    argument_parser.add_argument(
+        "--belief-bootstrap-world-goal",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Simulation-only bootstrap when the goal is initially invisible. "
+            "Disable for a strict detector-only evaluation."
+        ),
+    )
+    argument_parser.add_argument("--belief-bootstrap-std", type=float, default=0.50)
+    argument_parser.add_argument("--belief-ghost-base-radius", type=int, default=10)
+    argument_parser.add_argument("--belief-ghost-covariance-scale", type=float, default=2.0)
+    argument_parser.add_argument("--belief-ghost-maximum-radius", type=int, default=80)
+    argument_parser.add_argument(
         "--qwen-model-id", default="Qwen/Qwen2.5-VL-3B-Instruct"
     )
     argument_parser.add_argument("--qwen-device", default="auto")
@@ -1457,8 +1489,22 @@ def main() -> None:
     np.random.seed(args.seed)
     if args.goal_x is None or args.goal_z is None:
         raise ValueError("fixed PointGoal requires --goal-x and --goal-z")
-    if args.qwen_homotopy and args.goal_mode != "point":
-        raise ValueError("Qwen homotopy selection currently requires --goal-mode point")
+    if args.belief_pixel_goal and args.goal_mode != "pixel":
+        raise ValueError("--belief-pixel-goal requires --goal-mode pixel")
+    if args.belief_pixel_goal and not args.goal_mesh:
+        raise ValueError(
+            "simulation belief tracking requires --goal-mesh so a live semantic "
+            "goal observation exists"
+        )
+    if args.belief_minimum_goal_pixels < 1:
+        raise ValueError("belief-minimum-goal-pixels must be positive")
+    if min(
+        args.belief_measurement_std,
+        args.belief_translation_process_std,
+        args.belief_yaw_process_std_deg,
+        args.belief_bootstrap_std,
+    ) < 0.0:
+        raise ValueError("belief uncertainty parameters must be non-negative")
     if args.robot_radius < 0.0:
         raise ValueError("robot-radius must be non-negative")
     if args.obstacle_velocity_xz and args.obstacle_mode != "mesh":
@@ -1543,6 +1589,19 @@ def main() -> None:
         )
         agent = simulator.initialize_agent(0)
         intrinsic = camera_intrinsic(args.height, args.width, args.hfov_deg)
+        goal_belief = (
+            GaussianGoalBelief(
+                intrinsic,
+                (args.height, args.width),
+                minimum_visible_pixels=args.belief_minimum_goal_pixels,
+                measurement_std=args.belief_measurement_std,
+                translation_process_std=args.belief_translation_process_std,
+                yaw_process_std=math.radians(args.belief_yaw_process_std_deg),
+            )
+            if args.belief_pixel_goal
+            else None
+        )
+        previous_executed_action = np.zeros(3, dtype=np.float32)
         x, z = float(args.start_x), float(args.start_z)
         yaw = math.radians(float(args.start_yaw_deg))
         dt = 1.0 / float(args.hz)
@@ -1608,6 +1667,14 @@ def main() -> None:
                 "pose",
                 "action_3d",
                 "point_goal",
+                "belief_goal_mu",
+                "belief_goal_covariance",
+                "belief_goal_pixel",
+                "belief_goal_visible",
+                "belief_goal_source",
+                "belief_goal_time_since_seen",
+                "belief_goal_bearing_rad",
+                "belief_goal_pixel_sigma",
                 "selected_trajectory",
                 "all_trajectories",
                 "all_values",
@@ -1637,7 +1704,16 @@ def main() -> None:
                 "qwen_homotopy_queried",
         ]
         if args.archive_observations:
-            row_keys.extend(("rgb", "depth", "goal_mask", "obstacle_mask"))
+            row_keys.extend(
+                (
+                    "rgb",
+                    "depth",
+                    "goal_mask",
+                    "live_goal_mask",
+                    "ghost_goal_mask",
+                    "obstacle_mask",
+                )
+            )
         rows: dict[str, list[Any]] = {key: [] for key in row_keys}
         video_frames: list[Image.Image] = []
         success = False
@@ -1646,6 +1722,8 @@ def main() -> None:
         for step in range(int(args.max_steps)):
             y = terrain.local_height_max(x, z, args.pose_terrain_radius) + args.clearance
             position = np.asarray([x, y, z], dtype=np.float32)
+            if goal_belief is not None and step > 0:
+                goal_belief.predict(previous_executed_action, dt)
             set_agent_pose(agent, position, yaw)
             if mesh_placed:
                 elapsed_seconds = step * dt
@@ -1692,13 +1770,70 @@ def main() -> None:
             point_goal = np.asarray(
                 [max(goal_forward, 0.0), -goal_right], dtype=np.float32
             )
-            if args.goal_mesh:
+            live_goal_mask = np.zeros(depth.shape, dtype=np.uint8)
+            ghost_goal_mask = np.zeros(depth.shape, dtype=np.uint8)
+            belief_goal_visible = False
+            belief_goal_source = "DISABLED"
+            belief_goal_mu = np.full(2, np.nan, dtype=np.float32)
+            belief_goal_covariance = np.full((2, 2), np.nan, dtype=np.float32)
+            belief_goal_pixel = np.full(2, -1, dtype=np.int32)
+            belief_goal_time_since_seen = float("nan")
+            belief_goal_bearing = float("nan")
+            belief_goal_pixel_sigma = float("nan")
+
+            if goal_belief is not None:
                 assert semantic is not None
-                goal_mask = (semantic == MESH_GOAL_ID).astype(np.uint8)
-                # The obstacle may visually occlude the real goal mesh in the
-                # intentionally collinear test. Keep its projected fixed-goal
-                # overlay visible for Qwen without changing the numeric PointGoal.
-                if not np.any(goal_mask):
+                live_goal_mask = (semantic == MESH_GOAL_ID).astype(np.uint8)
+                belief_goal_visible = goal_belief.observe(live_goal_mask, depth)
+                bootstrapped = False
+                if not goal_belief.initialized:
+                    if not args.belief_bootstrap_world_goal:
+                        raise RuntimeError(
+                            "goal belief is uninitialized because the live goal mask "
+                            "has not been observed; start with the goal visible or pass "
+                            "--belief-bootstrap-world-goal for simulation"
+                        )
+                    goal_belief.initialize(
+                        np.asarray([goal_forward, -goal_right], dtype=np.float32),
+                        args.belief_bootstrap_std,
+                    )
+                    bootstrapped = True
+                belief_projection = goal_belief.project(
+                    base_radius=args.belief_ghost_base_radius,
+                    covariance_scale=args.belief_ghost_covariance_scale,
+                    maximum_radius=args.belief_ghost_maximum_radius,
+                )
+                planner_goal = belief_projection.pixel_uv
+                ghost_goal_mask = belief_projection.mask
+                goal_mask = live_goal_mask if belief_goal_visible else ghost_goal_mask
+                belief_goal_source = (
+                    "LIVE"
+                    if belief_goal_visible
+                    else ("WORLD_BOOTSTRAP" if bootstrapped else "GHOST")
+                )
+                assert goal_belief.mu is not None and goal_belief.Sigma is not None
+                belief_goal_mu = goal_belief.mu.copy()
+                belief_goal_covariance = goal_belief.Sigma.copy()
+                belief_goal_pixel = belief_projection.pixel_uv.copy()
+                belief_goal_time_since_seen = goal_belief.time_since_seen
+                belief_goal_bearing = belief_projection.bearing_rad
+                belief_goal_pixel_sigma = belief_projection.pixel_sigma
+            else:
+                if args.goal_mesh:
+                    assert semantic is not None
+                    live_goal_mask = (semantic == MESH_GOAL_ID).astype(np.uint8)
+                    goal_mask = live_goal_mask
+                    if not np.any(goal_mask):
+                        goal_mask, _ = project_world_mask(
+                            goal,
+                            position,
+                            yaw,
+                            intrinsic,
+                            args.height,
+                            args.width,
+                            args.goal_radius,
+                        )
+                else:
                     goal_mask, _ = project_world_mask(
                         goal,
                         position,
@@ -1708,18 +1843,8 @@ def main() -> None:
                         args.width,
                         args.goal_radius,
                     )
-            else:
-                goal_mask, _ = project_world_mask(
-                    goal,
-                    position,
-                    yaw,
-                    intrinsic,
-                    args.height,
-                    args.width,
-                    args.goal_radius,
-                )
-            planner_goal = point_goal
-            if args.goal_mode == "pixel":
+                planner_goal = point_goal
+            if args.goal_mode == "pixel" and goal_belief is None:
                 planner_goal = world_goal_to_pixel(
                     goal, position, yaw, intrinsic, args.height, args.width
                 )
@@ -1837,6 +1962,7 @@ def main() -> None:
             )
 
             next_position, next_yaw = integrate_mars(position, yaw, action, dt)
+            previous_executed_action = action.copy()
             x = float(np.clip(next_position[0], -args.size_x / 2.0 + 0.5, args.size_x / 2.0 - 0.5))
             z = float(np.clip(next_position[2], -args.size_z / 2.0 + 0.5, args.size_z / 2.0 - 0.5))
             yaw = wrap_angle(next_yaw)
@@ -1859,10 +1985,20 @@ def main() -> None:
                 rows["rgb"].append(rgb)
                 rows["depth"].append(depth)
                 rows["goal_mask"].append(goal_mask)
+                rows["live_goal_mask"].append(live_goal_mask)
+                rows["ghost_goal_mask"].append(ghost_goal_mask)
                 rows["obstacle_mask"].append(obstacle_mask)
             rows["pose"].append(pose)
             rows["action_3d"].append(action)
             rows["point_goal"].append(planner_goal)
+            rows["belief_goal_mu"].append(belief_goal_mu)
+            rows["belief_goal_covariance"].append(belief_goal_covariance)
+            rows["belief_goal_pixel"].append(belief_goal_pixel)
+            rows["belief_goal_visible"].append(belief_goal_visible)
+            rows["belief_goal_source"].append(belief_goal_source)
+            rows["belief_goal_time_since_seen"].append(belief_goal_time_since_seen)
+            rows["belief_goal_bearing_rad"].append(belief_goal_bearing)
+            rows["belief_goal_pixel_sigma"].append(belief_goal_pixel_sigma)
             rows["selected_trajectory"].append(result.trajectory)
             rows["all_trajectories"].append(result.all_trajectories)
             rows["all_values"].append(result.all_values)
@@ -1922,6 +2058,8 @@ def main() -> None:
                 )
                 label = (
                     f"t={step} goal={goal_distance:.2f}m qwen_side={side_label} pixels={len(obstacle_pixels)} "
+                    f"goal_src={belief_goal_source} "
+                    f"goal_sigma_px={belief_goal_pixel_sigma:.1f} "
                     f"pred={result.selected_minimum_clearance:.2f}m "
                     f"actual={surface_clearance:.2f}m "
                     f"mode={result.selected_circulation_sign:+.0f} "
@@ -1942,6 +2080,8 @@ def main() -> None:
             print(
                 f"step={step:04d} goal={goal_distance:.2f}m "
                 f"qwen_side={homotopy_decision.side if homotopy_decision else 'AUTO'} "
+                f"goal_src={belief_goal_source} "
+                f"goal_sigma_px={belief_goal_pixel_sigma:.1f} "
                 f"pixels={len(obstacle_pixels)} valid={result.valid_obstacle_points} "
                 f"selected={result.selected_index} fallback={result.fallback_stop} "
                 f"escape={result.escape_turn} mode={result.selected_circulation_sign:+.0f} "
@@ -1996,6 +2136,7 @@ def main() -> None:
             evaluation_layout=np.asarray(args.evaluation_layout),
             seed=np.asarray(args.seed, dtype=np.int64),
             goal_mode=np.asarray(args.goal_mode),
+            belief_pixel_goal=np.asarray(args.belief_pixel_goal),
         )
         with (output_directory / "manifest.json").open("w", encoding="utf-8") as file:
             json.dump(
@@ -2024,6 +2165,13 @@ def main() -> None:
                     "particle_energy_reweighting": args.particle_energy_reweighting,
                     "particle_collision_mask": args.particle_collision_mask,
                     "goal_mode": args.goal_mode,
+                    "belief_pixel_goal": args.belief_pixel_goal,
+                    "belief_source": "semantic_goal_mask_plus_odometry",
+                    "belief_bootstrap_world_goal": args.belief_bootstrap_world_goal,
+                    "belief_measurement_std": args.belief_measurement_std,
+                    "belief_translation_process_std": args.belief_translation_process_std,
+                    "belief_yaw_process_std_deg": args.belief_yaw_process_std_deg,
+                    "belief_covariance_controls_navdp_mask_size": False,
                     "particle_noise_schedule": args.particle_noise_schedule,
                     "progressive_guidance": args.progressive_guidance,
                     "mesh_obstacle_count": len(mesh_centroids),
