@@ -22,7 +22,7 @@ PROFILE="${PROFILE:-smoke}"
 EXPERIMENT_SET="${EXPERIMENT_SET:-core}"
 # Zero means every requested episode runs and overwrites its old archive.
 SKIP_COMPLETED="${SKIP_COMPLETED:-0}"
-SAVE_MEDIA="${SAVE_MEDIA:-0}"
+SAVE_MEDIA="${SAVE_MEDIA:-1}"
 MAX_STEPS="${MAX_STEPS:-800}"
 BOOTSTRAP_SAMPLES="${BOOTSTRAP_SAMPLES:-10000}"
 
@@ -35,8 +35,12 @@ GUIDANCE_STRENGTH="${GUIDANCE_STRENGTH:-0.95}"
 ROBOT_RADIUS="${ROBOT_RADIUS:-0.24}"
 OBSTACLE_HALF_EXTENT="${OBSTACLE_HALF_EXTENT:-0.75}"
 OBSTACLE_HEIGHT="${OBSTACLE_HEIGHT:-1.40}"
-SAFE_DISTANCE="${SAFE_DISTANCE:-0.70}"
-HARD_COLLISION_DISTANCE="${HARD_COLLISION_DISTANCE:-0.35}"
+SAFE_DISTANCE="${SAFE_DISTANCE:-1.00}"
+HARD_COLLISION_DISTANCE="${HARD_COLLISION_DISTANCE:-0.45}"
+LYAPUNOV_WEIGHT="${LYAPUNOV_WEIGHT:-2.0}"
+BARRIER_WEIGHT="${BARRIER_WEIGHT:-50}"
+CIRCULATION_ACTIVATION_DISTANCE="${CIRCULATION_ACTIVATION_DISTANCE:-3.00}"
+MAXIMUM_OBSTACLE_DEPTH="${MAXIMUM_OBSTACLE_DEPTH:-10.0}"
 
 case "${PROFILE}" in
     smoke)
@@ -159,18 +163,18 @@ COMMON=(
     --safe-distance "${SAFE_DISTANCE}"
     --hard-collision-distance "${HARD_COLLISION_DISTANCE}"
     --safety-weight 70
-    --barrier-weight 50
+    --barrier-weight "${BARRIER_WEIGHT}"
     --barrier-rate 0.15
     --circulation-weight 25
-    --circulation-activation-distance 2.20
+    --circulation-activation-distance "${CIRCULATION_ACTIVATION_DISTANCE}"
     --circulation-activation-sharpness 0.25
     --minimum-circulation-progress 0.035
     --blocking-alignment-threshold 0.15
     --circulation-switch-weight 3.0
     --escape-lateral-target 0.40
-    --maximum-obstacle-depth 8.0
+    --maximum-obstacle-depth "${MAXIMUM_OBSTACLE_DEPTH}"
     --max-steps "${MAX_STEPS}"
-    --no-overlay-masks
+    --overlay-masks
     "${MEDIA_ARGS[@]}"
 )
 
@@ -235,13 +239,13 @@ run_core() {
     # Eight matched variants isolate CBF, Lyapunov, their interaction,
     # in-denoising feedback, local exploration, and energy weighting.
     run_episode pure_navdp "${base[@]}" --planner-mode pure-navdp --no-qwen-homotopy
-    run_episode particle_full_p2 "${base[@]}" --lyapunov-weight 4
-    run_episode particle_no_cbf_barrier "${base[@]}" --lyapunov-weight 4 --barrier-weight 0
+    run_episode particle_full_p2 "${base[@]}" --lyapunov-weight "${LYAPUNOV_WEIGHT}"
+    run_episode particle_no_cbf_barrier "${base[@]}" --lyapunov-weight "${LYAPUNOV_WEIGHT}" --barrier-weight 0
     run_episode particle_no_lyapunov "${base[@]}" --lyapunov-weight 0
     run_episode particle_no_cbf_no_lyapunov "${base[@]}" --lyapunov-weight 0 --barrier-weight 0
-    run_episode particle_no_denoise_feedback "${base[@]}" --lyapunov-weight 4 --guidance-strength 0
-    run_episode particle_p1 "${base[@]}" --lyapunov-weight 4 --particles 1
-    run_episode particle_uniform_weights "${base[@]}" --lyapunov-weight 4 --no-particle-energy-reweighting
+    run_episode particle_no_denoise_feedback "${base[@]}" --lyapunov-weight "${LYAPUNOV_WEIGHT}" --guidance-strength 0
+    run_episode particle_p1 "${base[@]}" --lyapunov-weight "${LYAPUNOV_WEIGHT}" --particles 1
+    run_episode particle_uniform_weights "${base[@]}" --lyapunov-weight "${LYAPUNOV_WEIGHT}" --no-particle-energy-reweighting
 }
 
 run_mechanisms() {

@@ -46,7 +46,7 @@ FRAME_BURST_SIZE = {
 # This module never compares covariance against this threshold itself -- the
 # caller decides when to enter uncertainty mode and hands the crossed value
 # in via UncertaintyContext.threshold_used, purely for HCI logging.
-DEFAULT_COVARIANCE_THRESHOLD = 0.15
+DEFAULT_COVARIANCE_THRESHOLD = 0.25
 DEFAULT_MAX_UNITS = 5.0
 UNCERTAINTY_ROVER_FRONT_REFERENCE_DEG = 0.0
 

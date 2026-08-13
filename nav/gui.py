@@ -220,7 +220,6 @@ class NavGuiApp:
         root.grid_columnconfigure(0, weight=3)
         root.grid_columnconfigure(1, weight=1, minsize=self.SIDEBAR_MIN_W)
 
-        mono_font = ctk.CTkFont(family="Consolas", size=12)
         mode_font = ctk.CTkFont(size=17, weight="bold")
 
         # ---------------- camera hero (REACH P7: point-and-select) ------- #
@@ -307,18 +306,6 @@ class NavGuiApp:
             "<Configure>",
             lambda e: self.detail_label.configure(wraplength=max(200, e.width - 20)),
         )
-        # REACH P6: verbose numeric telemetry is deliberately de-emphasized
-        # (small, grey, mono) -- present for an operator who wants it, but
-        # never competing with the primary status above.
-        self.telemetry_label = ctk.CTkLabel(
-            self.status_panel,
-            text="",
-            anchor="w",
-            justify="left",
-            font=mono_font,
-            text_color="#9ca3af",
-        )
-        self.telemetry_label.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 8))
         self.alive_label = ctk.CTkLabel(
             self.status_panel,
             text="controller thread died -- see console",
@@ -370,17 +357,19 @@ class NavGuiApp:
         ).grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=BTN_GAP // 2)
         # REACH P1: open-vocabulary grounding -- name a target the segmenter
         # wasn't trained on; produces the same reviewable goal.
-        ctk.CTkButton(
-            target, text="Ground Target", height=BTN_H, command=self.ground_target
-        ).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=BTN_GAP // 2)
-        # REACH P1: free-text open-vocabulary entry feeding Ground Target.
-        self.ground_entry = ctk.CTkEntry(
-            target, placeholder_text='name it: "flag" / "blue cuboid"', height=38
-        )
-        self.ground_entry.grid(
-            row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, BTN_GAP)
-        )
-        self.ground_entry.bind("<Return>", lambda e: self.ground_target())
+        #######################################################
+        # ctk.CTkButton(
+        #     target, text="Ground Target", height=BTN_H, command=self.ground_target
+        # ).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=BTN_GAP // 2)
+        # # REACH P1: free-text open-vocabulary entry feeding Ground Target.
+        # self.ground_entry = ctk.CTkEntry(
+        #     target, placeholder_text='name it: "flag" / "blue cuboid"', height=38
+        # )
+        # self.ground_entry.grid(
+        #     row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, BTN_GAP)
+        # )
+        # self.ground_entry.bind("<Return>", lambda e: self.ground_target())
+        #######################################################
         # REACH P10 (autonomy): let the rover self-select a plausible
         # exploration goal when the operator has no specific target.
         ctk.CTkButton(
@@ -717,7 +706,10 @@ class NavGuiApp:
         # Skip root-level keyboard shortcuts while a text entry has focus,
         # so typing there doesn't also drive the rover / trigger a heading
         # submission (see the binding loops above).
-        if self.root.focus_get() in (self.command_entry, self.ground_entry):
+        if self.root.focus_get() in (
+            self.command_entry,
+            getattr(self, "ground_entry", None),
+        ):
             return
         fn(*fn_args)
 
@@ -919,34 +911,13 @@ class NavGuiApp:
 
         mode_txt = d.mode.upper().replace("_", " ")
         if d.goal_reached:
-            mode_txt += "  ✓ GOAL REACHED"
+            mode_txt += " GOAL REACHED"
         self.mode_label.configure(
             text=mode_txt, text_color=MODE_COLORS.get(d.mode, "#e5e7eb")
         )
         # REACH P9: prefer the freshest human ack, fall back to controller
         # status text -- so the header reacts on the same frame as a press.
         self.detail_label.configure(text=self._ack_text or d.status_text)
-
-        pose_txt = (
-            f"pose ({d.pose.x:.1f}, {d.pose.z:.1f}, yaw={math.degrees(d.pose.yaw):.0f}deg)"
-            if d.pose is not None
-            else "pose: -"
-        )
-        act = d.action
-        cbf_txt = ""
-        if d.cbf_info.get("blocked"):
-            cbf_txt = "  CBF:orbit" if d.cbf_info.get("orbiting") else "  CBF:blocked"
-        if d.cbf_info.get("hard_gate_fired"):
-            cbf_txt += "  CBF:hard-gate"
-        unc_txt = (
-            f"   unc={d.uncertainty_value:.2f}/{d.uncertainty_threshold:.2f}"
-            if d.uncertainty_enabled
-            else ""
-        )
-        self.telemetry_label.configure(
-            text=f"{pose_txt}   step={d.step}   "
-            f"v=[{act.v_fwd:.2f},{act.v_lat:.2f}] yaw_rate={act.yaw_rate:+.2f}{cbf_txt}{unc_txt}"
-        )
 
         alive = self.controller.is_alive()
         if not alive and not self._alive_label_visible:
@@ -1107,6 +1078,7 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         navdp_upstream_ckpt=navdp_upstream_ckpt,
         navdp_upstream_root=args.navdp_upstream_root,
         navdp_root=args.navdp_root,
+        gen_home_base=args.gen_home_base,
         rock_field_path=args.rock_field,
         flag_seed=args.flag_seed,
         num_flags=args.num_flags,
@@ -1140,6 +1112,7 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         dino_device=args.dino_device,
         dino_box_threshold=args.dino_box_threshold,
         dino_text_threshold=args.dino_text_threshold,
+        use_obs_detect=args.use_obs_detect,
         mission_belief_sweep_every=args.mission_belief_sweep_every,
         mission_belief_cov_growth=args.mission_belief_cov_growth,
         mission_belief_cov_growth_rate=args.mission_belief_cov_growth_rate,
@@ -1163,6 +1136,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--rock-field", default=None, help="rock_field.json manifest (optional)"
+    )
+    ap.add_argument(
+        "--gen-home-base",
+        action="store_true",
+        help="spawn the ghost home-base marker (a fixed, non-collidable blue "
+        "cuboid 5m from the rover's start pose). Off by default",
     )
     ap.add_argument(
         "--flag-seed",
@@ -1304,6 +1283,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=dino_grounding_resolver.DEFAULT_TEXT_THRESHOLD,
     )
     ap.add_argument(
+        "--use-obs-detect",
+        action="store_true",
+        help="run SAM2 obstacle detection alongside GroundingDINO target grounding "
+        "('Ground Target' / a Command-panel GO_TO/FIND step). Off by default -- that "
+        "checkpoint currently predicts artifact slivers, not real rock geometry (see "
+        "CLAUDE.md's 'Annotation masks are thin silhouette slivers' known issue), so "
+        "it burns time for obstacle boxes that get dropped or mislead the CBF anyway",
+    )
+    ap.add_argument(
         "--mission-belief-sweep-every",
         type=int,
         default=15,
@@ -1317,7 +1305,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument(
         "--mission-belief-cov-growth",
         type=float,
-        default=0.0002,
+        default=0.00002,
         help="per-tick belief-uncertainty growth for a goal sighted by the "
         "periodic mission sweep above but not currently being driven to -- kept "
         "far below --cov-growth (that rate is tuned for a goal briefly losing its "

@@ -47,6 +47,7 @@ class MarsHabitatEnv:
         spawn_clearance: float = SPAWN_CLEARANCE_M,
         spawn_terrain_radius: float = SPAWN_TERRAIN_RADIUS_M,
         with_semantic: bool = False,
+        gen_home_base: bool = False,
         rock_field_path: Optional[str] = None,
         annotations_dir: Optional[str] = None,
         annotation_categories: Optional[Sequence[str]] = None,
@@ -71,6 +72,7 @@ class MarsHabitatEnv:
         self._spawn_clearance = spawn_clearance
         self._spawn_terrain_radius = spawn_terrain_radius
         self._with_semantic = with_semantic
+        self._gen_home_base = gen_home_base
         self._rock_field_path = Path(rock_field_path) if rock_field_path else None
         self._annotations_dir = Path(annotations_dir) if annotations_dir else None
         self._annotation_categories = annotation_categories
@@ -146,9 +148,10 @@ class MarsHabitatEnv:
         y = self.get_height_at_xz(x, z)
         set_agent_pose(self._agent, x, y, z, yaw)
 
-        from sam_vla.env.home_base import register_home_base
+        if self._gen_home_base:
+            from sam_vla.env.home_base import register_home_base
 
-        self.home_base = register_home_base(self._sim, self._terrain, x, z, yaw)
+            self.home_base = register_home_base(self._sim, self._terrain, x, z, yaw)
 
         if self._rock_field_path is not None:
             self.rocks, _rock_config = load_rock_field(self._rock_field_path)

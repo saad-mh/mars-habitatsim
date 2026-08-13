@@ -78,7 +78,23 @@ def parse_direction_response(raw_text: str) -> dict:
     return parsed
 
 
-NAV_COMMAND_DIRECTIONS = ("left", "right", "back", "front")
+NAV_COMMAND_DIRECTIONS = (
+    "turn_left",
+    "turn_right",
+    "turn_back",
+    "go_left",
+    "go_right",
+    "go_front",
+    # Bare legacy tokens (no verb prefix) -- build_parse_nav_command_prompt no
+    # longer asks for these, but mission.py's _TURN_HEADINGS still accepts
+    # them as a turn-only fallback if the model ever reverts to them, so they
+    # must not be rejected here either (see mission.py's docstring on why
+    # this is treated as the safer turn-only reading rather than an error).
+    "left",
+    "right",
+    "back",
+    "front",
+)
 
 
 def parse_nav_command_response(raw_text: str) -> dict:

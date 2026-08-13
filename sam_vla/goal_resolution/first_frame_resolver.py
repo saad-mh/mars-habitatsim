@@ -31,8 +31,28 @@ def _detect(
     if checkpoint_path is not None:
         seg_kwargs["checkpoint_path"] = checkpoint_path
     raw_detections = sam_segmenter.segment_frame(frame, **seg_kwargs)
+    # Logged pre-filter (includes "bedrock", which to_detections always drops)
+    # so a class-confusion bug -- e.g. ground pixels classified "bigrock" --
+    # is visible here rather than only as an unexplained obstacle box later.
+    print(
+        f"[sam detect] {len(raw_detections)} raw detection(s) on "
+        f"{'mesh-overlay' if detect_rgb is not None else 'plain'} frame "
+        f"({frame.shape[1]}x{frame.shape[0]}): "
+        + (
+            ", ".join(
+                f"{d['class_name']}@px({d['x']:.0f},{d['y']:.0f} "
+                f"{d['width']:.0f}x{d['height']:.0f}) score={d['score']:.2f}"
+                for d in raw_detections
+            )
+            or "none"
+        )
+    )
     detections: list[Detection] = sam_output_adapter.to_detections(
         raw_detections, frame.shape[1], frame.shape[0]
+    )
+    print(
+        f"[sam detect] {len(detections)}/{len(raw_detections)} survive class "
+        "filter (bigrock only)"
     )
 
     if not detections:

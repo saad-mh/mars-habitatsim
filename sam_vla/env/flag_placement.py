@@ -66,7 +66,7 @@ FLAG_FOOTPRINT_RADIUS = 0.3
 # are offsets added to the spawn yaw using the same (-sin, -cos) forward
 # convention as sam_vla.env.home_base.home_base_xz (see its docstring).
 DEFAULT_FLAG_BEARINGS_DEG = (-45.0, 45.0, 135.0, -135.0)
-DEFAULT_FLAG_DISTANCE_M = 6.0
+DEFAULT_FLAG_DISTANCE_M = 12.0
 
 
 @dataclass
@@ -102,7 +102,9 @@ def _in_exclude_zone(x: float, z: float, exclude_zones: Sequence[ExcludeZone]) -
     return any(math.hypot(x - ex, z - ez) < er for ex, ez, er in exclude_zones)
 
 
-def _facing_yaw(flag_x: float, flag_z: float, target_x: float, target_z: float) -> float:
+def _facing_yaw(
+    flag_x: float, flag_z: float, target_x: float, target_z: float
+) -> float:
     """Yaw that points the flag's one renderable face at (target_x, target_z) --
     see FLAG_LOCAL_FRONT_ANGLE_RAD."""
     target_angle = math.atan2(target_z - flag_z, target_x - flag_x)
@@ -110,7 +112,9 @@ def _facing_yaw(flag_x: float, flag_z: float, target_x: float, target_z: float) 
 
 
 def generate_flag_field(
-    config: FlagFieldConfig, terrain: Terrain, face_target: Optional[Tuple[float, float]] = None
+    config: FlagFieldConfig,
+    terrain: Terrain,
+    face_target: Optional[Tuple[float, float]] = None,
 ) -> List[FlagSpec]:
     """Rejection-sample `config.num_flags` non-overlapping flag positions within
     the scene bounds, each dropped onto the terrain height under it and
@@ -199,7 +203,13 @@ def generate_default_flag_field(
         color = colors[i % len(colors)]
         flags.append(
             FlagSpec(
-                id=i, x=x, y=y, z=z, yaw=yaw, color=color, mesh_path=str(FLAG_COLORS[color])
+                id=i,
+                x=x,
+                y=y,
+                z=z,
+                yaw=yaw,
+                color=color,
+                mesh_path=str(FLAG_COLORS[color]),
             )
         )
     return flags

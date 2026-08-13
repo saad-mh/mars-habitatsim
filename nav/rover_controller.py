@@ -135,7 +135,7 @@ MODE_TURN = "turn"
 MODE_REVIEW_SEGMENTATION = "review_segmentation"
 
 # Ground-truth distance at which a point goal counts as reached
-POINT_GOAL_REACHED_M = 1.5
+POINT_GOAL_REACHED_M = 2.0  # revert to 1.5 if near reach required
 
 # Ground-truth yaw error at which a MODE_TURN sub-goal counts as reached
 TURN_GOAL_REACHED_RAD = math.radians(3.0)
@@ -206,6 +206,14 @@ class DisplayState:
     uncertainty_request_in_flight: bool = False
     uncertainty_searching: bool = False
     uncertainty_line: str = ""
+    # Belief-tracker uncertainty for the persistent "home base" entry in
+    # goal_beliefs (see _env_loop's home_base_seeded comment) -- tracked and
+    # dead-reckoned for the whole mission, independent of whichever sub-goal
+    # is currently active, so this keeps growing even while driving toward a
+    # GO_TO/FIND leg rather than only once a RETURN leg starts. 0.0 until a
+    # mission has seeded a home-base belief.
+    home_base_uncertainty_value: float = 0.0
+    home_base_uncertainty_threshold: float = 0.0
 
 
 class RoverController:
@@ -217,6 +225,7 @@ class RoverController:
         navdp_upstream_ckpt: str,
         navdp_upstream_root: Optional[str] = None,
         navdp_root: Optional[str] = None,
+        gen_home_base: bool = False,
         rock_field_path: Optional[str] = None,
         flag_seed: Optional[int] = None,
         num_flags: int = 6,
@@ -260,6 +269,7 @@ class RoverController:
         dino_device: str = dino_grounding_resolver.DEFAULT_DINO_DEVICE,
         dino_box_threshold: float = dino_grounding_resolver.DEFAULT_BOX_THRESHOLD,
         dino_text_threshold: float = dino_grounding_resolver.DEFAULT_TEXT_THRESHOLD,
+        use_obs_detect: bool = False,
         mission_sweep_yaws: int = 8,
         mission_belief_sweep_every: int = 15,
         mission_belief_cov_growth: float = 0.0002,
@@ -277,6 +287,7 @@ class RoverController:
         self.navdp_upstream_ckpt = navdp_upstream_ckpt
         self.navdp_upstream_root = navdp_upstream_root
         self.navdp_root = navdp_root
+        self.gen_home_base = bool(gen_home_base)
         self.rock_field_path = rock_field_path
         self.flag_seed = flag_seed
         self.num_flags = int(num_flags)
@@ -287,6 +298,10 @@ class RoverController:
         self.start_yaw_deg = float(start_yaw_deg)
         self.dt = float(dt)
         self.hz = float(hz)
+        # Cadence (in ticks) for the periodic home-base-uncertainty log line
+        # below -- every ~5s of sim time, not every tick, so a long RETURN
+        # leg doesn't flood nav/logs/ at self.hz.
+        self._home_base_uncertainty_log_every = max(1, round(self.hz * 5.0))
         self.cbf_enabled = bool(cbf_enabled)
         self._cbf_kwargs = dict(
             d_safe=cbf_d_safe,
@@ -337,6 +352,13 @@ class RoverController:
         self.dino_device = dino_device
         self.dino_box_threshold = float(dino_box_threshold)
         self.dino_text_threshold = float(dino_text_threshold)
+        # Gates the SAM2 obstacle-detection pass inside dino_grounding_resolver's
+        # target_text path (see its use_obs_detect param) -- off by default
+        # since that checkpoint currently predicts artifact slivers, not real
+        # rock geometry (CLAUDE.md's "Annotation masks are thin silhouette
+        # slivers" known issue), so running it just burns time for boxes that
+        # get dropped or mislead the CBF.
+        self.use_obs_detect = bool(use_obs_detect)
 
         # In-place 360deg scan a GO_TO/FIND mission sub-goal runs (see
         # _start_mission_subgoal) before the existing single-frame
@@ -433,6 +455,7 @@ class RoverController:
         self.display = DisplayState()
         self.display.uncertainty_enabled = self.uncertainty_enabled
         self.display.uncertainty_threshold = self.uncertainty_cov_threshold
+        self.display.home_base_uncertainty_threshold = self.uncertainty_cov_threshold
         self._rng = np.random.default_rng()
         # Goal-detected/goal-reached event log (nav/logs/, gitignored) --
         # see EventLogger's docstring. Created once per RoverController (one
@@ -624,6 +647,7 @@ class RoverController:
                 start_z=self.start_z,
                 start_yaw=math.radians(self.start_yaw_deg),
                 with_semantic=True,
+                gen_home_base=self.gen_home_base,
                 rock_field_path=self.rock_field_path,
                 flag_seed=self.flag_seed,
                 num_flags=self.num_flags,
@@ -821,11 +845,14 @@ class RoverController:
                     # mission is dispatched, keyed the same way _sweep_goal_beliefs
                     # keys everything else -- so home is remembered right from
                     # the prompt, not only once a RETURN sub-goal is reached.
-                    # This is bookkeeping only: RETURN's own drive (below) still
-                    # goes straight to the ground-truth (self.start_x, self.start_z)
-                    # every tick via MODE_POINT, which is exact and never needs
-                    # correcting -- this entry just makes home visible in the
-                    # same belief bank flags/other goals live in.
+                    # This seed is what RETURN's own drive (below) actually
+                    # navigates off of via MODE_RESOLVE -- like every other
+                    # tracked goal it's then dead-reckoned every tick (see the
+                    # "for bt in goal_beliefs.values()" propagate loop below),
+                    # so a RETURN leg accrues the same odometry drift/
+                    # uncertainty a GO_TO/FIND leg would, rather than homing in
+                    # on an exact ground-truth world position the rover has no
+                    # real way of knowing.
                     home_forward, home_left = body_frame_goal(
                         self.display.pose, (self.start_x, self.start_z)
                     )
@@ -1262,8 +1289,22 @@ class RoverController:
                     d.step = step
                     d.frame_count += 1
                     d.uncertainty_value = belief_tracker.uncertainty_value()
+                    home_bt = goal_beliefs.get("home base")
+                    d.home_base_uncertainty_value = (
+                        home_bt.uncertainty_value() if home_bt is not None else 0.0
+                    )
                     d.mission_status = (
                         self._mission.status() if self._mission is not None else ""
+                    )
+
+                if (
+                    home_bt is not None
+                    and step % self._home_base_uncertainty_log_every == 0
+                ):
+                    self._event_log.log(
+                        "home_base_uncertainty",
+                        value=round(d.home_base_uncertainty_value, 3),
+                        threshold=round(self.uncertainty_cov_threshold, 3),
                     )
 
                 step += 1
@@ -1635,6 +1676,42 @@ class RoverController:
                 continue
 
             if goal.kind == GoalKind.RETURN:
+                # _clear_masks also nulls self._ground_target_world -- without
+                # this, MODE_RESOLVE's unseen-goal fallback (below, "if not
+                # seen and self._ground_target_world is not None") would
+                # re-seed the home belief from whatever DINO-grounded target
+                # (e.g. "flag") the mission's previous GO_TO leg left behind,
+                # since RETURN itself never calls _do_resolve to clear it.
+                goal_objects, obstacle_objects = self._clear_masks(
+                    env, goal_objects, obstacle_objects
+                )
+                home = goal_beliefs.get("home base")
+                if home is not None and home.belief_g is not None:
+                    # Drive off the dead-reckoned "home base" belief seeded at
+                    # mission dispatch (see home_base_seeded above) instead of
+                    # the ground-truth spawn point -- same MODE_RESOLVE
+                    # mechanism/placeholder-spec pattern the "resume toward
+                    # previously-sighted target" path above uses, so RETURN
+                    # is subject to the same odometry drift/uncertainty halt
+                    # every other belief-tracked goal is, not a magic exact
+                    # fix on the world frame.
+                    placeholder_spec = GoalSpec(
+                        goal_bbox_norm=(0.0, 0.0, 1.0, 1.0),
+                        obstacle_bboxes_norm=[],
+                        instruction_text="Navigate back to home base.",
+                    )
+                    with self._lock:
+                        self._mode = MODE_RESOLVE
+                        self.display.status_text = (
+                            "[mission] returning to home base (belief)"
+                        )
+                        self.display.goal_reached = False
+                    self._activate_belief_tracker(home)
+                    return goal_objects, obstacle_objects, placeholder_spec, home
+                # No seeded belief -- shouldn't normally happen (home_base_seeded
+                # runs at mission dispatch, before any RETURN leg can be
+                # reached), but fall back to the exact ground-truth spawn
+                # rather than stalling the mission.
                 with self._lock:
                     self._world_goal = (self.start_x, self.start_z)
                     self._mode = MODE_POINT
@@ -1789,7 +1866,9 @@ class RoverController:
                 self.mission_belief_cov_growth_rate if self.uncertainty_enabled else 0.0
             )
         else:
-            odom_noise = self.uncertainty_cov_growth if self.uncertainty_enabled else 0.0
+            odom_noise = (
+                self.uncertainty_cov_growth if self.uncertainty_enabled else 0.0
+            )
             odom_noise_growth_rate = (
                 self.uncertainty_cov_growth_rate if self.uncertainty_enabled else 0.0
             )
@@ -1875,6 +1954,7 @@ class RoverController:
                     dino_device=self.dino_device,
                     dino_box_threshold=self.dino_box_threshold,
                     dino_text_threshold=self.dino_text_threshold,
+                    use_obs_detect=self.use_obs_detect,
                 )
             else:
                 goal_spec_r, vlm_result, dets = first_frame_resolver.resolve_verbose(
@@ -1890,9 +1970,7 @@ class RoverController:
             # previously only visible by reading the (often truncated)
             # sidebar status text.
             print(f"[nav resolve] failed: {exc}")
-            self._event_log.log(
-                "goal_detect_failed", name=target_text, reason=str(exc)
-            )
+            self._event_log.log("goal_detect_failed", name=target_text, reason=str(exc))
             with self._lock:
                 self.display.status_text = f"resolve failed: {exc}"
             # goal_objects/obstacle_objects are already emptied (cleared

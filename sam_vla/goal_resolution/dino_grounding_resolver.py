@@ -136,6 +136,7 @@ def resolve_verbose(
     dino_device: str = DEFAULT_DINO_DEVICE,
     dino_box_threshold: float = DEFAULT_BOX_THRESHOLD,
     dino_text_threshold: float = DEFAULT_TEXT_THRESHOLD,
+    use_obs_detect: bool = False,
 ) -> tuple[GoalSpec, dict, list[Detection]]:
     """Grounds `target_text` directly via GroundingDINO (no SAM2 candidate
     list involved in picking the goal). Raises RuntimeError if DINO doesn't
@@ -177,25 +178,49 @@ def resolve_verbose(
         max(0.0, min(1.0, x1 / width)),
         max(0.0, min(1.0, y1 / height)),
     )
+    print(
+        f"[dino resolve] goal_bbox_norm={tuple(round(v, 3) for v in goal_bbox_norm)} "
+        f"px x[{x0:.0f}:{x1:.0f}] y[{y0:.0f}:{y1:.0f}] of {width}x{height}"
+    )
 
-    try:
-        obstacle_detections = first_frame_resolver.resolve_obstacles(
-            rgb,
-            detect_rgb=detect_rgb,
-            backend=backend,
-            checkpoint_path=checkpoint_path,
-        )
-    except RuntimeError:
-        # Unlike first_frame_resolver's own path, the goal here doesn't
-        # depend on SAM2 finding anything -- only obstacles do, so zero
-        # detections is a legitimate (obstacle-free) outcome, not a failure.
+    if not use_obs_detect:
+        # SAM2-LoRA's obstacle detections are currently unreliable artifact
+        # slivers, not real rock geometry (see CLAUDE.md's "Annotation masks
+        # are thin silhouette slivers" known issue) -- skip the SAM2 pass
+        # entirely rather than pay its cost for boxes that get dropped or
+        # mislead the CBF anyway. Opt back in with use_obs_detect=True once
+        # that's fixed.
         obstacle_detections = []
     else:
-        # SAM2 doesn't know what DINO just grounded -- strip out whichever
-        # of its detections is actually the grounded target itself so it
-        # doesn't also get registered as an obstacle mesh on top of the
-        # goal mesh (see _drop_goal_overlap).
-        obstacle_detections = _drop_goal_overlap(goal_bbox_norm, obstacle_detections)
+        try:
+            obstacle_detections = first_frame_resolver.resolve_obstacles(
+                rgb,
+                detect_rgb=detect_rgb,
+                backend=backend,
+                checkpoint_path=checkpoint_path,
+            )
+        except RuntimeError:
+            # Unlike first_frame_resolver's own path, the goal here doesn't
+            # depend on SAM2 finding anything -- only obstacles do, so zero
+            # detections is a legitimate (obstacle-free) outcome, not a failure.
+            obstacle_detections = []
+        else:
+            # Logged before the overlap filter so a "SAM only ever fires right
+            # next to the goal box" pattern -- which _drop_goal_overlap would
+            # otherwise quietly hide -- is visible here.
+            for d in obstacle_detections:
+                iou = _iou_norm(goal_bbox_norm, d.bbox_norm)
+                print(
+                    f"[dino resolve] obstacle candidate {d.class_name} "
+                    f"bbox_norm={tuple(round(v, 3) for v in d.bbox_norm)} "
+                    f"conf={d.confidence:.2f} iou_vs_goal={iou:.2f} "
+                    f"{'DROPPED (overlaps goal)' if iou >= _GOAL_OVERLAP_IOU_THRESHOLD else 'kept'}"
+                )
+            # SAM2 doesn't know what DINO just grounded -- strip out whichever
+            # of its detections is actually the grounded target itself so it
+            # doesn't also get registered as an obstacle mesh on top of the
+            # goal mesh (see _drop_goal_overlap).
+            obstacle_detections = _drop_goal_overlap(goal_bbox_norm, obstacle_detections)
 
     goal_spec = GoalSpec(
         goal_bbox_norm=goal_bbox_norm,

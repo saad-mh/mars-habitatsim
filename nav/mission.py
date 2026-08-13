@@ -74,6 +74,21 @@ _GO_HEADINGS = {
 # emits one of those phrases verbatim as a goal instead of normalizing it.
 _RETURN_WORDS = re.compile(r"\b(home|base|spawn|return|come back|go back)\b", re.I)
 
+# A second, outer safety net: unlike _RETURN_WORDS above (checked against
+# each already-emitted goal phrase), this is checked against the raw
+# instruction text itself, to catch the VLM dropping the return leg from
+# "goals" entirely (observed in practice -- "turn right go to the flag and
+# come back to base" parsed to goals=["flag"], silently losing "come back to
+# base"). Deliberately narrower than _RETURN_WORDS -- no bare "back"/"home"/
+# "base"/"return" alone, since e.g. "turn back" (in-place turn, handled by
+# "directions") legitimately contains "back" with no return-to-spawn sense
+# at all. Only multi-word phrases that are unambiguous in this domain.
+_RETURN_PHRASE = re.compile(
+    r"come back|go back|head back|back to (?:the )?(?:home )?base|"
+    r"back to (?:the )?spawn|home base|return (?:to|home)",
+    re.I,
+)
+
 
 def _direction_subgoals(direction: str) -> List[SubGoal]:
     """One VLM-emitted direction token -> zero, one, or two sub-goals.
@@ -102,7 +117,9 @@ def _goal_subgoal(goal: str) -> SubGoal:
     return SubGoal(kind, goal, goal)
 
 
-def parse_parts(directions: List[str], goals: List[str]) -> List[SubGoal]:
+def parse_parts(
+    directions: List[str], goals: List[str], instruction: str = ""
+) -> List[SubGoal]:
     """Turn the VLM's (directions, goals) split into an ordered sub-goal
     sequence, in two parts: every direction first (each a TURN and/or
     ADVANCE, see _direction_subgoals), then every goal (GO_TO, or RETURN for
@@ -110,7 +127,19 @@ def parse_parts(directions: List[str], goals: List[str]) -> List[SubGoal]:
     within-list ordering (see qwen_prompts.build_parse_nav_command_prompt),
     but the VLM never orders directions relative to goals across the two
     lists -- "part 1 then part 2" is the closest ordering available, not a
-    reconstruction of the original interleaving."""
+    reconstruction of the original interleaving.
+
+    `instruction` (the original raw command text, if given) backstops a
+    return leg the VLM dropped from `goals` altogether -- see
+    _RETURN_PHRASE's docstring. Only fires when nothing already in `goals`
+    reads as a return (checked via _RETURN_WORDS, not _RETURN_PHRASE, so an
+    already-present "home base"/"spawn point" goal from the VLM counts)."""
+    if (
+        instruction
+        and _RETURN_PHRASE.search(instruction)
+        and not any(_RETURN_WORDS.search(g) for g in goals)
+    ):
+        goals = [*goals, "home base"]
     steps: List[SubGoal] = []
     for direction in directions:
         steps.extend(_direction_subgoals(direction))
@@ -130,7 +159,9 @@ class Mission:
 
     def __post_init__(self):
         if not self.goals:
-            self.goals = parse_parts(self.directions, self.goal_texts)
+            self.goals = parse_parts(
+                self.directions, self.goal_texts, self.instruction
+            )
 
     @property
     def current(self) -> SubGoal:
