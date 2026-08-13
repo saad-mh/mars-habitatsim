@@ -864,6 +864,23 @@ class RoverController:
                     self._sweep_goal_beliefs(
                         mission_snapshot, obs.rgb, obs.depth, goal_beliefs
                     )
+                    with self._lock:
+                        turning_now = self._mode == MODE_TURN
+                    if turning_now and self._check_turn_interrupt(
+                        mission_snapshot, goal_beliefs
+                    ):
+                        goal_objects, obstacle_objects, goal_spec, belief_tracker = (
+                            self._start_mission_subgoal(
+                                env,
+                                step,
+                                mask_dir,
+                                goal_objects,
+                                obstacle_objects,
+                                goal_spec,
+                                goal_beliefs,
+                                belief_tracker,
+                            )
+                        )
 
                 if pixel_click is not None:
                     self._handle_pixel_click(obs, pixel_click)
@@ -1710,6 +1727,46 @@ class RoverController:
                 left=round(float(left), 2),
                 score=round(float(score), 3),
             )
+
+    def _check_turn_interrupt(self, mission, goal_beliefs) -> bool:
+        """While a mission TURN sub-goal is spinning, don't finish the spin
+        (or any ADVANCE step after it) if the goal it was turning toward is
+        already confidently sighted -- called right after _sweep_goal_beliefs
+        so it's reacting to the same detection, not an extra DINO call of its
+        own. Only ever considers the NEAREST upcoming GO_TO/FIND sub-goal
+        (the one this turn exists to face), same as a person stopping mid-
+        turn the moment they spot what they were looking for. Jumps the
+        mission straight to that sub-goal (skipping any ADVANCE in between --
+        no point blindly driving forward first when the target is already in
+        view) and lets the caller kick off _start_mission_subgoal, whose own
+        GO_TO/FIND handling picks the belief seeded here right back up (fresh
+        resolve, or this prior belief as fallback -- see its docstring).
+        Returns whether an interrupt happened."""
+        upcoming = next(
+            (
+                g
+                for g in mission.goals[mission.idx :]
+                if g.kind in (GoalKind.GO_TO, GoalKind.FIND)
+            ),
+            None,
+        )
+        if upcoming is None:
+            return False
+        bt = goal_beliefs.get(upcoming.target)
+        if (
+            bt is None
+            or bt.belief_g is None
+            or bt.uncertainty_value() >= self.uncertainty_cov_threshold
+        ):
+            return False
+        with self._lock:
+            if self._mission is not mission:
+                return False
+            while self._mission.current is not upcoming:
+                self._mission.advance()
+            self._mission_target_yaw = None
+        self._event_log.log("turn_interrupted_goal_sighted", target=upcoming.target)
+        return True
 
     def _new_belief_tracker(self, *, mission_sweep: bool = False) -> BeliefGoalTracker:
         # odom_noise/odom_noise_growth_rate drive uncertainty_value()'s real
