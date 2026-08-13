@@ -1227,6 +1227,7 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         flag_min_spacing=args.flag_min_spacing,
         flag_boundary_margin=args.flag_boundary_margin,
         enable_topdown_viz=args.top_down_viz,
+        rover_marker_scale=args.rover_marker_scale,
         start_x=args.start_x,
         start_z=args.start_z,
         start_yaw_deg=args.start_yaw,
@@ -1319,6 +1320,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         "habitat-sim camera framing the four flags from directly above) for "
         "video recording -- human viz only, plays no part in navigation/CBF/VLM. "
         "Off by default",
+    )
+    ap.add_argument(
+        "--rover-marker-scale",
+        type=float,
+        default=1.0,
+        help="scale multiplier for the assets/perseverance_mars_rover.glb marker "
+        "shown at the rover's live position in --top-down-viz (1.0 = the asset's "
+        "native, real-world meter scale). Only affects the top-down window -- "
+        "the marker never appears in the main camera view. Turn down if it reads "
+        "too large against the course",
     )
     ap.add_argument(
         "--navdp-upstream-ckpt",

@@ -236,6 +236,7 @@ class RoverController:
         flag_min_spacing: float = 1.5,
         flag_boundary_margin: float = 2.0,
         enable_topdown_viz: bool = False,
+        rover_marker_scale: float = 1.0,
         start_x: float = 0.0,
         start_z: float = 8.0,
         start_yaw_deg: float = 0.0,
@@ -299,6 +300,7 @@ class RoverController:
         self.flag_min_spacing = float(flag_min_spacing)
         self.flag_boundary_margin = float(flag_boundary_margin)
         self.enable_topdown_viz = bool(enable_topdown_viz)
+        self.rover_marker_scale = float(rover_marker_scale)
         self.start_x = float(start_x)
         self.start_z = float(start_z)
         self.start_yaw_deg = float(start_yaw_deg)
@@ -660,6 +662,7 @@ class RoverController:
                 flag_min_spacing=self.flag_min_spacing,
                 flag_boundary_margin=self.flag_boundary_margin,
                 enable_topdown_viz=self.enable_topdown_viz,
+                rover_marker_scale=self.rover_marker_scale,
                 annotations_dir=self.annotations_dir,
                 annotation_categories=self.annotation_categories,
             ) as env:

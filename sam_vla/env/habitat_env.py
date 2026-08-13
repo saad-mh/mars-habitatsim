@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 import habitat_sim
+import magnum as mn
 import numpy as np
 import quaternion
 from habitat_sim.agent import AgentConfiguration
@@ -17,6 +18,7 @@ from sam_vla.env.annotation_meshes import load_mesh_id_map, register_annotation_
 from sam_vla.env.terrain import SIZE_X, SIZE_Y, SIZE_Z, HeightmapGrid, Terrain
 from sam_vla.env.sim_utils import (
     make_sensor,
+    register_glb_object,
     register_semantic_mesh,
     rgb_depth,
     save_obj,
@@ -41,6 +43,16 @@ TOPDOWN_HFOV_DEG = 90.0
 # Extra clearance added around the flags' bounding box so no flag/marker
 # sits flush against the frame edge.
 TOPDOWN_MARGIN_M = 4.0
+
+# assets/perseverance_mars_rover.glb is authored at real-world 1:1 meter
+# scale (~2.7m wide x 2.3m tall x 4.5m long, matching the real Perseverance
+# rover's proportions) -- 1.0 renders it true-to-scale against marsyard2022's
+# already full-size course/flag spacing. Exposed as rover_marker_scale in
+# case a future course/asset combination needs it dialed down.
+ROVER_MARKER_GLB = (
+    Path(__file__).resolve().parent.parent.parent / "assets" / "perseverance_mars_rover.glb"
+)
+ROVER_MARKER_SCALE = 1.0
 
 SPAWN_CLEARANCE_M = 1.0
 SPAWN_TERRAIN_RADIUS_M = 0.8
@@ -72,6 +84,7 @@ class MarsHabitatEnv:
         topdown_resolution: tuple = (TOPDOWN_HEIGHT, TOPDOWN_WIDTH),
         topdown_hfov_deg: float = TOPDOWN_HFOV_DEG,
         topdown_margin_m: float = TOPDOWN_MARGIN_M,
+        rover_marker_scale: float = ROVER_MARKER_SCALE,
     ):
         self._scene_path = Path(scene_path)
         self._heightmap_path = Path(heightmap_path)
@@ -108,6 +121,15 @@ class MarsHabitatEnv:
         self._topdown_hfov_deg = float(topdown_hfov_deg)
         self._topdown_margin_m = float(topdown_margin_m)
         self._topdown_agent = None
+        self._rover_marker_scale = float(rover_marker_scale)
+        # A render-only Perseverance model tracking the driving agent's live
+        # pose, shown only in the topdown camera's frame (see
+        # get_topdown_rgb's hide/show toggle) -- never the driving agent's
+        # own camera, which sits inside the model's own body at that same
+        # position/scale and would otherwise render from its interior.
+        self._rover_marker_obj = None
+        self._rover_marker_onstage = None
+        self._rover_marker_half_height = 0.0
         self.rocks: List[RockSpec] = []
         self.flags: list = []
         self.home_base = None
@@ -230,6 +252,7 @@ class MarsHabitatEnv:
 
         if self._topdown_agent is not None:
             self._place_topdown_camera(fallback_x=x, fallback_z=z)
+            self._register_rover_marker(x, z, yaw)
 
         if self._annotations_dir is not None:
             self.annotation_mesh_id_map = load_mesh_id_map(self._annotations_dir)
@@ -289,18 +312,78 @@ class MarsHabitatEnv:
         ground_y = self._terrain(cx, cz)
         set_agent_pose_topdown(self._topdown_agent, cx, ground_y + cam_height, cz)
 
+    def _register_rover_marker(self, x: float, z: float, yaw: float) -> None:
+        """Register the render-only Perseverance model at the rover's spawn
+        pose, resting state hidden (see sim_utils.set_objects_hidden -- same
+        drop-far-away trick the annotation hull meshes use, since habitat-sim
+        has no per-sensor visibility flag): _sync_rover_marker +
+        get_topdown_rgb are the only things that ever show it, and only for
+        the duration of the topdown camera's own render call."""
+        ground_y = self._terrain(x, z)
+        obj = register_glb_object(
+            self._sim,
+            str(ROVER_MARKER_GLB),
+            (x, ground_y, z),
+            yaw=yaw,
+            scale=self._rover_marker_scale,
+        )
+        # Model origin is at its own vertical center, not its wheelbase --
+        # lift by half its (already-scaled) height so it rests on the
+        # terrain instead of sinking halfway into it.
+        self._rover_marker_half_height = float(obj.aabb.size().y) / 2.0
+        obj.translation = obj.translation + mn.Vector3(
+            0.0, self._rover_marker_half_height, 0.0
+        )
+        self._rover_marker_obj = obj
+        self._rover_marker_onstage = obj.translation
+        set_objects_hidden(
+            {0: obj}, {0: self._rover_marker_onstage}, hidden=True
+        )
+
+    def _sync_rover_marker(self) -> None:
+        """Move the (still-hidden) rover marker to the driving agent's
+        current live pose -- called right before get_topdown_rgb shows it,
+        so the marker always reflects this tick's position/heading rather
+        than wherever the rover was at spawn."""
+        state = self._agent.get_state()
+        x, _y, z = (float(v) for v in state.position)
+        yaw = float(quaternion.as_rotation_vector(state.rotation)[1])
+        ground_y = self._terrain(x, z)
+        pos = mn.Vector3(x, ground_y + self._rover_marker_half_height, z)
+        self._rover_marker_obj.translation = pos
+        self._rover_marker_obj.rotation = mn.Quaternion.rotation(
+            mn.Rad(yaw), mn.Vector3.y_axis()
+        )
+        self._rover_marker_onstage = pos
+
     def get_topdown_rgb(self) -> Optional[np.ndarray]:
         """RGB frame from the fixed bird's-eye viz camera (see
-        enable_topdown_viz), framing the flag field from directly above.
-        Human-viewing/recording only -- never fed to a policy, VLM, or
-        segmentation model. Returns None if enable_topdown_viz=False."""
+        enable_topdown_viz), framing the flag field from directly above,
+        with the rover marker (see _register_rover_marker) shown at its
+        current live pose for exactly this one render. Human-viewing/
+        recording only -- never fed to a policy, VLM, or segmentation
+        model. Returns None if enable_topdown_viz=False."""
         if self._topdown_agent is None:
             return None
+        if self._rover_marker_obj is not None:
+            self._sync_rover_marker()
+            set_objects_hidden(
+                {0: self._rover_marker_obj},
+                {0: self._rover_marker_onstage},
+                hidden=False,
+            )
         obs = self._sim.get_sensor_observations(agent_ids=1)
         rgb = np.asarray(obs["topdown"])
         if rgb.ndim == 3 and rgb.shape[-1] == 4:
             rgb = rgb[:, :, :3]
-        return rgb.astype(np.uint8)
+        rgb = rgb.astype(np.uint8)
+        if self._rover_marker_obj is not None:
+            set_objects_hidden(
+                {0: self._rover_marker_obj},
+                {0: self._rover_marker_onstage},
+                hidden=True,
+            )
+        return rgb
 
     def get_height_at_xz(self, x: float, z: float) -> float:
         """Terrain height at (x, z), plus rover clearance, sampled from the heightmap."""
