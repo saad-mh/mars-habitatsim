@@ -1387,7 +1387,7 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         num_flags=args.num_flags,
         flag_min_spacing=args.flag_min_spacing,
         flag_boundary_margin=args.flag_boundary_margin,
-        enable_topdown_viz=args.top_down_viz,
+        enable_topdown_viz=args.tdviz,
         rover_marker_scale=args.rover_marker_scale,
         start_x=args.start_x,
         start_z=args.start_z,
@@ -1475,7 +1475,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="keep placed flags this many meters clear of the scene bounds",
     )
     ap.add_argument(
-        "--top-down-viz",
+        "--tdviz",
         action="store_true",
         help="open a second, fixed bird's-eye-view window (a separate high-res "
         "habitat-sim camera framing the four flags from directly above) for "
