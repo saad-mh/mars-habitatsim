@@ -71,7 +71,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -187,6 +187,11 @@ class DisplayState:
     action: Action = field(default_factory=lambda: Action(0.0, 0.0, 0.0))
     distance: Optional[float] = None
     goal_world: Optional[tuple] = None
+    # Human-readable name of whatever goal is currently active (GoalSpec.
+    # instruction_text) -- covers both ad-hoc goals (Segment/Ground/Random)
+    # and the current Mission sub-goal, for nav/gui.py's exp.md-style
+    # "CURRENT GOAL" display. "" when no goal is resolved yet.
+    goal_label: str = ""
     belief_g: Optional[tuple] = None  # (forward, left), body frame
     trajectory: Optional[np.ndarray] = None  # chosen NavDP waypoints, body frame
     obstacle_point: Optional[tuple] = None  # nearest CBF obstacle, body frame
@@ -199,6 +204,15 @@ class DisplayState:
     # Active Mission's status() line (nav/gui.py's Command panel), "" when no
     # mission is running -- see nav.mission.Mission.
     mission_status: str = ""
+    # Structured view of the same Mission, for nav/gui.py's exp.md-style
+    # Mission panel goal list (checklist of done/current/upcoming SubGoals).
+    # A shallow copy of Mission.goals/.idx -- SubGoal instances are never
+    # mutated after Mission.__post_init__ builds them, so sharing references
+    # across the controller/GUI thread boundary here is safe. Empty/-1 when
+    # no mission is running (ad-hoc Segment/Random/point-click goals aren't a
+    # Mission at all -- gui.py falls back to a single synthesized entry).
+    mission_goals: List = field(default_factory=list)
+    mission_goal_idx: int = -1
     # Uncertainty-halt (vl_direction's "uncertainty" prompt against the real
     # BeliefGoalTracker, see this module's imports): uncertainty_value grows
     # while a MODE_RESOLVE goal mask stays unseen; once it reaches
@@ -1299,6 +1313,9 @@ class RoverController:
                     d.action = action
                     d.distance = dist_to_goal
                     d.goal_world = world_goal
+                    d.goal_label = (
+                        goal_spec.instruction_text if goal_spec is not None else ""
+                    )
                     d.belief_g = (
                         None
                         if belief_tracker.belief_g is None
@@ -1320,6 +1337,12 @@ class RoverController:
                     )
                     d.mission_status = (
                         self._mission.status() if self._mission is not None else ""
+                    )
+                    d.mission_goals = (
+                        list(self._mission.goals) if self._mission is not None else []
+                    )
+                    d.mission_goal_idx = (
+                        self._mission.idx if self._mission is not None else -1
                     )
 
                 if (

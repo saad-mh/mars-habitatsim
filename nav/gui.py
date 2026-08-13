@@ -17,6 +17,14 @@ own DINO usage, --dino-* flags below configure it. The SAM2+Qwen-salience
 "Segment" path and the Qwen-based free-text Command-splitting/uncertainty-halt
 prompts are unrelated and still use Qwen.
 
+Top-level region layout (Top Status bar / Camera / Mission+Rover-Status
+sidebar / Trajectory+Belief bar / pinned Emergency Stop) follows exp.md's
+supervisory rover-control-console spec verbatim -- see that file's ASCII
+layout and per-region field lists before touching root-grid structure or
+adding/removing a sidebar stat cell. The REACH principles below shape the
+*interaction design within* that layout (contextual panels, glove-safe
+sizing, three-stage-style feedback, etc.), not the region layout itself.
+
 ========================================================================
 REACH UI/UX PRINCIPLES  (Ma et al., "Human-Robot Interaction through
 REACH", DLR/NASA) -- this layout is a deliberate re-implementation of the
@@ -76,6 +84,7 @@ from PIL import Image, ImageDraw, ImageTk
 from sam_vla.goal_resolution import dino_grounding_resolver
 from vl_direction import config as vl_dir_config
 
+from nav.mission import GoalKind
 from nav.rover_controller import MODE_REVIEW_SEGMENTATION, MODE_TURN, RoverController
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -91,7 +100,6 @@ PLOT_GOAL = "#fbbf24"
 # CTkLabel whose text/background colors can each independently follow the OS
 # appearance mode and end up low-contrast -- see _draw_plot_telemetry.
 PLOT_TELEMETRY_TEXT = "#e5e7eb"
-PLOT_TELEMETRY_WARN = "#fbbf24"
 
 # REACH P5: glove-safe control sizing. One place to tune the whole
 # console's button footprint so every primary action stays large and
@@ -101,30 +109,41 @@ BTN_H = 46  # primary action button height (px)
 BTN_GAP = 8  # inter-button spacing (px)
 SECTION_GAP = 12  # spacing between labeled sections (px)
 
-# REACH P2: the three-stage command lifecycle, in order. The status
-# header renders exactly these, lighting the active one -- this is the
-# whole "rover status update bar" of the paper, made unmissable.
-STAGE_ORDER = ("received", "executing", "complete")
-STAGE_LABELS = {
-    "received": "1 · RECEIVED",
-    "executing": "2 · EXECUTING",
-    "complete": "3 · COMPLETE",
+# exp.md Sec 1 (Top Status / Current Status) -- state word -> accent color
+# for the persistent full-width header. REACH P10: keeps color the one
+# consistent cue for "what is the rover doing right now" across the window.
+TOP_STATUS_COLORS = {
+    "IDLE": "#9ca3af",
+    "PARSING MISSION": "#c084fc",
+    "SEARCHING": "#38bdf8",
+    "NAVIGATING": "#4ade80",
+    "AWAITING HUMAN": "#f59e0b",
+    "RECOVERING": "#f87171",
+    "GOAL REACHED": "#22d3ee",
+    "MISSION COMPLETE": "#4ade80",
+    "MANUAL CONTROL": "#60a5fa",
 }
-STAGE_ACTIVE_COLOR = "#22d3ee"
-STAGE_DONE_COLOR = "#4ade80"
-STAGE_IDLE_COLOR = "#3f3f46"
 
-# Mode -> accent color, shared by the big mode label and (where relevant)
-# the panel that goes with that mode -- REACH P10: keeps color the one
-# consistent cue for "what is the rover doing right now" across the
-# whole window.
-MODE_COLORS = {
-    "idle": "#9ca3af",
-    "manual": "#60a5fa",
-    "point": "#4ade80",
-    "resolve": "#c084fc",
-    MODE_REVIEW_SEGMENTATION: "#f59e0b",
-    MODE_TURN: "#fb923c",
+# exp.md Sec 3 (Mission panel) "Goal Status" -- current sub-goal's
+# execution state -> accent color, shown as one of the Mission panel's
+# stat cells (REACH P2: the same continuous three-stage-style feedback,
+# expressed in exp.md's own vocabulary instead of a generic RECEIVED/
+# EXECUTING/COMPLETE pill).
+GOAL_STATUS_COLORS = {
+    "SEARCHING": "#38bdf8",
+    "DETECTED": "#c084fc",
+    "NAVIGATING": "#4ade80",
+    "UNCERTAIN": "#f59e0b",
+    "REACQUIRING": "#fb923c",
+    "REACHED": "#22d3ee",
+}
+
+# exp.md Sec 4 (Rover Status panel) "Mode" -> accent color.
+ROVER_MODE_COLORS = {
+    "IDLE": "#9ca3af",
+    "AUTONOMOUS": "#4ade80",
+    "HUMAN GUIDANCE": "#f59e0b",
+    "MANUAL": "#60a5fa",
 }
 
 # Uncertainty-halt numpad panel: rover-front-relative headings (degrees,
@@ -166,8 +185,10 @@ def _default_navdp_upstream_ckpt() -> Optional[str]:
 
 class NavGuiApp:
     SIDEBAR_MIN_W = 360
-    PLOT_MIN = 200
-    PLOT_MAX = 480
+    # exp.md Sec 5: TRAJECTORY / BELIEF is a full-width bar below the
+    # camera+sidebar body, not a square panel sized off the sidebar's own
+    # width -- a fixed height, full window width.
+    PLOT_BOTTOM_H = 200
     PLOT_RANGE = 6.0  # meters shown top-to-bottom of the body-frame plot
 
     def __init__(
@@ -188,7 +209,6 @@ class NavGuiApp:
         self._click_panel_visible = False
         self._cam_img_box: Optional[tuple[int, int, int, int]] = None
         self._cam_photo = None
-        self._plot_size = self.PLOT_MIN
         # REACH P9: last action acknowledged, echoed in the status header
         # the instant a button is pressed (before the controller's own
         # state catches up on the next tick) so no press ever feels lost.
@@ -224,17 +244,66 @@ class NavGuiApp:
             except tk.TclError:
                 pass
 
-        # Root grid: row 0 is the working area (camera hero + sidebar),
-        # row 1 is the pinned emergency bar. REACH P8: the STOP control
-        # lives OUTSIDE the scrollable sidebar, on its own always-visible
-        # root row, so an emergency takeover is one click away no matter
-        # how far the sidebar is scrolled or what mode is active.
-        root.grid_rowconfigure(0, weight=1)
-        root.grid_rowconfigure(1, weight=0)
+        # Root grid, following exp.md's four persistent regions top to
+        # bottom: row 0 is the Top Status bar, row 1 is the working area
+        # (camera hero + sidebar), row 2 is the Trajectory/Belief bar, row 3
+        # is the pinned emergency bar. REACH P8: the STOP control lives
+        # OUTSIDE the scrollable sidebar, on its own always-visible root
+        # row, so an emergency takeover is one click away no matter how far
+        # the sidebar is scrolled or what mode is active.
+        root.grid_rowconfigure(0, weight=0)
+        root.grid_rowconfigure(1, weight=1)
+        root.grid_rowconfigure(2, weight=0)
+        root.grid_rowconfigure(3, weight=0)
         root.grid_columnconfigure(0, weight=3)
         root.grid_columnconfigure(1, weight=1, minsize=self.SIDEBAR_MIN_W)
 
         mode_font = ctk.CTkFont(size=17, weight="bold")
+
+        # ===== TOP STATUS / CURRENT STATUS (exp.md Sec. 1) =============== #
+        # Full-width, persistent, above everything else -- the one line the
+        # operator should be able to read without inspecting the camera,
+        # mission, or telemetry panels (REACH P9/P10: continuous, unmissable
+        # feedback on what the rover is doing right now and why).
+        top_status_bar = ctk.CTkFrame(root, border_width=2, border_color="#3f3f46")
+        top_status_bar.grid(
+            row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 4)
+        )
+        top_status_bar.grid_columnconfigure(0, weight=1)
+        self.top_status_label = ctk.CTkLabel(
+            top_status_bar,
+            text="",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=20, weight="bold"),
+        )
+        self.top_status_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 0))
+        self.top_status_detail_label = ctk.CTkLabel(
+            top_status_bar,
+            text="",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=13),
+            text_color="#e5e7eb",
+        )
+        self.top_status_detail_label.grid(
+            row=1, column=0, sticky="ew", padx=14, pady=(0, 8)
+        )
+        top_status_bar.bind(
+            "<Configure>",
+            lambda e: self.top_status_detail_label.configure(
+                wraplength=max(200, e.width - 28)
+            ),
+        )
+        self.alive_label = ctk.CTkLabel(
+            top_status_bar,
+            text="controller thread died -- see console",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#f87171",
+        )
+        self._alive_label_visible = False
 
         # ---------------- camera hero (REACH P7: point-and-select) ------- #
         # Fills all left-column space; the frame is letterboxed into it on
@@ -242,7 +311,7 @@ class NavGuiApp:
         # the primary, most intuitive way to designate a goal -- the direct
         # analog of REACH "point and select an object in the environment".
         cam_frame = ctk.CTkFrame(root)
-        cam_frame.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        cam_frame.grid(row=1, column=0, sticky="nsew", padx=(10, 5), pady=(4, 4))
         cam_frame.grid_rowconfigure(0, weight=1)
         cam_frame.grid_columnconfigure(0, weight=1)
 
@@ -262,20 +331,87 @@ class NavGuiApp:
         # Scrollable so no control is ever clipped off a short monitor
         # (contextual review panels can push the stack past screen height).
         sidebar = ctk.CTkScrollableFrame(root, fg_color="transparent")
-        sidebar.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=(10, 4))
+        sidebar.grid(row=1, column=1, sticky="nsew", padx=(5, 10), pady=(4, 4))
         sidebar.grid_columnconfigure(0, weight=1)
         self.sidebar = sidebar
 
         row = 0
 
-        # ===== SECTION 1 — ROVER STATUS (REACH P2 + P9 + P10) =========== #
-        # The single most important panel in the paper: continuous,
-        # three-stage feedback the rover cannot otherwise provide. Placed
-        # first and always visible.
+        def _stat_cell(parent, col, title) -> ctk.CTkLabel:
+            # Small titled stat card shared by the Mission and Rover Status
+            # panels below (exp.md's DISTANCE / GOAL BELIEF / GOAL STATUS /
+            # CURRENT UNCERTAINTY / HOME UNCERTAINTY cells) -- one visual
+            # vocabulary for "labeled single value" across both panels.
+            cell = ctk.CTkFrame(parent, fg_color="#1a1a1e", corner_radius=6)
+            cell.grid(row=0, column=col, sticky="nsew", padx=3)
+            ctk.CTkLabel(
+                cell,
+                text=title,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="#9ca3af",
+            ).pack(pady=(6, 0))
+            value_label = ctk.CTkLabel(cell, text="--", font=ctk.CTkFont(size=13, weight="bold"))
+            value_label.pack(pady=(0, 6))
+            return value_label
+
+        # ===== SECTION 1 — MISSION (exp.md Sec. 3) ======================= #
+        # "What is the rover trying to accomplish, how far away is the
+        # goal, and how confident is it about that goal?" -- the ordered
+        # goal list plus the four at-a-glance stats about the active goal.
+        self.mission_panel = ctk.CTkFrame(
+            sidebar, border_width=2, border_color="#3f3f46"
+        )
+        self.mission_panel.grid(row=row, column=0, sticky="ew")
+        row += 1
+        self.mission_panel.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            self.mission_panel,
+            text="MISSION",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#9ca3af",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        self.goal_list_label = ctk.CTkLabel(
+            self.mission_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=13),
+        )
+        self.goal_list_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+
+        ctk.CTkLabel(
+            self.mission_panel,
+            text="CURRENT GOAL",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#9ca3af",
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 0))
+        self.current_goal_label = ctk.CTkLabel(
+            self.mission_panel, text="--", anchor="w", justify="left", font=mode_font
+        )
+        self.current_goal_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        mission_stat_row = ctk.CTkFrame(self.mission_panel, fg_color="transparent")
+        mission_stat_row.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 10))
+        for i in range(3):
+            mission_stat_row.grid_columnconfigure(i, weight=1)
+        self.goal_distance_label = _stat_cell(mission_stat_row, 0, "DISTANCE")
+        self.goal_belief_label = _stat_cell(mission_stat_row, 1, "GOAL BELIEF")
+        self.goal_status_label = _stat_cell(mission_stat_row, 2, "STATUS")
+
+        self.mission_panel.bind(
+            "<Configure>",
+            lambda e: self.goal_list_label.configure(wraplength=max(200, e.width - 20)),
+        )
+
+        # ===== SECTION 2 — ROVER STATUS (exp.md Sec. 4) =================== #
+        # "How is the rover operating, what mode is it in, and how certain
+        # is its localization?" -- mode plus the two uncertainty readouts
+        # plus low-level telemetry, kept separate from Mission/goal state.
         self.status_panel = ctk.CTkFrame(
             sidebar, border_width=2, border_color="#3f3f46"
         )
-        self.status_panel.grid(row=row, column=0, sticky="ew")
+        self.status_panel.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
         row += 1
         self.status_panel.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
@@ -285,69 +421,37 @@ class NavGuiApp:
             text_color="#9ca3af",
         ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
 
-        # REACH P2: the three lifecycle pills, lit in order.
-        stage_row = ctk.CTkFrame(self.status_panel, fg_color="transparent")
-        stage_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
-        for i in range(3):
-            stage_row.grid_columnconfigure(i, weight=1)
-        self.stage_pills: dict[str, ctk.CTkLabel] = {}
-        for i, stage in enumerate(STAGE_ORDER):
-            pill = ctk.CTkLabel(
-                stage_row,
-                text=STAGE_LABELS[stage],
-                font=ctk.CTkFont(size=11, weight="bold"),
-                fg_color=STAGE_IDLE_COLOR,
-                corner_radius=6,
-                text_color="#e5e7eb",
-            )
-            pill.grid(row=0, column=i, sticky="ew", padx=2, ipady=5)
-            self.stage_pills[stage] = pill
-
         self.mode_label = ctk.CTkLabel(
             self.status_panel, text="", anchor="w", justify="left", font=mode_font
         )
-        self.mode_label.grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 0))
-        self.detail_label = ctk.CTkLabel(
+        self.mode_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+
+        rover_stat_row = ctk.CTkFrame(self.status_panel, fg_color="transparent")
+        rover_stat_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        rover_stat_row.grid_columnconfigure(0, weight=1)
+        rover_stat_row.grid_columnconfigure(1, weight=1)
+        self.current_uncertainty_label = _stat_cell(
+            rover_stat_row, 0, "CURRENT UNCERTAINTY"
+        )
+        self.home_uncertainty_label = _stat_cell(rover_stat_row, 1, "HOME UNCERTAINTY")
+
+        # Telemetry: only the operational values exp.md calls out (position,
+        # heading, velocity, yaw rate, nav state) -- model-internal/CBF
+        # debugging detail stays out of this panel (see the trajectory/
+        # belief bar's own HUD for that).
+        self.telemetry_label = ctk.CTkLabel(
             self.status_panel,
             text="",
             anchor="w",
             justify="left",
-            wraplength=self.SIDEBAR_MIN_W - 40,
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=12, family="Consolas"),
+            text_color="#e5e7eb",
         )
-        self.detail_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(2, 2))
+        self.telemetry_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
         self.status_panel.bind(
             "<Configure>",
-            lambda e: self.detail_label.configure(wraplength=max(200, e.width - 20)),
+            lambda e: self.telemetry_label.configure(wraplength=max(200, e.width - 20)),
         )
-        self.alive_label = ctk.CTkLabel(
-            self.status_panel,
-            text="controller thread died -- see console",
-            anchor="w",
-            justify="left",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#f87171",
-        )
-        self._alive_label_visible = False
-
-        # ===== SECTION 2 — MAP / SITUATIONAL AWARENESS (REACH P4) ======= #
-        # Persistent body-frame frame-of-reference: rover, goal, planned
-        # path (trajectory) and hazards (obstacles) always on screen.
-        plot_frame = ctk.CTkFrame(sidebar)
-        plot_frame.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
-        row += 1
-        plot_frame.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            plot_frame,
-            text="MAP",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#9ca3af",
-        ).grid(row=0, column=0, sticky="w", padx=10, pady=(6, 0))
-        self.plot = tk.Canvas(
-            plot_frame, height=self.PLOT_MIN, bg=PLOT_BG, highlightthickness=0
-        )
-        self.plot.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
-        self.plot.bind("<Configure>", self._on_plot_configure)
 
         # ===== SECTION 3 — DESIGNATE TARGET (REACH P1 + P7) ============= #
         # REACH P1 (contextual menu): this section is only the *selection*
@@ -397,11 +501,13 @@ class NavGuiApp:
         # self.ground_entry.bind("<Return>", lambda e: self.ground_target())
         #######################################################
 
-        # ===== SECTION 4 — TASKWORK / MISSION (REACH P3 + P10) ========== #
+        # ===== SECTION 4 — TASKWORK (REACH P3 + P10) ===================== #
         # Free-text command -> ordered, chunked mission the operator can
-        # self-check step by step (progress synced from d.mission_status),
-        # exactly REACH's linear taskwork pages that "reduce the need for
-        # constant, line-by-line directions from ground control".
+        # self-check step by step (progress synced from d.mission_status,
+        # and shown structured in the MISSION panel above via d.mission_goals
+        # once dispatched), exactly REACH's linear taskwork pages that
+        # "reduce the need for constant, line-by-line directions from
+        # ground control".
         command_panel = ctk.CTkFrame(sidebar)
         command_panel.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
         row += 1
@@ -661,13 +767,33 @@ class NavGuiApp:
             row=footer_row, column=0, sticky="new", padx=4, pady=(BTN_GAP, 0)
         )
 
+        # ===== TRAJECTORY / BELIEF (exp.md Sec. 5) ======================= #
+        # "Where has the rover been, and where does it currently believe
+        # the goal is?" -- full-width, persistent, below the camera+sidebar
+        # body (REACH P4 map/situational-awareness), pulled out of the
+        # scrollable sidebar so it's never affected by sidebar scroll
+        # position, matching exp.md's dedicated bottom region.
+        plot_frame = ctk.CTkFrame(root)
+        plot_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4))
+        plot_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            plot_frame,
+            text="TRAJECTORY / BELIEF",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#9ca3af",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(6, 0))
+        self.plot = tk.Canvas(
+            plot_frame, height=self.PLOT_BOTTOM_H, bg=PLOT_BG, highlightthickness=0
+        )
+        self.plot.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 6))
+
         # ===== PINNED EMERGENCY BAR (REACH P8) ========================== #
         # On its own root row, spanning the full width, OUTSIDE the
         # scrollable sidebar -- always on screen. This is the paper's
         # emergency-takeover affordance: the single most safety-critical
         # control gets the largest, reddest, most reachable real estate.
         stop_bar = ctk.CTkFrame(root, fg_color="transparent")
-        stop_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        stop_bar.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
         stop_bar.grid_columnconfigure(0, weight=3)
         stop_bar.grid_columnconfigure(1, weight=1)
         ctk.CTkButton(
@@ -707,14 +833,6 @@ class NavGuiApp:
         # Mirror of _scroll_sidebar_to_bottom for when a contextual panel
         # closes -- return to the always-on status/map sections above.
         self.root.after_idle(lambda: self.sidebar._parent_canvas.yview_moveto(0.0))
-
-    def _on_plot_configure(self, event) -> None:
-        # Keep the body-frame canvas square, tracking the sidebar's current
-        # width (clamped) instead of a fixed pixel size baked in at startup.
-        new_size = max(self.PLOT_MIN, min(int(event.width), self.PLOT_MAX))
-        if abs(new_size - self._plot_size) > 2:
-            self._plot_size = new_size
-            self.plot.configure(height=new_size)
 
     # ---------------- commands ---------------- #
     def _guarded(self, fn, *fn_args) -> None:
@@ -914,34 +1032,235 @@ class NavGuiApp:
         self.root.destroy()
 
     # ---------------- refresh loop ---------------- #
-    def _derive_stage(self, d) -> Optional[str]:
-        # REACH P2: fold the controller's existing signals into the
-        # three-stage lifecycle without needing any new controller field.
-        # COMPLETE wins; otherwise an active goal that is moving is
-        # EXECUTING, an active goal not yet moving is RECEIVED. No goal ->
-        # no stage lit (idle / manual).
+    def _derive_goal_status(self, d) -> Optional[str]:
+        # exp.md Sec 3 "Goal Status" -- the active sub-goal's execution
+        # state, folded from the controller's existing signals (no new
+        # controller field needed, same trick the old REACH 3-stage pills
+        # used). Precedence: REACHED wins, then the uncertainty-halt
+        # states, then SEARCHING/DETECTED/NAVIGATING based on whether a
+        # goal has been sighted and whether the rover is currently moving.
+        # None when no goal is active at all (idle / manual drive) -- the
+        # Mission panel shows a dash then.
         if d.goal_reached:
-            return "complete"
+            return "REACHED"
+        if d.uncertainty_halted:
+            return "UNCERTAIN"
+        if d.uncertainty_searching:
+            return "REACQUIRING"
         active = d.mode in ("point", "resolve", MODE_TURN, MODE_REVIEW_SEGMENTATION)
         if not active:
             return None
+        if d.mode == MODE_REVIEW_SEGMENTATION:
+            return "DETECTED"
+        if d.mode == "resolve" and d.belief_g is None:
+            return "SEARCHING"
         moving = abs(d.action.v_fwd) > 0.01 or abs(d.action.yaw_rate) > 0.01
-        return "executing" if moving else "received"
+        return "NAVIGATING" if moving else "DETECTED"
 
-    def _sync_stage_pills(self, stage: Optional[str]) -> None:
-        # Light stages up to and including the active one: past stages
-        # green (done), current stage cyan (active), future stages grey.
-        active_idx = STAGE_ORDER.index(stage) if stage in STAGE_ORDER else -1
-        for i, name in enumerate(STAGE_ORDER):
-            if active_idx < 0:
-                color = STAGE_IDLE_COLOR
-            elif i < active_idx:
-                color = STAGE_DONE_COLOR
-            elif i == active_idx:
-                color = STAGE_ACTIVE_COLOR
+    @staticmethod
+    def _subgoal_label(g) -> str:
+        # nav.mission.SubGoal -> exp.md Goal-List display text. GO_TO/FIND
+        # show the landmark name; RETURN/TURN/ADVANCE (direction legs, not
+        # landmarks) get a short verb label instead.
+        if g.kind in (GoalKind.GO_TO, GoalKind.FIND):
+            return g.target.upper()
+        if g.kind == GoalKind.RETURN:
+            return "HOME"
+        if g.kind == GoalKind.TURN:
+            return f"TURN {g.target.upper()}"
+        if g.kind == GoalKind.ADVANCE:
+            return "ADVANCE"
+        return g.raw.upper() or "?"
+
+    def _current_goal_text(self, d) -> str:
+        if d.mission_goals and 0 <= d.mission_goal_idx < len(d.mission_goals):
+            g = d.mission_goals[d.mission_goal_idx]
+            if g.kind != GoalKind.DONE:
+                return self._subgoal_label(g)
+        # Ad-hoc (non-mission) goal -- Segment/Ground/Random/point-click --
+        # d.goal_label is GoalSpec.instruction_text, still its startup
+        # placeholder until a goal is actually resolved.
+        if d.goal_label and d.goal_label != "(no goal resolved yet)":
+            return d.goal_label.upper()
+        return ""
+
+    def _goal_list_text(self, d) -> str:
+        # exp.md Sec 3 "Goal List" -- ✓ done / → current / ○ upcoming.
+        if not d.mission_goals:
+            # No VLM-parsed Mission running -- degrade to a single-entry
+            # list around whatever ad-hoc goal is active, rather than
+            # leaving the panel blank.
+            label = self._current_goal_text(d)
+            return f"→ 1. {label}" if label else "(no active mission)"
+        lines = []
+        n = 0
+        for i, g in enumerate(d.mission_goals):
+            if g.kind == GoalKind.DONE:
+                continue
+            n += 1
+            if i < d.mission_goal_idx:
+                marker = "✓"
+            elif i == d.mission_goal_idx:
+                marker = "→"
             else:
-                color = STAGE_IDLE_COLOR
-            self.stage_pills[name].configure(fg_color=color)
+                marker = "○"
+            lines.append(f"{marker} {n}. {self._subgoal_label(g)}")
+        return "\n".join(lines) if lines else "(no active mission)"
+
+    def _derive_goal_belief(self, d) -> tuple[str, str]:
+        # exp.md Sec 3 "Goal Belief" -- a human-readable confidence label,
+        # not the raw covariance value (that stays numeric in the Rover
+        # Status panel / trajectory-belief HUD). Ratio thresholds mirror
+        # _draw_plot_telemetry's own 0.8-of-threshold warning color.
+        if (
+            d.belief_g is None
+            or not d.uncertainty_enabled
+            or d.uncertainty_threshold <= 0
+        ):
+            return "--", PLOT_TELEMETRY_TEXT
+        ratio = d.uncertainty_value / d.uncertainty_threshold
+        if ratio >= 0.8:
+            return "LOW CONFIDENCE", "#f87171"
+        if ratio >= 0.5:
+            return "LOW CONFIDENCE", "#fbbf24"
+        return "HIGH CONFIDENCE", "#4ade80"
+
+    @staticmethod
+    def _derive_rover_mode(d) -> str:
+        # exp.md Sec 4 "Mode" -- collapses the controller's finer-grained
+        # d.mode into the four states the operator actually needs to tell
+        # apart; HUMAN GUIDANCE wins whenever an uncertainty halt is
+        # actively asking the operator for a heading, regardless of d.mode.
+        if d.mode == "manual":
+            return "MANUAL"
+        if d.uncertainty_halted:
+            return "HUMAN GUIDANCE"
+        if d.mode == "idle":
+            return "IDLE"
+        return "AUTONOMOUS"
+
+    def _derive_top_status(
+        self, d, goal_status: Optional[str], alive: bool
+    ) -> tuple[str, str, str]:
+        # exp.md Sec 1 -- (state, subtext, color). `state` is drawn from
+        # exp.md's own "typical states" vocabulary; `subtext` carries the
+        # specific why/what (goal name, halt reason), matching that
+        # section's own "Navigating to ANTENNA" / "Goal localization
+        # uncertainty exceeded threshold" examples.
+        if not alive:
+            return (
+                "RECOVERING",
+                "controller thread died -- see console",
+                TOP_STATUS_COLORS["RECOVERING"],
+            )
+        if d.uncertainty_halted:
+            reason = (
+                d.uncertainty_line or "Goal localization uncertainty exceeded threshold"
+            )
+            return "AWAITING HUMAN", reason, TOP_STATUS_COLORS["AWAITING HUMAN"]
+        if d.mode == "manual":
+            return "MANUAL CONTROL", "Operator driving", TOP_STATUS_COLORS["MANUAL CONTROL"]
+        if (
+            d.mission_goals
+            and d.mission_goal_idx >= 0
+            and d.mission_goals[d.mission_goal_idx].kind == GoalKind.DONE
+        ):
+            return (
+                "MISSION COMPLETE",
+                d.mission_status or "All goals reached",
+                TOP_STATUS_COLORS["MISSION COMPLETE"],
+            )
+        if d.goal_reached:
+            target = self._current_goal_text(d)
+            subtext = f"Reached {target}" if target else d.status_text
+            return "GOAL REACHED", subtext, TOP_STATUS_COLORS["GOAL REACHED"]
+        if d.mode == MODE_REVIEW_SEGMENTATION:
+            return "PARSING MISSION", d.status_text, TOP_STATUS_COLORS["PARSING MISSION"]
+        if goal_status == "SEARCHING":
+            target = self._current_goal_text(d)
+            subtext = f"Searching for {target}" if target else d.status_text
+            return "SEARCHING", subtext, TOP_STATUS_COLORS["SEARCHING"]
+        if goal_status in ("NAVIGATING", "DETECTED", "REACQUIRING"):
+            target = self._current_goal_text(d)
+            subtext = f"Navigating to {target}" if target else d.status_text
+            return "NAVIGATING", subtext, TOP_STATUS_COLORS["NAVIGATING"]
+        return "IDLE", d.status_text, TOP_STATUS_COLORS["IDLE"]
+
+    def _sync_mission_panel(self, d, goal_status: Optional[str]) -> None:
+        self.goal_list_label.configure(text=self._goal_list_text(d))
+        current = self._current_goal_text(d)
+        self.current_goal_label.configure(text=current or "--")
+        self.goal_distance_label.configure(
+            text=f"{d.distance:.1f} m" if d.distance is not None else "--"
+        )
+        belief_text, belief_color = self._derive_goal_belief(d)
+        self.goal_belief_label.configure(text=belief_text, text_color=belief_color)
+        self.goal_status_label.configure(
+            text=goal_status or "--",
+            text_color=GOAL_STATUS_COLORS.get(goal_status, "#e5e7eb"),
+        )
+
+    @staticmethod
+    def _unc_color(value: float, threshold: float) -> str:
+        if threshold <= 0:
+            return PLOT_TELEMETRY_TEXT
+        ratio = value / threshold
+        if ratio >= 0.8:
+            return "#f87171"
+        if ratio >= 0.5:
+            return "#fbbf24"
+        return "#4ade80"
+
+    def _sync_rover_status_panel(self, d) -> None:
+        rover_mode = self._derive_rover_mode(d)
+        self.mode_label.configure(
+            text=rover_mode, text_color=ROVER_MODE_COLORS.get(rover_mode, "#e5e7eb")
+        )
+
+        if d.uncertainty_enabled:
+            cur_text = f"{d.uncertainty_value:.2f}/{d.uncertainty_threshold:.2f}"
+            cur_color = self._unc_color(d.uncertainty_value, d.uncertainty_threshold)
+        else:
+            cur_text, cur_color = "off", PLOT_TELEMETRY_TEXT
+        self.current_uncertainty_label.configure(text=cur_text, text_color=cur_color)
+
+        home_text = (
+            f"{d.home_base_uncertainty_value:.2f}/{d.home_base_uncertainty_threshold:.2f}"
+        )
+        self.home_uncertainty_label.configure(
+            text=home_text,
+            text_color=self._unc_color(
+                d.home_base_uncertainty_value, d.home_base_uncertainty_threshold
+            ),
+        )
+
+        # exp.md Sec 4 "Telemetry" -- only the operational values it calls
+        # out (position, heading, velocity, yaw rate, nav state);
+        # model-internal/CBF debugging detail stays in the trajectory/
+        # belief bar's own HUD instead of this panel.
+        pose_txt = (
+            f"pos ({d.pose.x:.1f}, {d.pose.z:.1f})  heading={math.degrees(d.pose.yaw):.0f}deg"
+            if d.pose is not None
+            else "pos: -"
+        )
+        act = d.action
+        nav_state = d.mode.upper().replace("_", " ")
+        if d.goal_reached:
+            nav_state += " (GOAL REACHED)"
+        lines = [
+            pose_txt,
+            f"v={act.v_fwd:.2f} m/s  yaw_rate={act.yaw_rate:+.2f} rad/s",
+            f"nav state: {nav_state}",
+        ]
+        self.telemetry_label.configure(text="\n".join(lines))
+
+    def _sync_top_status(self, d, goal_status: Optional[str], alive: bool) -> None:
+        state, subtext, color = self._derive_top_status(d, goal_status, alive)
+        self.top_status_label.configure(text=state, text_color=color)
+        # REACH P9: prefer the freshest human ack over the derived subtext
+        # so a just-pressed control's acknowledgment always wins on the
+        # same frame it fires, before the controller's own state catches up.
+        self.top_status_detail_label.configure(text=self._ack_text or subtext)
 
     def refresh(self) -> None:
         if self.closed:
@@ -965,22 +1284,14 @@ class NavGuiApp:
         self.click_status_label.configure(text=d.click_status)
         self.mission_status_label.configure(text=d.mission_status)
 
-        # REACH P2: drive the three-stage lifecycle pills.
-        self._sync_stage_pills(self._derive_stage(d))
-
-        mode_txt = d.mode.upper().replace("_", " ")
-        if d.goal_reached:
-            mode_txt += " GOAL REACHED"
-        self.mode_label.configure(
-            text=mode_txt, text_color=MODE_COLORS.get(d.mode, "#e5e7eb")
-        )
-        # REACH P9: prefer the freshest human ack, fall back to controller
-        # status text -- so the header reacts on the same frame as a press.
-        self.detail_label.configure(text=self._ack_text or d.status_text)
+        goal_status = self._derive_goal_status(d)
+        self._sync_mission_panel(d, goal_status)
+        self._sync_rover_status_panel(d)
 
         alive = self.controller.is_alive()
+        self._sync_top_status(d, goal_status, alive)
         if not alive and not self._alive_label_visible:
-            self.alive_label.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
+            self.alive_label.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
             self._alive_label_visible = True
         elif alive and self._alive_label_visible:
             self.alive_label.grid_forget()
@@ -1089,17 +1400,27 @@ class NavGuiApp:
         return img
 
     def _draw_plot(self, d) -> None:
+        # exp.md Sec 5: a full-width, fixed-height bottom bar now (not a
+        # square panel sized off the sidebar) -- scale is derived from the
+        # canvas's actual current size every frame instead of a cached
+        # square _plot_size, and the drawing is centered horizontally so
+        # extra width just widens the visible left/right margin.
         self.plot.delete("all")
-        S, R = self._plot_size, self.PLOT_RANGE
+        W = max(2, self.plot.winfo_width())
+        H = max(2, self.plot.winfo_height())
+        R = self.PLOT_RANGE
+        scale = min(W / (2 * R), 0.92 * H / R)
+        cx = W / 2
+        baseline_y = H - 20
 
         def to_px(
             forward, left
-        ):  # body frame (fwd, left) -> canvas (origin at rover, facing up)
-            return S / 2 - (left / R) * (S / 2), S - (forward / R) * S * 0.92 - 20
+        ):  # body frame (fwd, left) -> canvas (rover at bottom-center, facing up)
+            return cx - left * scale, baseline_y - forward * scale
 
-        self.plot.create_line(0, S - 20, S, S - 20, fill=PLOT_AXIS)
+        self.plot.create_line(0, baseline_y, W, baseline_y, fill=PLOT_AXIS)
         self.plot.create_oval(
-            S / 2 - 5, S - 25, S / 2 + 5, S - 15, fill=PLOT_ROVER, outline=""
+            cx - 5, baseline_y - 5, cx + 5, baseline_y + 5, fill=PLOT_ROVER, outline=""
         )  # rover
 
         if d.obstacle_point is not None:
@@ -1116,6 +1437,29 @@ class NavGuiApp:
 
         if d.belief_g is not None:
             gx, gy = to_px(d.belief_g[0], d.belief_g[1])
+            # exp.md Sec 5 "Belief": the goal marker's own dispersion ring
+            # grows with uncertainty_value (clamped at uncertainty_threshold)
+            # so high-confidence vs. increasing vs. high uncertainty reads
+            # spatially here, not only as the Mission panel's HIGH/LOW
+            # CONFIDENCE text.
+            if d.uncertainty_enabled and d.uncertainty_threshold > 0:
+                ratio = min(1.0, d.uncertainty_value / d.uncertainty_threshold)
+            else:
+                ratio = 0.0
+            ring_r_px = max(6.0, (0.25 + 1.5 * ratio) * scale)
+            ring_color = (
+                self._unc_color(d.uncertainty_value, d.uncertainty_threshold)
+                if d.uncertainty_enabled
+                else PLOT_GOAL
+            )
+            self.plot.create_oval(
+                gx - ring_r_px,
+                gy - ring_r_px,
+                gx + ring_r_px,
+                gy + ring_r_px,
+                outline=ring_color,
+                width=2,
+            )
             self.plot.create_text(
                 gx, gy, text="*", fill=PLOT_GOAL, font=("TkDefaultFont", 26)
             )
@@ -1123,14 +1467,14 @@ class NavGuiApp:
         self._draw_plot_telemetry(d)
 
     def _draw_plot_telemetry(self, d) -> None:
-        # REACH P4 + P6: the numeric telemetry (pose, drive command, CBF and
-        # belief-uncertainty state) used to live in a themed sidebar
-        # CTkLabel, whose text/background colors each independently follow
-        # the OS appearance mode and would often end up low-contrast against
-        # each other. Drawn here instead, stacked top-left over the radar/map
-        # canvas, with an explicit fill against the canvas's own fixed
-        # PLOT_BG -- always legible, and it reads naturally as the map's own
-        # HUD rather than a separate panel.
+        # REACH P4 + P6: a compact debug HUD (pose, drive command, CBF
+        # state) stacked top-left over the trajectory/belief canvas, with
+        # an explicit fill against the canvas's own fixed PLOT_BG -- always
+        # legible regardless of OS appearance mode. Current/home
+        # uncertainty are shown numerically in the Rover Status panel
+        # instead of duplicated here; this HUD stays low-level/diagnostic,
+        # per exp.md's "keep implementation detail out of the primary
+        # panels" guidance.
         pose_txt = (
             f"pose ({d.pose.x:.1f}, {d.pose.z:.1f})  yaw={math.degrees(d.pose.yaw):.0f}deg"
             if d.pose is not None
@@ -1162,46 +1506,6 @@ class NavGuiApp:
                 font=("Consolas", 10),
             )
             y += 14
-
-        # Uncertainty lines are colored separately (warn once a tracker is
-        # within 80% of the halt/threshold) rather than folded into `lines`
-        # above, so their color can react independently of the plain-text
-        # telemetry stacked over them.
-        def unc_color(value: float, threshold: float) -> str:
-            return (
-                PLOT_TELEMETRY_WARN
-                if threshold > 0 and value >= 0.8 * threshold
-                else PLOT_TELEMETRY_TEXT
-            )
-
-        if d.uncertainty_enabled:
-            text = (
-                f"current unc={d.uncertainty_value:.2f}/{d.uncertainty_threshold:.2f}"
-            )
-            self.plot.create_text(
-                x,
-                y,
-                text=text,
-                anchor="nw",
-                fill=unc_color(d.uncertainty_value, d.uncertainty_threshold),
-                font=("Consolas", 10),
-            )
-            y += 14
-
-        home_text = (
-            f"home unc={d.home_base_uncertainty_value:.2f}/"
-            f"{d.home_base_uncertainty_threshold:.2f}"
-        )
-        self.plot.create_text(
-            x,
-            y,
-            text=home_text,
-            anchor="nw",
-            fill=unc_color(
-                d.home_base_uncertainty_value, d.home_base_uncertainty_threshold
-            ),
-            font=("Consolas", 10),
-        )
 
     def tick_forever(self) -> None:
         self.root.mainloop()
