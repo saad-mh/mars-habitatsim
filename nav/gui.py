@@ -195,15 +195,10 @@ class NavGuiApp:
         self,
         root: ctk.CTk,
         controller: RoverController,
-        max_linear: float,
-        max_angular: float,
     ):
         self.root = root
         self.controller = controller
-        self.max_linear = max_linear
-        self.max_angular = max_angular
         self.closed = False
-        self._manual_held: set[str] = set()
         self._pending_click_norm: Optional[tuple[float, float]] = None
         self._seg_panel_visible = False
         self._click_panel_visible = False
@@ -453,54 +448,6 @@ class NavGuiApp:
             lambda e: self.telemetry_label.configure(wraplength=max(200, e.width - 20)),
         )
 
-        # ===== SECTION 3 — DESIGNATE TARGET (REACH P1 + P7) ============= #
-        # REACH P1 (contextual menu): this section is only the *selection*
-        # half of the workflow -- the three ways to designate a target.
-        # The *action* half (Confirm / Rerun / Pick manually, or a point
-        # confirm) is not shown here; it appears contextually below only
-        # once a target actually exists. That mirrors REACH's "select an
-        # object, THEN the relevant actions appear" adaptive menu.
-        target = ctk.CTkFrame(sidebar)
-        target.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
-        row += 1
-        target.grid_columnconfigure(0, weight=1)
-        target.grid_columnconfigure(1, weight=1)
-        target.grid_columnconfigure(2, weight=1)
-        ctk.CTkLabel(
-            target, text="DESIGNATE TARGET", font=ctk.CTkFont(size=12, weight="bold")
-        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 4))
-
-        # REACH P7/P1: segment the scene and let the model pick a rock goal.
-        ctk.CTkButton(
-            target, text="Segment Scene", height=BTN_H, command=self.resolve_goal
-        ).grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, BTN_GAP))
-        # REACH P10 (autonomy): let the rover self-select a plausible
-        # exploration goal when the operator has no specific target.
-        ctk.CTkButton(
-            target, text="Random Goal", height=BTN_H, command=self.random_goal
-        ).grid(row=1, column=1, sticky="ew", padx=4, pady=(0, BTN_GAP))
-        # REACH P1 (rover-as-selectable-object → "go home" action): the
-        # paper's rover menu includes "go home" (autonomous return to
-        # start). Same verb, same place.
-        ctk.CTkButton(target, text="Go Home", height=BTN_H, command=self.go_home).grid(
-            row=1, column=2, sticky="ew", padx=(4, 10), pady=(0, BTN_GAP)
-        )
-        # REACH P1: open-vocabulary grounding -- name a target the segmenter
-        # wasn't trained on; produces the same reviewable goal.
-        #######################################################
-        # ctk.CTkButton(
-        #     target, text="Ground Target", height=BTN_H, command=self.ground_target
-        # ).grid(row=2, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, BTN_GAP // 2))
-        # # REACH P1: free-text open-vocabulary entry feeding Ground Target.
-        # self.ground_entry = ctk.CTkEntry(
-        #     target, placeholder_text='name it: "flag" / "blue cuboid"', height=38
-        # )
-        # self.ground_entry.grid(
-        #     row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, BTN_GAP)
-        # )
-        # self.ground_entry.bind("<Return>", lambda e: self.ground_target())
-        #######################################################
-
         # ===== SECTION 4 — TASKWORK (REACH P3 + P10) ===================== #
         # Free-text command -> ordered, chunked mission the operator can
         # self-check step by step (progress synced from d.mission_status,
@@ -539,57 +486,9 @@ class NavGuiApp:
             row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, BTN_GAP)
         )
 
-        # ===== SECTION 5 — MANUAL DRIVE (REACH P5 + P7) ================= #
-        # Direct D-pad control, large glove-safe keys, always visible.
-        drive = ctk.CTkFrame(sidebar)
-        drive.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
-        row += 1
-        drive.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            drive, text="MANUAL DRIVE", font=ctk.CTkFont(size=12, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
-        dpad = ctk.CTkFrame(drive, fg_color="transparent")
-        dpad.grid(row=1, column=0, pady=(0, 4))
-        dpad_cells = {
-            "fwd": (0, 1, "↑"),
-            "left": (1, 0, "←"),
-            "right": (1, 2, "→"),
-            "back": (2, 1, "↓"),
-        }
-        # REACH P5: each drive key is large (64x52) and separated by wide
-        # padding so a gloved press cannot spill onto the neighbour.
-        for direction, (r, c, glyph) in dpad_cells.items():
-            b = ctk.CTkButton(dpad, text=glyph, width=64, height=52, font=mode_font)
-            b.bind("<ButtonPress-1>", lambda e, d=direction: self.manual_press(d))
-            b.bind("<ButtonRelease-1>", lambda e, d=direction: self.manual_release(d))
-            b.grid(row=r, column=c, padx=6, pady=6)
-        ctk.CTkLabel(
-            drive,
-            text="hold a direction, or use the arrow keys — Esc cancels a pending click",
-            font=ctk.CTkFont(size=11),
-            text_color="#9ca3af",
-            wraplength=self.SIDEBAR_MIN_W - 40,
-            justify="left",
-        ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, BTN_GAP))
-
-        # Global keyboard shortcuts below are bound on root, so they fire on
-        # every keypress in the window regardless of focus -- guard each one
-        # against a text entry having focus, or typing e.g. "left" or a
-        # digit into it would also drive the rover / submit a heading.
-        for key, direction in (
-            ("Up", "fwd"),
-            ("Down", "back"),
-            ("Left", "left"),
-            ("Right", "right"),
-        ):
-            root.bind(
-                f"<KeyPress-{key}>",
-                lambda e, d=direction: self._guarded(self.manual_press, d),
-            )
-            root.bind(
-                f"<KeyRelease-{key}>",
-                lambda e, d=direction: self._guarded(self.manual_release, d),
-            )
+        # Escape is a global keyboard shortcut bound on root (fires on every
+        # keypress regardless of focus) -- cancels a pending camera click /
+        # hard-clears goals, independent of any particular sidebar section.
         root.bind("<Escape>", lambda e: self.clear_all())
 
         # Numpad heading shortcuts for the uncertainty-halt panel below --
@@ -836,13 +735,10 @@ class NavGuiApp:
 
     # ---------------- commands ---------------- #
     def _guarded(self, fn, *fn_args) -> None:
-        # Skip root-level keyboard shortcuts while a text entry has focus,
-        # so typing there doesn't also drive the rover / trigger a heading
-        # submission (see the binding loops above).
-        if self.root.focus_get() in (
-            self.command_entry,
-            getattr(self, "ground_entry", None),
-        ):
+        # Skip root-level keyboard shortcuts (the uncertainty-halt numpad
+        # heading/retry bindings below) while the taskwork entry has focus,
+        # so typing a command there doesn't also submit a heading.
+        if self.root.focus_get() is self.command_entry:
             return
         fn(*fn_args)
 
@@ -866,41 +762,12 @@ class NavGuiApp:
         self.controller.submit_nav_command(text)
         self.command_entry.delete(0, "end")
 
-    def resolve_goal(self) -> None:
-        self._manual_held.clear()
-        self.cancel_pixel_click()
-        self._ack("segmenting scene…")
-        self.controller.request_resolve()
-
-    def ground_target(self) -> None:
-        text = self.ground_entry.get().strip()
-        if not text:
-            return
-        self._manual_held.clear()
-        self.cancel_pixel_click()
-        self._ack(f"grounding target: {text}")
-        self.controller.request_resolve(target_text=text)
-
-    def random_goal(self) -> None:
-        self._manual_held.clear()
-        self.cancel_pixel_click()
-        self._ack("random goal requested")
-        self.controller.random_goal()
-
-    def go_home(self) -> None:
-        self._manual_held.clear()
-        self.cancel_pixel_click()
-        self._ack("returning home")
-        self.controller.go_home()
-
     def reset_rover(self) -> None:
-        self._manual_held.clear()
         self.cancel_pixel_click()
         self._ack("rover reset")
         self.controller.request_reset()
 
     def stop(self) -> None:
-        self._manual_held.clear()
         self.cancel_pixel_click()
         self._ack("STOP — driving halted")
         self.controller.stop_driving()
@@ -910,7 +777,6 @@ class NavGuiApp:
         # goal/obstacle masks, the active mission, and any uncertainty halt,
         # leaving the rover exactly where it is (unlike reset_rover, which
         # also teleports it back to spawn). See RoverController.clear_all_goals.
-        self._manual_held.clear()
         self.cancel_pixel_click()
         self._ack("cleared — all goals, missions, and masks removed")
         self.controller.clear_all_goals()
@@ -925,7 +791,6 @@ class NavGuiApp:
         self.controller.request_rerun_segmentation()
 
     def pick_manually(self) -> None:
-        self._manual_held.clear()
         self._ack("pick a point in the live view")
         self.controller.request_pick_manually()
 
@@ -956,7 +821,6 @@ class NavGuiApp:
     def confirm_pixel_goal(self) -> None:
         if self._pending_click_norm is None:
             return
-        self._manual_held.clear()
         nx, ny = self._pending_click_norm
         self._ack("point goal committed")
         self.controller.request_pixel_goal(nx, ny)
@@ -964,31 +828,6 @@ class NavGuiApp:
 
     def cancel_pixel_click(self) -> None:
         self._pending_click_norm = None
-
-    # ---------------- manual drive ---------------- #
-    def manual_press(self, direction: str) -> None:
-        self.cancel_pixel_click()
-        self._manual_held.add(direction)
-        self._manual_update()
-
-    def manual_release(self, direction: str) -> None:
-        self._manual_held.discard(direction)
-        self._manual_update()
-
-    def _manual_update(self) -> None:
-        if not self._manual_held:
-            self.controller.stop_driving()
-            return
-        lin = ang = 0.0
-        if "fwd" in self._manual_held:
-            lin += self.max_linear
-        if "back" in self._manual_held:
-            lin -= 0.5 * self.max_linear
-        if "left" in self._manual_held:
-            ang += self.max_angular
-        if "right" in self._manual_held:
-            ang -= self.max_angular
-        self.controller.set_manual(lin, ang)
 
     def _build_topdown_window(self) -> None:
         """Second, independent window showing the fixed bird's-eye camera
@@ -1844,9 +1683,7 @@ def main(argv=None) -> None:
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("dark-blue")
     root = ctk.CTk()
-    app = NavGuiApp(
-        root, controller, max_linear=args.max_linear, max_angular=args.max_angular
-    )
+    app = NavGuiApp(root, controller)
     try:
         app.tick_forever()
     finally:
