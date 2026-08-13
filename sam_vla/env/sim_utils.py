@@ -34,6 +34,23 @@ def set_agent_pose(agent, x: float, y: float, z: float, yaw: float) -> None:
     agent.set_state(state)
 
 
+# -pi/2 about world +X pitches the agent's default forward (-Z) to straight
+# down (-Y) -- the standard habitat-sim trick for a bird's-eye camera. See
+# set_agent_pose_topdown.
+_TOPDOWN_ROTATION_VECTOR = [-1.5707963267948966, 0.0, 0.0]
+
+
+def set_agent_pose_topdown(agent, x: float, y: float, z: float) -> None:
+    """Point a free-standing (non-driving) agent's camera straight down at
+    (x, z) from height y, for a fixed top-down viz camera -- unlike
+    set_agent_pose, there is no yaw: this agent never steers, so only its
+    world position and downward pitch matter."""
+    state = agent.get_state()
+    state.position = np.asarray([x, y, z], dtype=np.float32)
+    state.rotation = quaternion.from_rotation_vector(_TOPDOWN_ROTATION_VECTOR)
+    agent.set_state(state)
+
+
 def rgb_depth(obs: Dict[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
     rgb = np.asarray(obs["rgb"])
     if rgb.ndim == 3 and rgb.shape[-1] == 4:

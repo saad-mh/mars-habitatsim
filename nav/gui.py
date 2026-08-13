@@ -194,6 +194,15 @@ class NavGuiApp:
         # state catches up on the next tick) so no press ever feels lost.
         self._ack_text = ""
 
+        # Purely additive, human-viz-only window (see RoverController.
+        # enable_topdown_viz) -- never touches the main console's layout
+        # below; only exists when the controller was started with the flag.
+        self._topdown_window = None
+        self._topdown_canvas = None
+        self._topdown_photo = None
+        if getattr(self.controller, "enable_topdown_viz", False):
+            self._build_topdown_window()
+
         root.title("mars-habitatsim/nav · REACH console")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.minsize(900, 640)
@@ -330,7 +339,7 @@ class NavGuiApp:
         plot_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             plot_frame,
-            text="MAP — rover · goal · path · hazards",
+            text="MAP",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#9ca3af",
         ).grid(row=0, column=0, sticky="w", padx=10, pady=(6, 0))
@@ -863,8 +872,45 @@ class NavGuiApp:
             ang -= self.max_angular
         self.controller.set_manual(lin, ang)
 
+    def _build_topdown_window(self) -> None:
+        """Second, independent window showing the fixed bird's-eye camera
+        (see RoverController.enable_topdown_viz / MarsHabitatEnv.
+        get_topdown_rgb) for video-recording/human-viz purposes only -- not
+        wired into any click/goal/manual-drive handler, and never touches
+        the main console window built by the rest of __init__."""
+        win = ctk.CTkToplevel(self.root)
+        win.title("mars-habitatsim/nav · Top-Down View")
+        win.geometry("900x900")
+        win.minsize(360, 360)
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+        win.grid_rowconfigure(0, weight=1)
+        win.grid_columnconfigure(0, weight=1)
+        canvas = tk.Canvas(win, bg="#111111", highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        self._topdown_window = win
+        self._topdown_canvas = canvas
+
+    def _draw_topdown(self, vis_rgb) -> None:
+        cw = self._topdown_canvas.winfo_width()
+        ch = self._topdown_canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        img = Image.fromarray(vis_rgb).convert("RGB")
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih)
+        dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        img = img.resize((dw, dh))
+        self._topdown_photo = ImageTk.PhotoImage(img)
+        x0, y0 = (cw - dw) // 2, (ch - dh) // 2
+        self._topdown_canvas.delete("frame")
+        self._topdown_canvas.create_image(
+            x0, y0, anchor="nw", image=self._topdown_photo, tags="frame"
+        )
+
     def on_close(self) -> None:
         self.closed = True
+        if self._topdown_window is not None:
+            self._topdown_window.destroy()
         self.root.destroy()
 
     # ---------------- refresh loop ---------------- #
@@ -904,6 +950,13 @@ class NavGuiApp:
 
         if d.vis_rgb is not None:
             self._draw_camera(d.vis_rgb)
+
+        if (
+            d.vis_rgb_topdown is not None
+            and self._topdown_canvas is not None
+            and self._topdown_window.winfo_viewable()
+        ):
+            self._draw_topdown(d.vis_rgb_topdown)
 
         self._draw_plot(d)
         self._sync_seg_panel(d)
@@ -1173,6 +1226,7 @@ def build_controller(args: argparse.Namespace) -> RoverController:
         num_flags=args.num_flags,
         flag_min_spacing=args.flag_min_spacing,
         flag_boundary_margin=args.flag_boundary_margin,
+        enable_topdown_viz=args.top_down_viz,
         start_x=args.start_x,
         start_z=args.start_z,
         start_yaw_deg=args.start_yaw,
@@ -1257,6 +1311,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=float,
         default=2.0,
         help="keep placed flags this many meters clear of the scene bounds",
+    )
+    ap.add_argument(
+        "--top-down-viz",
+        action="store_true",
+        help="open a second, fixed bird's-eye-view window (a separate high-res "
+        "habitat-sim camera framing the four flags from directly above) for "
+        "video recording -- human viz only, plays no part in navigation/CBF/VLM. "
+        "Off by default",
     )
     ap.add_argument(
         "--navdp-upstream-ckpt",

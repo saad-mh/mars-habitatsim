@@ -177,6 +177,10 @@ class DisplayState:
     copy each call."""
 
     vis_rgb: Optional[np.ndarray] = None
+    # Fixed bird's-eye camera frame (see RoverController's enable_topdown_viz)
+    # -- human-viewing/recording only, never consumed by policy/CBF/belief
+    # logic. None unless enable_topdown_viz=True.
+    vis_rgb_topdown: Optional[np.ndarray] = None
     pose: Optional[Pose] = None
     mode: str = MODE_IDLE
     status_text: str = "starting"
@@ -231,6 +235,7 @@ class RoverController:
         num_flags: int = 6,
         flag_min_spacing: float = 1.5,
         flag_boundary_margin: float = 2.0,
+        enable_topdown_viz: bool = False,
         start_x: float = 0.0,
         start_z: float = 8.0,
         start_yaw_deg: float = 0.0,
@@ -293,6 +298,7 @@ class RoverController:
         self.num_flags = int(num_flags)
         self.flag_min_spacing = float(flag_min_spacing)
         self.flag_boundary_margin = float(flag_boundary_margin)
+        self.enable_topdown_viz = bool(enable_topdown_viz)
         self.start_x = float(start_x)
         self.start_z = float(start_z)
         self.start_yaw_deg = float(start_yaw_deg)
@@ -653,6 +659,7 @@ class RoverController:
                 num_flags=self.num_flags,
                 flag_min_spacing=self.flag_min_spacing,
                 flag_boundary_margin=self.flag_boundary_margin,
+                enable_topdown_viz=self.enable_topdown_viz,
                 annotations_dir=self.annotations_dir,
                 annotation_categories=self.annotation_categories,
             ) as env:
@@ -1275,9 +1282,14 @@ class RoverController:
                         tu, tv = turn_pixel
                         vis_rgb = draw_ghost_mask(vis_rgb, tu, tv, TURN_GHOST_RADIUS_PX)
 
+                vis_rgb_topdown = (
+                    env.get_topdown_rgb() if self.enable_topdown_viz else None
+                )
+
                 with self._lock:
                     d = self.display
                     d.vis_rgb = vis_rgb
+                    d.vis_rgb_topdown = vis_rgb_topdown
                     d.pose = new_pose
                     d.mode = mode
                     d.status_text = status

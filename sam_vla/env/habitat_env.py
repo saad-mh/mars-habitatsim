@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -20,6 +21,7 @@ from sam_vla.env.sim_utils import (
     rgb_depth,
     save_obj,
     set_agent_pose,
+    set_agent_pose_topdown,
     set_objects_hidden,
 )
 from sam_vla.env.pose_sweep import sample_in_place_sweep_yaws
@@ -29,6 +31,16 @@ RGB_HEIGHT = 480
 RGB_WIDTH = 640
 HFOV_DEG = 90.0
 DEPTH_MAX_RANGE_M = 10.0
+
+# Fixed bird's-eye viz camera (see enable_topdown_viz) -- human-viewing only,
+# never fed to a policy/VLM/segmentation model, so it's not held to the same
+# "match the rover sensor" resolution as RGB_HEIGHT/RGB_WIDTH above.
+TOPDOWN_HEIGHT = 1080
+TOPDOWN_WIDTH = 1080
+TOPDOWN_HFOV_DEG = 90.0
+# Extra clearance added around the flags' bounding box so no flag/marker
+# sits flush against the frame edge.
+TOPDOWN_MARGIN_M = 4.0
 
 SPAWN_CLEARANCE_M = 1.0
 SPAWN_TERRAIN_RADIUS_M = 0.8
@@ -56,6 +68,10 @@ class MarsHabitatEnv:
         flag_min_spacing: float = 1.5,
         flag_boundary_margin: float = 2.0,
         flag_spawn_clearance: float = 2.0,
+        enable_topdown_viz: bool = False,
+        topdown_resolution: tuple = (TOPDOWN_HEIGHT, TOPDOWN_WIDTH),
+        topdown_hfov_deg: float = TOPDOWN_HFOV_DEG,
+        topdown_margin_m: float = TOPDOWN_MARGIN_M,
     ):
         self._scene_path = Path(scene_path)
         self._heightmap_path = Path(heightmap_path)
@@ -84,6 +100,14 @@ class MarsHabitatEnv:
         self._flag_min_spacing = float(flag_min_spacing)
         self._flag_boundary_margin = float(flag_boundary_margin)
         self._flag_spawn_clearance = float(flag_spawn_clearance)
+        self._enable_topdown_viz = bool(enable_topdown_viz)
+        self._topdown_resolution = (
+            int(topdown_resolution[0]),
+            int(topdown_resolution[1]),
+        )
+        self._topdown_hfov_deg = float(topdown_hfov_deg)
+        self._topdown_margin_m = float(topdown_margin_m)
+        self._topdown_agent = None
         self.rocks: List[RockSpec] = []
         self.flags: list = []
         self.home_base = None
@@ -120,10 +144,26 @@ class MarsHabitatEnv:
         agent_cfg = AgentConfiguration()
         agent_cfg.sensor_specifications = sensor_specs
 
+        agent_cfgs = [agent_cfg]
+        if self._enable_topdown_viz:
+            topdown_h, topdown_w = self._topdown_resolution
+            topdown_spec = make_sensor(
+                "topdown",
+                habitat_sim.SensorType.COLOR,
+                topdown_h,
+                topdown_w,
+                self._topdown_hfov_deg,
+            )
+            topdown_agent_cfg = AgentConfiguration()
+            topdown_agent_cfg.sensor_specifications = [topdown_spec]
+            agent_cfgs.append(topdown_agent_cfg)
+
         self._sim = habitat_sim.Simulator(
-            habitat_sim.Configuration(sim_cfg, [agent_cfg])
+            habitat_sim.Configuration(sim_cfg, agent_cfgs)
         )
         self._agent = self._sim.initialize_agent(0)
+        if self._enable_topdown_viz:
+            self._topdown_agent = self._sim.initialize_agent(1)
 
         heightmap_grid = HeightmapGrid(
             self._heightmap_path.expanduser().resolve(),
@@ -188,6 +228,9 @@ class MarsHabitatEnv:
             self.flags = generate_default_flag_field(self._terrain, x, z, yaw)
             register_flags(self._sim, self.flags)
 
+        if self._topdown_agent is not None:
+            self._place_topdown_camera(fallback_x=x, fallback_z=z)
+
         if self._annotations_dir is not None:
             self.annotation_mesh_id_map = load_mesh_id_map(self._annotations_dir)
             self._annotation_objects = register_annotation_meshes(
@@ -210,6 +253,54 @@ class MarsHabitatEnv:
 
         self._registry.start_all()
         return self
+
+    def _place_topdown_camera(self, fallback_x: float, fallback_z: float) -> None:
+        """Point the fixed viz-only top-down camera (see enable_topdown_viz)
+        straight down at a height/position chosen so its frame's ground
+        footprint contains every flag's (x, z) plus topdown_margin_m of
+        clearance -- never moves after this, unlike the driving agent.
+        Falls back to a small box around the rover's spawn point if no
+        flags were placed (shouldn't happen with the current flag-placement
+        paths, both of which always populate self.flags, but this camera
+        must not crash env startup either way)."""
+        if self.flags:
+            xs = [f.x for f in self.flags]
+            zs = [f.z for f in self.flags]
+            min_x, max_x = min(xs), max(xs)
+            min_z, max_z = min(zs), max(zs)
+        else:
+            min_x = max_x = fallback_x
+            min_z = max_z = fallback_z
+
+        margin = self._topdown_margin_m
+        half_width = max((max_x - min_x) / 2.0 + margin, margin)
+        half_depth = max((max_z - min_z) / 2.0 + margin, margin)
+        cx = (min_x + max_x) / 2.0
+        cz = (min_z + max_z) / 2.0
+
+        topdown_h, topdown_w = self._topdown_resolution
+        hfov = math.radians(self._topdown_hfov_deg)
+        vfov = 2.0 * math.atan(math.tan(hfov / 2.0) * topdown_h / topdown_w)
+
+        height_for_width = half_width / math.tan(hfov / 2.0)
+        height_for_depth = half_depth / math.tan(vfov / 2.0)
+        cam_height = max(height_for_width, height_for_depth)
+
+        ground_y = self._terrain(cx, cz)
+        set_agent_pose_topdown(self._topdown_agent, cx, ground_y + cam_height, cz)
+
+    def get_topdown_rgb(self) -> Optional[np.ndarray]:
+        """RGB frame from the fixed bird's-eye viz camera (see
+        enable_topdown_viz), framing the flag field from directly above.
+        Human-viewing/recording only -- never fed to a policy, VLM, or
+        segmentation model. Returns None if enable_topdown_viz=False."""
+        if self._topdown_agent is None:
+            return None
+        obs = self._sim.get_sensor_observations(agent_ids=1)
+        rgb = np.asarray(obs["topdown"])
+        if rgb.ndim == 3 and rgb.shape[-1] == 4:
+            rgb = rgb[:, :, :3]
+        return rgb.astype(np.uint8)
 
     def get_height_at_xz(self, x: float, z: float) -> float:
         """Terrain height at (x, z), plus rover clearance, sampled from the heightmap."""
