@@ -352,40 +352,41 @@ class NavGuiApp:
         row += 1
         target.grid_columnconfigure(0, weight=1)
         target.grid_columnconfigure(1, weight=1)
+        target.grid_columnconfigure(2, weight=1)
         ctk.CTkLabel(
             target, text="DESIGNATE TARGET", font=ctk.CTkFont(size=12, weight="bold")
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 4))
 
         # REACH P7/P1: segment the scene and let the model pick a rock goal.
         ctk.CTkButton(
             target, text="Segment Scene", height=BTN_H, command=self.resolve_goal
-        ).grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=BTN_GAP // 2)
+        ).grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, BTN_GAP))
+        # REACH P10 (autonomy): let the rover self-select a plausible
+        # exploration goal when the operator has no specific target.
+        ctk.CTkButton(
+            target, text="Random Goal", height=BTN_H, command=self.random_goal
+        ).grid(row=1, column=1, sticky="ew", padx=4, pady=(0, BTN_GAP))
+        # REACH P1 (rover-as-selectable-object → "go home" action): the
+        # paper's rover menu includes "go home" (autonomous return to
+        # start). Same verb, same place.
+        ctk.CTkButton(target, text="Go Home", height=BTN_H, command=self.go_home).grid(
+            row=1, column=2, sticky="ew", padx=(4, 10), pady=(0, BTN_GAP)
+        )
         # REACH P1: open-vocabulary grounding -- name a target the segmenter
         # wasn't trained on; produces the same reviewable goal.
         #######################################################
         # ctk.CTkButton(
         #     target, text="Ground Target", height=BTN_H, command=self.ground_target
-        # ).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=BTN_GAP // 2)
+        # ).grid(row=2, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, BTN_GAP // 2))
         # # REACH P1: free-text open-vocabulary entry feeding Ground Target.
         # self.ground_entry = ctk.CTkEntry(
         #     target, placeholder_text='name it: "flag" / "blue cuboid"', height=38
         # )
         # self.ground_entry.grid(
-        #     row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, BTN_GAP)
+        #     row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, BTN_GAP)
         # )
         # self.ground_entry.bind("<Return>", lambda e: self.ground_target())
         #######################################################
-        # REACH P10 (autonomy): let the rover self-select a plausible
-        # exploration goal when the operator has no specific target.
-        ctk.CTkButton(
-            target, text="Random Goal", height=BTN_H, command=self.random_goal
-        ).grid(row=3, column=0, sticky="ew", padx=(10, 4), pady=(0, BTN_GAP))
-        # REACH P1 (rover-as-selectable-object → "go home" action): the
-        # paper's rover menu includes "go home" (autonomous return to
-        # start). Same verb, same place.
-        ctk.CTkButton(target, text="Go Home", height=BTN_H, command=self.go_home).grid(
-            row=3, column=1, sticky="ew", padx=(4, 10), pady=(0, BTN_GAP)
-        )
 
         # ===== SECTION 4 — TASKWORK / MISSION (REACH P3 + P10) ========== #
         # Free-text command -> ordered, chunked mission the operator can
