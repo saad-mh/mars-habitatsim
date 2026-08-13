@@ -87,6 +87,11 @@ PLOT_ROVER = "#e5e7eb"
 PLOT_OBSTACLE = "#f87171"
 PLOT_TRAJECTORY = "#f97373"
 PLOT_GOAL = "#fbbf24"
+# Explicit fill against the plot canvas's own fixed PLOT_BG, unlike a themed
+# CTkLabel whose text/background colors can each independently follow the OS
+# appearance mode and end up low-contrast -- see _draw_plot_telemetry.
+PLOT_TELEMETRY_TEXT = "#e5e7eb"
+PLOT_TELEMETRY_WARN = "#fbbf24"
 
 # REACH P5: glove-safe control sizing. One place to tune the whole
 # console's button footprint so every primary action stays large and
@@ -1060,6 +1065,71 @@ class NavGuiApp:
             self.plot.create_text(
                 gx, gy, text="*", fill=PLOT_GOAL, font=("TkDefaultFont", 26)
             )
+
+        self._draw_plot_telemetry(d)
+
+    def _draw_plot_telemetry(self, d) -> None:
+        # REACH P4 + P6: the numeric telemetry (pose, drive command, CBF and
+        # belief-uncertainty state) used to live in a themed sidebar
+        # CTkLabel, whose text/background colors each independently follow
+        # the OS appearance mode and would often end up low-contrast against
+        # each other. Drawn here instead, stacked top-left over the radar/map
+        # canvas, with an explicit fill against the canvas's own fixed
+        # PLOT_BG -- always legible, and it reads naturally as the map's own
+        # HUD rather than a separate panel.
+        pose_txt = (
+            f"pose ({d.pose.x:.1f}, {d.pose.z:.1f})  yaw={math.degrees(d.pose.yaw):.0f}deg"
+            if d.pose is not None
+            else "pose: -"
+        )
+        act = d.action
+        lines = [
+            pose_txt,
+            f"step={d.step}  v=[{act.v_fwd:.2f},{act.v_lat:.2f}]  "
+            f"yaw_rate={act.yaw_rate:+.2f}",
+        ]
+
+        cbf_txt = ""
+        if d.cbf_info.get("blocked"):
+            cbf_txt = "CBF:orbit" if d.cbf_info.get("orbiting") else "CBF:blocked"
+        if d.cbf_info.get("hard_gate_fired"):
+            cbf_txt = (cbf_txt + " CBF:hard-gate").strip()
+        if cbf_txt:
+            lines.append(cbf_txt)
+
+        x, y = 6, 4
+        for line in lines:
+            self.plot.create_text(
+                x, y, text=line, anchor="nw", fill=PLOT_TELEMETRY_TEXT,
+                font=("Consolas", 10),
+            )
+            y += 14
+
+        # Uncertainty lines are colored separately (warn once a tracker is
+        # within 80% of the halt/threshold) rather than folded into `lines`
+        # above, so their color can react independently of the plain-text
+        # telemetry stacked over them.
+        def unc_color(value: float, threshold: float) -> str:
+            return PLOT_TELEMETRY_WARN if threshold > 0 and value >= 0.8 * threshold else PLOT_TELEMETRY_TEXT
+
+        if d.uncertainty_enabled:
+            text = f"unc={d.uncertainty_value:.2f}/{d.uncertainty_threshold:.2f}"
+            self.plot.create_text(
+                x, y, text=text, anchor="nw",
+                fill=unc_color(d.uncertainty_value, d.uncertainty_threshold),
+                font=("Consolas", 10),
+            )
+            y += 14
+
+        home_text = (
+            f"home unc={d.home_base_uncertainty_value:.2f}/"
+            f"{d.home_base_uncertainty_threshold:.2f}"
+        )
+        self.plot.create_text(
+            x, y, text=home_text, anchor="nw",
+            fill=unc_color(d.home_base_uncertainty_value, d.home_base_uncertainty_threshold),
+            font=("Consolas", 10),
+        )
 
     def tick_forever(self) -> None:
         self.root.mainloop()
