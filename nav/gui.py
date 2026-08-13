@@ -1122,7 +1122,9 @@ class NavGuiApp:
             )
 
         if d.uncertainty_enabled:
-            text = f"unc={d.uncertainty_value:.2f}/{d.uncertainty_threshold:.2f}"
+            text = (
+                f"current unc={d.uncertainty_value:.2f}/{d.uncertainty_threshold:.2f}"
+            )
             self.plot.create_text(
                 x,
                 y,
@@ -1392,7 +1394,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument(
         "--mission-belief-cov-growth",
         type=float,
-        default=0.00002,
+        default=0.0002,  # 0.00002, tested to reach back home without losing its grip over the reality
         help="per-tick belief-uncertainty growth for a goal sighted by the "
         "periodic mission sweep above but not currently being driven to -- kept "
         "far below --cov-growth (that rate is tuned for a goal briefly losing its "

@@ -159,9 +159,7 @@ class Mission:
 
     def __post_init__(self):
         if not self.goals:
-            self.goals = parse_parts(
-                self.directions, self.goal_texts, self.instruction
-            )
+            self.goals = parse_parts(self.directions, self.goal_texts, self.instruction)
 
     @property
     def current(self) -> SubGoal:

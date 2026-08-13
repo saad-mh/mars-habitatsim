@@ -1783,6 +1783,17 @@ class RoverController:
             for g in mission.goals[mission.idx :]
             if g.kind in (GoalKind.GO_TO, GoalKind.FIND)
         }
+        if self.gen_home_base:
+            # RETURN goals are excluded above (their target text varies --
+            # "home base"/"spawn point"/whatever phrase matched _RETURN_WORDS
+            # -- and driving itself never calls _do_resolve), so without this
+            # "home base" would never be checked here even while the rover
+            # drives straight at it, leaving its belief tracker to only ever
+            # dead-reckon from home_base_seeded's spawn-point seed and never
+            # get uncertainty reset by a real sighting. goal_beliefs' key for
+            # it is always the literal "home base" string regardless of the
+            # RETURN goal's own target text -- see home_base_seeded.
+            queries.add("home base")
         if not queries:
             return
         hits = dino_grounding_resolver.detect_in_frame(

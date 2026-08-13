@@ -138,6 +138,7 @@ def register_glb_object(
     yaw: float = 0.0,
     semantic_id: int = 0,
     template_name: Optional[str] = None,
+    scale: float = 1.0,
 ):
     """Add a fixed-geometry .glb asset (e.g. a flag marker) as a render-only,
     non-collidable kinematic object at an explicit world (x, y, z) / yaw.
@@ -148,13 +149,18 @@ def register_glb_object(
     red_flag.glb), so position/rotation are set explicitly post-registration
     instead of being pre-baked into the mesh, and each call needs a unique
     template_name (defaults to one derived from the object id) so repeated
-    placements of the same asset don't collide in the template registry."""
+    placements of the same asset don't collide in the template registry.
+
+    `scale` is a uniform multiplier on the asset's native size (1.0 = as
+    authored in the .glb), set on the template before registration since
+    ManagedRigidObject has no post-creation scale setter."""
     otm = sim.get_object_template_manager()
     rom = sim.get_rigid_object_manager()
     template = otm.create_new_template(str(glb_path))
     template.render_asset_handle = str(glb_path)
     template.collision_asset_handle = str(glb_path)
     template.is_collidable = False
+    template.scale = mn.Vector3(float(scale), float(scale), float(scale))
     name = template_name or f"glb_{semantic_id}_{Path(glb_path).stem}_{id(template)}"
     template_id = otm.register_template(template, name)
     obj = rom.add_object_by_template_handle(otm.get_template_handle_by_id(template_id))

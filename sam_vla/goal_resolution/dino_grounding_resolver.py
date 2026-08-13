@@ -73,10 +73,24 @@ def _get_detector(
     return _detector_cache[key]
 
 
+# "home base" is never a real-world class DINO could ground literally -- it's
+# nav/mission.py's RETURN target text and goal_beliefs' hardcoded key for the
+# ghost marker sam_vla.env.home_base places (assets/base_station_antenna.glb).
+# Without this override, every "home base" query came back with no detection,
+# so its belief tracker only ever dead-reckoned from the spawn-point seed and
+# never got a real sighting to reset uncertainty against -- even while driving
+# straight at the model. Route it to a prompt describing what's actually
+# there instead.
+_QUERY_PROMPT_OVERRIDES = {
+    "home base": "a large parabolic satellite dish antenna on a metal support frame",
+}
+
+
 def _to_prompt(target_text: str) -> str:
     # GroundingDINO convention: lowercase, ends with a period (see
     # GroundingDINODetector.detect's docstring).
     text = target_text.strip().lower()
+    text = _QUERY_PROMPT_OVERRIDES.get(text, text)
     return text if text.endswith(".") else text + "."
 
 
