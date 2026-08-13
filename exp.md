@@ -1,69 +1,281 @@
-# `nav/gui.py` — the rover control console
+# Rover Control Console Layout
 
-## What it is
+The rover control console follows a supervisory human-robot interaction model. The operator primarily monitors the rover while it autonomously interprets and executes missions, with human intervention becoming necessary only when the rover's autonomy reaches a state requiring assistance.
 
-`NavGuiApp` is a single-process Tkinter/`customtkinter` control panel for `nav.rover_controller.RoverController`. It's the in-house equivalent of `Nav_new/MARS/launch_mars.sh`'s DINO+NavDP GUI, but drives the *published* NavDP model rather than this repo's custom S2DiT+NavDP model. It runs at a fixed ~15 Hz repaint (`REFRESH_MS = 66`), independent of the controller's own tick rate, and every frame it pulls a `d = controller.snapshot()` dataclass and re-renders the whole window from it — the GUI holds almost no state of its own beyond a handful of UI-only flags (pending click, panel visibility, manual-drive keys held, a one-line "ack" echo).
+The interface is divided into four persistent regions:
 
-The entire layout is a **deliberate re-implementation of the REACH Handheld-Device HRI principles** (Ma et al., DLR/NASA — "Human-Robot Interaction through REACH"). Every section of code carries a `# REACH Pn:` comment naming which of ten principles it serves (P1 contextual menus, P2 three-stage command feedback, P3 chunked taskwork, P4 map/situational awareness, P5 glove-safe spacing, P6 minimal clutter, P7 point-and-select, P8 always-available emergency stop, P9 continuous feedback, P10 autonomy/intent communication). The file's own docstring is the canonical cross-reference to `reach_gui/REACH_UI_justification.md`.
+┌─────────────────────────────────────────────────────────────┐
+│ TOP STATUS / CURRENT STATUS │
+├──────────────────────────────────────┬──────────────────────┤
+│ │ MISSION │
+│ │ │
+│ │ Goal list │
+│ CAMERA │ Current goal │
+│ │ Goal distance │
+│ │ Goal belief │
+│ │ Goal status │
+│ ├──────────────────────┤
+│ │ ROVER STATUS │
+│ │ Mode │
+│ │ Current uncertainty │
+│ │ Home uncertainty │
+│ │ Telemetry │
+├──────────────────────────────────────┴──────────────────────┤
+│ TRAJECTORY / BELIEF │
+├─────────────────────────────────────────────────────────────┤
+│ ■ EMERGENCY STOP │
+└─────────────────────────────────────────────────────────────┘
 
-## Overall window layout
+## 1. Top Status / Current Status
 
-The root window is a 2-column, 2-row grid, starting maximized (explicit `geometry()` fallback plus best-effort `state("zoomed")`, since not every window manager honors zoom):
+The top bar provides a persistent indication of the rover's current operational state. It communicates what the rover is currently doing and whether autonomous operation is proceeding normally or requires human attention.
 
-- **Row 0** — the working area, split into:
-  - **Column 0 (weight 3)** — the camera hero panel (live sim view).
-  - **Column 1 (weight 1, min 360px)** — a scrollable sidebar containing every status panel, control, and contextual menu.
-- **Row 1 (weight 0)** — a pinned emergency bar spanning both columns, *outside* the scrollable sidebar, always visible regardless of scroll position (REACH P8).
+Typical states may include:
 
-### Camera hero (left)
+- IDLE
+- PARSING MISSION
+- SEARCHING
+- NAVIGATING
+- AWAITING HUMAN
+- RECOVERING
+- GOAL REACHED
+- MISSION COMPLETE
+- MANUAL CONTROL
 
-A `tk.Canvas` that the live RGB frame (`d.vis_rgb`) is letterboxed into every refresh, tracking whatever size the window currently is. Clicking anywhere on the rendered frame is the primary way to designate a goal — REACH P7 "point and select an object in the environment." A caption below the canvas reminds the operator of this. If a click is pending confirmation, a cyan crosshair+circle is drawn onto the frame at the clicked point (distinct from the gold marker the controller itself burns into `vis_rgb` once a goal is actually confirmed).
+The status should be immediately visible without requiring the operator to inspect the camera, mission, or telemetry panels.
 
-### Sidebar (right, scrollable, top-anchored)
+For example:
 
-A vertical stack of labeled sections, each in its own bordered/unbordered `CTkFrame`, in this order:
+AUTONOMOUS
+Navigating to ANTENNA
 
-1. **ROVER STATUS** — always visible. Contains:
-   - Three **stage pills** ("1 · RECEIVED", "2 · EXECUTING", "3 · COMPLETE") that light up in sequence (grey→cyan→green) as a command progresses — the file's implementation of REACH's three-stage command-feedback bar (P2). Stage is derived each frame from `d.goal_reached` / `d.mode` / whether the rover is currently moving, with no dedicated controller field needed.
-   - A large **mode label** (color-coded per mode: idle/manual/point/resolve/review-segmentation/turn) showing the current high-level state, appending "✓ GOAL REACHED" when applicable.
-   - A **detail label** that prefers the GUI's own just-pressed acknowledgment text over the controller's status text, so a button press feels instantly registered (P9) even before the controller thread's own state catches up next tick.
-   - A small, grey, monospace **telemetry line** (pose, step count, velocity/yaw-rate, CBF blocked/orbit/hard-gate flags, uncertainty value vs threshold) — deliberately de-emphasized per REACH P6 (essential info only; raw numbers are secondary).
-   - A hidden **"controller thread died"** warning label that only grids in if `controller.is_alive()` goes false.
+or:
 
-2. **MAP — rover · goal · path · hazards** — a square `tk.Canvas` (`self.plot`, resizes between 200–480px with the sidebar width) drawing a body-frame top-down view centered on the rover:
-   - A horizontal axis line and a small oval marking the rover itself, always at the same fixed screen position (rover-centric frame).
-   - A red-outlined circle for the nearest obstacle point, if any (`d.obstacle_point`).
-   - A red polyline for the recent trajectory (`d.trajectory`).
-   - A gold asterisk marking the current belief-tracked goal position (`d.belief_g`).
-   This is the REACH P4 "persistent situational-awareness map" — rover, goal, path, and hazards in one glance, always present regardless of mode.
+HUMAN ASSISTANCE REQUIRED
+Goal localization uncertainty exceeded threshold
 
-3. **DESIGNATE TARGET** — the *selection* half of goal-setting (REACH P1: contextual menu shows only what's relevant right now). Four buttons plus one text entry:
-   - **Segment Scene** — runs the SAM2(+LoRA)/Qwen-salience goal resolver.
-   - **Ground Target** — open-vocabulary grounding via GroundingDINO, driven by the adjacent free-text entry (placeholder `"flag" / "blue cuboid"`, Enter-to-submit bound).
-   - **Random Goal** — lets the rover pick a plausible exploration goal itself (P10 autonomy).
-   - **Go Home** — autonomous return-to-start, same verb REACH's own rover menu uses.
-   None of these buttons show the *outcome* actions (confirm/rerun/pick-manually) — those only appear in **Contextual Panel A** once a resolution actually exists, which is the point of the REACH-style adaptive menu.
+## 2. Camera View
 
-4. **TASKWORK** — a free-text command box (placeholder `"go to a flag then return to home"`) plus a **Send** button. Text is handed to `RoverController.submit_nav_command`, which splits it via a Qwen VLM into an ordered list of sub-goals/directions and drives through them one at a time; a `mission_status_label` below shows N/total progress — REACH P3's "chunked, linear taskwork" so the operator can self-check without step-by-step direction.
+The camera occupies the largest portion of the interface and serves as the primary visual representation of the rover's environment.
 
-5. **MANUAL DRIVE** — a 3×3 D-pad of large (64×52px), widely-spaced buttons (↑←→↓ only; REACH P5 glove-safe sizing/spacing) bound to press/release for continuous manual velocity while held, mirrored by the physical arrow keys (bound globally on `root`, guarded so typing in a text entry doesn't also drive the rover). Also binds numpad digit keys 1/2/3/4/6/7/8/9 to uncertainty-heading submission and `r`/`R` to retry — these are no-ops unless the uncertainty panel (below) is actually active.
+The camera provides:
 
-6. **Contextual Panel A — REVIEW RESOLVED GOAL** *(amber border, only gridded in `MODE_REVIEW_SEGMENTATION`)* — shows the resolver's description text and three actions: **Confirm** (green, accept the goal), **Rerun** (amber, re-resolve), **Pick Manually** (fall back to point-and-select). Sidebar auto-scrolls to reveal this panel the instant it appears.
+- Current rover viewpoint
+- Environmental and terrain context
+- Current target visibility
+- Obstacles and relevant scene elements
+- Visual confirmation of detected goals
+- Visual context during human intervention
 
-7. **Contextual Panel B — CONFIRM POINT GOAL** *(cyan border, only gridded while a camera click is pending)* — "Set the goal at the point you clicked?" with **Confirm Point Goal** (green) / **Cancel** (grey, also bound to Esc).
+The camera is intended to answer:
 
-8. **Contextual Panel C — UNCERTAINTY HALT** *(blue border, only gridded while `d.uncertainty_halted`)* — fires when the real `BeliefGoalTracker`'s uncertainty value crosses threshold while driving toward a resolved goal. A numpad-shaped 3×3 grid of heading buttons (8 directions at 45° increments, front-relative, same convention/layout as `kb_teleop_vl.py`'s panel) lets the operator redirect the rover, plus a **Retry** button to re-request a VLM heading sweep instead of committing. Buttons disable and the title/border turn amber while a VLM request is in flight. Unlike `kb_teleop_vl.py`'s original (log-only), this panel's headings actually redirect driving.
+"What does the rover currently see?"
 
-9. **Footer** — a small grey status line (`d.click_status`) showing the outcome of the last point-goal click (e.g. "click ignored: no valid depth"); this row absorbs leftover vertical space so the whole stack stays top-anchored on tall screens instead of floating mid-window.
+The default camera view should provide sufficient environmental context for the operator to understand the rover's surroundings and heading while keeping relevant goal objects at a recognizable scale. Zoom should be available as a secondary interaction rather than being required during normal operation.
 
-### Pinned emergency bar (bottom, spans both columns)
+The camera may also support point-and-select interaction when manually designating a target.
 
-Outside the scrollable sidebar entirely, so it's reachable no matter how far the sidebar is scrolled or what mode is active (REACH P8):
-- **■ EMERGENCY STOP** — large (56px), bold, red — the single most safety-critical control, given the most real estate.
-- **Reset Rover** — smaller, grey, visually subordinate since it's destructive-adjacent but not an emergency action.
+## 3. Right Sidebar: Mission
 
-## Why it's built this way
+The Mission panel communicates the rover's current task and progress through the goal sequence generated from the operator's natural-language command.
 
-The whole file is structured around one idea: **the rover gives no feedback on its own**, so the console has to manufacture every signal REACH identified operators need — command lifecycle (pills), spatial awareness (the map), safety (always-reachable stop), and low-friction acknowledgment (the `_ack_text` echo, which updates the header the instant a button is pressed, before the controller's background thread has caught up). Panels that don't apply to the current state simply aren't drawn (P1/P6), rather than being greyed out — this is what keeps a fairly feature-dense console (goal resolution, open-vocab grounding, mission taskwork, manual drive, uncertainty handling, emergency stop) from overwhelming the operator at any single moment.
+### Goal List
 
-Color is used consistently as the one cross-panel cue for "what is the rover doing" (`MODE_COLORS`), separate from the per-panel border colors that mean "this needs your attention now" (amber = review, cyan = confirm, blue = uncertainty halt, red = danger/stop).
+The VLM converts the natural-language mission into an ordered sequence of goals.
+
+Example:
+
+✓ 1. ANTENNA
+→ 2. HABITAT
+○ 3. FLAG
+○ 4. HOME
+
+Completed goals, the active goal, and upcoming goals should be visually distinguishable.
+
+### Current Goal
+
+The currently active goal is explicitly displayed.
+
+Example:
+
+CURRENT GOAL
+HABITAT
+
+### Goal Distance
+
+The estimated distance between the rover and the current goal is displayed.
+
+Example:
+
+DISTANCE
+12.4 m
+
+This provides the operator with a simple indication of navigation progress without requiring interpretation of the trajectory or raw rover pose.
+
+### Goal Belief
+
+The interface communicates the rover's current belief regarding the location of the goal.
+
+The belief consists of an estimated goal position and associated uncertainty. The operator should be given a human-readable representation of the belief rather than being required to interpret raw covariance values.
+
+For example:
+
+GOAL BELIEF
+HIGH CONFIDENCE
+
+or:
+
+GOAL BELIEF
+LOW CONFIDENCE
+
+The corresponding spatial belief and uncertainty are represented in the bottom trajectory/belief panel.
+
+### Goal Status
+
+The current goal's execution state is displayed explicitly.
+
+Possible states include:
+
+- SEARCHING
+- DETECTED
+- NAVIGATING
+- UNCERTAIN
+- REACQUIRING
+- REACHED
+
+The Mission panel therefore answers:
+
+"What is the rover trying to accomplish, how far away is the goal, and how confident is it about that goal?"
+
+## 4. Right Sidebar: Rover Status
+
+The Rover Status panel communicates the rover's current operational and navigation state.
+
+### Mode
+
+The current control mode is displayed explicitly.
+
+Examples:
+
+AUTONOMOUS
+HUMAN GUIDANCE
+MANUAL
+IDLE
+
+The operator should never need to infer whether the rover is under autonomous or human control.
+
+### Current Uncertainty
+
+The current localization uncertainty associated with the active goal is displayed.
+
+Example:
+
+CURRENT UNCERTAINTY
+0.42
+
+The value may additionally be represented qualitatively:
+
+LOW
+MEDIUM
+HIGH
+
+The uncertainty threshold that triggers human intervention should be represented clearly when relevant.
+
+### Home Uncertainty
+
+The rover's uncertainty regarding its estimated home/start position is displayed separately from the uncertainty of the current goal.
+
+Example:
+
+HOME UNCERTAINTY
+LOW
+
+This distinction allows the operator to understand whether uncertainty concerns the active task or the rover's ability to reliably return to its starting location.
+
+### Telemetry
+
+Only useful operational telemetry should be displayed in the primary interface.
+
+Potential values include:
+
+- Rover position
+- Heading
+- Velocity
+- Yaw rate
+- Navigation state
+- Other relevant runtime information
+
+Low-level implementation details such as model inference information, internal controller flags, or debugging values should remain in a separate diagnostics view rather than occupying the primary operational interface.
+
+The Rover Status panel therefore answers:
+
+"How is the rover operating, what mode is it in, and how certain is its localization?"
+
+## 5. Bottom Bar: Trajectory / Belief
+
+The bottom panel provides persistent spatial information about the rover's recent movement and its estimated goal location.
+
+It contains:
+
+### Trajectory
+
+The recent rover trajectory is displayed to provide spatial context for the rover's movement and progress toward the current goal.
+
+### Belief
+
+The estimated location of the current goal is represented together with its uncertainty.
+
+The belief representation should allow the operator to visually distinguish between:
+
+- High-confidence localization, where the estimated goal position is relatively well constrained.
+- Increasing uncertainty, where the possible goal location becomes more spatially dispersed.
+- High uncertainty, where the rover may no longer be sufficiently confident to continue autonomous goal navigation.
+
+This panel therefore answers:
+
+"Where has the rover been, and where does it currently believe the goal is?"
+
+## 6. Emergency Stop
+
+The emergency stop is placed in a persistent bottom bar outside the main content area so that it remains accessible regardless of the current interface state.
+
+It must remain available when:
+
+- The sidebar is scrolled
+- A mission is executing
+- A contextual interaction is active
+- The rover is navigating autonomously
+- The rover is receiving human guidance
+- The rover is operating in manual mode
+
+The emergency stop is intentionally given the greatest visual prominence among the controls.
+
+Example:
+
+■ EMERGENCY STOP
+
+The emergency stop immediately halts rover movement and provides the operator with a direct safety mechanism independent of the current navigation or mission state.
+
+## Overall Information Hierarchy
+
+The interface is organized around five questions that the operator should be able to answer at any point:
+
+1. What is the rover doing?
+   → Top Status / Current Status
+
+2. What is the rover trying to accomplish?
+   → Mission / Goal List / Current Goal
+
+3. How far is the rover from its goal and how confident is it?
+   → Goal Distance / Goal Belief / Goal Status
+
+4. How is the rover operating?
+   → Rover Status / Mode / Uncertainty / Telemetry
+
+5. Where has the rover been and where does it believe the goal is?
+   → Trajectory / Belief
+
+6. How can I stop the rover immediately?
+   → Emergency Stop
+
+The interface therefore prioritizes mission intent, rover state, visual perception, spatial belief, and safety while keeping low-level implementation details out of the primary operator workflow. The rover remains autonomous during normal operation, while the UI provides the operator with sufficient situational awareness to recognize degradation and intervene when the rover's uncertainty requires human assistance.

@@ -1324,7 +1324,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument(
         "--rover-marker-scale",
         type=float,
-        default=1.0,
+        default=0.5,
         help="scale multiplier for the assets/perseverance_mars_rover.glb marker "
         "shown at the rover's live position in --top-down-viz (1.0 = the asset's "
         "native, real-world meter scale). Only affects the top-down window -- "
