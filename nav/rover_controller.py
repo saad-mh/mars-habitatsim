@@ -1262,7 +1262,7 @@ class RoverController:
                     )
 
                 status = self._status_text(mode, unresolved, goal_spec, dist_to_goal)
-                vis_rgb = overlay_semantic_masks(obs.rgb, semantic, text=status)
+                vis_rgb = overlay_semantic_masks(obs.rgb, semantic)
                 if goal_pixel is not None:
                     vis_rgb = draw_point_marker(vis_rgb, goal_pixel)
                 if self._ground_target_world is not None:

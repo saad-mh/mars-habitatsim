@@ -204,6 +204,10 @@ class NavGuiApp:
         self._click_panel_visible = False
         self._cam_img_box: Optional[tuple[int, int, int, int]] = None
         self._cam_photo = None
+        # Manual drive: no dedicated dpad/section in this layout, but the
+        # arrow keys still hold-to-drive via the same controller.set_manual
+        # path the old dpad buttons used (see manual_press/_manual_update).
+        self._manual_held: set[str] = set()
         # REACH P9: last action acknowledged, echoed in the status header
         # the instant a button is pressed (before the controller's own
         # state catches up on the next tick) so no press ever feels lost.
@@ -345,7 +349,9 @@ class NavGuiApp:
                 font=ctk.CTkFont(size=10, weight="bold"),
                 text_color="#9ca3af",
             ).pack(pady=(6, 0))
-            value_label = ctk.CTkLabel(cell, text="--", font=ctk.CTkFont(size=13, weight="bold"))
+            value_label = ctk.CTkLabel(
+                cell, text="--", font=ctk.CTkFont(size=13, weight="bold")
+            )
             value_label.pack(pady=(0, 6))
             return value_label
 
@@ -485,6 +491,24 @@ class NavGuiApp:
         self.mission_status_label.grid(
             row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, BTN_GAP)
         )
+
+        # Manual drive: arrow keys hold-to-drive (no dpad/section rendered --
+        # see class docstring notes near _manual_held); guarded so typing in
+        # the taskwork entry doesn't also drive the rover.
+        for key, direction in (
+            ("Up", "fwd"),
+            ("Down", "back"),
+            ("Left", "left"),
+            ("Right", "right"),
+        ):
+            root.bind(
+                f"<KeyPress-{key}>",
+                lambda e, d=direction: self._guarded(self.manual_press, d),
+            )
+            root.bind(
+                f"<KeyRelease-{key}>",
+                lambda e, d=direction: self._guarded(self.manual_release, d),
+            )
 
         # Escape is a global keyboard shortcut bound on root (fires on every
         # keypress regardless of focus) -- cancels a pending camera click /
@@ -673,7 +697,9 @@ class NavGuiApp:
         # scrollable sidebar so it's never affected by sidebar scroll
         # position, matching exp.md's dedicated bottom region.
         plot_frame = ctk.CTkFrame(root)
-        plot_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4))
+        plot_frame.grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4)
+        )
         plot_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             plot_frame,
@@ -763,11 +789,13 @@ class NavGuiApp:
         self.command_entry.delete(0, "end")
 
     def reset_rover(self) -> None:
+        self._manual_held.clear()
         self.cancel_pixel_click()
         self._ack("rover reset")
         self.controller.request_reset()
 
     def stop(self) -> None:
+        self._manual_held.clear()
         self.cancel_pixel_click()
         self._ack("STOP — driving halted")
         self.controller.stop_driving()
@@ -777,9 +805,35 @@ class NavGuiApp:
         # goal/obstacle masks, the active mission, and any uncertainty halt,
         # leaving the rover exactly where it is (unlike reset_rover, which
         # also teleports it back to spawn). See RoverController.clear_all_goals.
+        self._manual_held.clear()
         self.cancel_pixel_click()
         self._ack("cleared — all goals, missions, and masks removed")
         self.controller.clear_all_goals()
+
+    # ---------------- manual drive ---------------- #
+    def manual_press(self, direction: str) -> None:
+        self.cancel_pixel_click()
+        self._manual_held.add(direction)
+        self._manual_update()
+
+    def manual_release(self, direction: str) -> None:
+        self._manual_held.discard(direction)
+        self._manual_update()
+
+    def _manual_update(self) -> None:
+        if not self._manual_held:
+            self.controller.stop_driving()
+            return
+        lin = ang = 0.0
+        if "fwd" in self._manual_held:
+            lin += self.controller.max_forward_speed
+        if "back" in self._manual_held:
+            lin -= 0.5 * self.controller.max_forward_speed
+        if "left" in self._manual_held:
+            ang += self.controller.max_yaw_rate
+        if "right" in self._manual_held:
+            ang -= self.controller.max_yaw_rate
+        self.controller.set_manual(lin, ang)
 
     # ---------------- segmentation review (Goal 1) ---------------- #
     def confirm_segmentation(self) -> None:
@@ -791,6 +845,7 @@ class NavGuiApp:
         self.controller.request_rerun_segmentation()
 
     def pick_manually(self) -> None:
+        self._manual_held.clear()
         self._ack("pick a point in the live view")
         self.controller.request_pick_manually()
 
@@ -998,7 +1053,11 @@ class NavGuiApp:
             )
             return "AWAITING HUMAN", reason, TOP_STATUS_COLORS["AWAITING HUMAN"]
         if d.mode == "manual":
-            return "MANUAL CONTROL", "Operator driving", TOP_STATUS_COLORS["MANUAL CONTROL"]
+            return (
+                "MANUAL CONTROL",
+                "Operator driving",
+                TOP_STATUS_COLORS["MANUAL CONTROL"],
+            )
         if (
             d.mission_goals
             and d.mission_goal_idx >= 0
@@ -1014,7 +1073,11 @@ class NavGuiApp:
             subtext = f"Reached {target}" if target else d.status_text
             return "GOAL REACHED", subtext, TOP_STATUS_COLORS["GOAL REACHED"]
         if d.mode == MODE_REVIEW_SEGMENTATION:
-            return "PARSING MISSION", d.status_text, TOP_STATUS_COLORS["PARSING MISSION"]
+            return (
+                "PARSING MISSION",
+                d.status_text,
+                TOP_STATUS_COLORS["PARSING MISSION"],
+            )
         if goal_status == "SEARCHING":
             target = self._current_goal_text(d)
             subtext = f"Searching for {target}" if target else d.status_text
@@ -1063,9 +1126,7 @@ class NavGuiApp:
             cur_text, cur_color = "off", PLOT_TELEMETRY_TEXT
         self.current_uncertainty_label.configure(text=cur_text, text_color=cur_color)
 
-        home_text = (
-            f"{d.home_base_uncertainty_value:.2f}/{d.home_base_uncertainty_threshold:.2f}"
-        )
+        home_text = f"{d.home_base_uncertainty_value:.2f}/{d.home_base_uncertainty_threshold:.2f}"
         self.home_uncertainty_label.configure(
             text=home_text,
             text_color=self._unc_color(
@@ -1302,49 +1363,6 @@ class NavGuiApp:
             self.plot.create_text(
                 gx, gy, text="*", fill=PLOT_GOAL, font=("TkDefaultFont", 26)
             )
-
-        self._draw_plot_telemetry(d)
-
-    def _draw_plot_telemetry(self, d) -> None:
-        # REACH P4 + P6: a compact debug HUD (pose, drive command, CBF
-        # state) stacked top-left over the trajectory/belief canvas, with
-        # an explicit fill against the canvas's own fixed PLOT_BG -- always
-        # legible regardless of OS appearance mode. Current/home
-        # uncertainty are shown numerically in the Rover Status panel
-        # instead of duplicated here; this HUD stays low-level/diagnostic,
-        # per exp.md's "keep implementation detail out of the primary
-        # panels" guidance.
-        pose_txt = (
-            f"pose ({d.pose.x:.1f}, {d.pose.z:.1f})  yaw={math.degrees(d.pose.yaw):.0f}deg"
-            if d.pose is not None
-            else "pose: -"
-        )
-        act = d.action
-        lines = [
-            pose_txt,
-            f"step={d.step}  v=[{act.v_fwd:.2f},{act.v_lat:.2f}]  "
-            f"yaw_rate={act.yaw_rate:+.2f}",
-        ]
-
-        cbf_txt = ""
-        if d.cbf_info.get("blocked"):
-            cbf_txt = "CBF:orbit" if d.cbf_info.get("orbiting") else "CBF:blocked"
-        if d.cbf_info.get("hard_gate_fired"):
-            cbf_txt = (cbf_txt + " CBF:hard-gate").strip()
-        if cbf_txt:
-            lines.append(cbf_txt)
-
-        x, y = 6, 4
-        for line in lines:
-            self.plot.create_text(
-                x,
-                y,
-                text=line,
-                anchor="nw",
-                fill=PLOT_TELEMETRY_TEXT,
-                font=("Consolas", 10),
-            )
-            y += 14
 
     def tick_forever(self) -> None:
         self.root.mainloop()
