@@ -1100,7 +1100,11 @@ class NavGuiApp:
         x, y = 6, 4
         for line in lines:
             self.plot.create_text(
-                x, y, text=line, anchor="nw", fill=PLOT_TELEMETRY_TEXT,
+                x,
+                y,
+                text=line,
+                anchor="nw",
+                fill=PLOT_TELEMETRY_TEXT,
                 font=("Consolas", 10),
             )
             y += 14
@@ -1110,12 +1114,19 @@ class NavGuiApp:
         # above, so their color can react independently of the plain-text
         # telemetry stacked over them.
         def unc_color(value: float, threshold: float) -> str:
-            return PLOT_TELEMETRY_WARN if threshold > 0 and value >= 0.8 * threshold else PLOT_TELEMETRY_TEXT
+            return (
+                PLOT_TELEMETRY_WARN
+                if threshold > 0 and value >= 0.8 * threshold
+                else PLOT_TELEMETRY_TEXT
+            )
 
         if d.uncertainty_enabled:
             text = f"unc={d.uncertainty_value:.2f}/{d.uncertainty_threshold:.2f}"
             self.plot.create_text(
-                x, y, text=text, anchor="nw",
+                x,
+                y,
+                text=text,
+                anchor="nw",
                 fill=unc_color(d.uncertainty_value, d.uncertainty_threshold),
                 font=("Consolas", 10),
             )
@@ -1126,8 +1137,13 @@ class NavGuiApp:
             f"{d.home_base_uncertainty_threshold:.2f}"
         )
         self.plot.create_text(
-            x, y, text=home_text, anchor="nw",
-            fill=unc_color(d.home_base_uncertainty_value, d.home_base_uncertainty_threshold),
+            x,
+            y,
+            text=home_text,
+            anchor="nw",
+            fill=unc_color(
+                d.home_base_uncertainty_value, d.home_base_uncertainty_threshold
+            ),
             font=("Consolas", 10),
         )
 
@@ -1410,9 +1426,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument(
         "--cov-growth",
         type=float,
-        default=0.01,
+        default=0.001,
         help="base per-tick belief-uncertainty growth while the goal mask is unseen "
-        "(default 0.01); lower this to trigger the halt sooner for testing",
+        "(default 0.001); lower this to trigger the halt sooner for testing",
     )
     ap.add_argument(
         "--cov-growth-rate",

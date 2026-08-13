@@ -857,7 +857,7 @@ class RoverController:
                         self.display.pose, (self.start_x, self.start_z)
                     )
                     goal_beliefs.setdefault(
-                        "home base", self._new_belief_tracker()
+                        "home base", self._new_belief_tracker(mission_sweep=True)
                     ).observe_body_point(home_forward, home_left)
                     self._event_log.log(
                         "home_base_seeded",
@@ -1176,10 +1176,14 @@ class RoverController:
                 new_pose = integrate_mars(obs.pose, action, self.dt)
                 env.step(new_pose)
 
-                if mode in (MODE_POINT, MODE_RESOLVE) and self._mission is None:
+                if (
+                    mode in (MODE_POINT, MODE_RESOLVE)
+                    and self._mission is None
+                    and not self._uncertainty_halted
+                ):
                     belief_tracker.propagate(action, self.dt)
 
-                if self._mission is not None:
+                if self._mission is not None and not self._uncertainty_halted:
                     # Every tracked goal belief (not just the active one) dead-
                     # reckons against the rover's actual executed motion this tick,
                     # regardless of which mode that motion happened under -- a
@@ -1188,7 +1192,13 @@ class RoverController:
                     # decay/rotate with it. belief_tracker (the active goal's
                     # tracker, aliased into goal_beliefs by _start_mission_subgoal)
                     # is one of these entries, so it's propagated here instead of
-                    # the ad-hoc-only line above.
+                    # the ad-hoc-only line above. Frozen while uncertainty-halted,
+                    # same "no growth while frozen" contract kb_teleop_vl.py's
+                    # _update_uncertainty_covariance uses -- action is pinned to
+                    # zero during a halt anyway, but propagate()'s uncertainty
+                    # growth is time-based (uncertainty_growth_increment), not
+                    # action-scaled, so without this guard it kept climbing every
+                    # tick even while frozen awaiting a human heading.
                     for bt in goal_beliefs.values():
                         bt.propagate(action, self.dt)
 
