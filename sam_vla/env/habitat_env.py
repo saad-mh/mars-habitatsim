@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import habitat_sim
 import magnum as mn
@@ -80,6 +80,7 @@ class MarsHabitatEnv:
         flag_min_spacing: float = 1.5,
         flag_boundary_margin: float = 2.0,
         flag_spawn_clearance: float = 2.0,
+        spawn_flags: bool = True,
         enable_topdown_viz: bool = False,
         topdown_resolution: tuple = (TOPDOWN_HEIGHT, TOPDOWN_WIDTH),
         topdown_hfov_deg: float = TOPDOWN_HFOV_DEG,
@@ -113,6 +114,11 @@ class MarsHabitatEnv:
         self._flag_min_spacing = float(flag_min_spacing)
         self._flag_boundary_margin = float(flag_boundary_margin)
         self._flag_spawn_clearance = float(flag_spawn_clearance)
+        # False skips flag placement entirely (self.flags stays []) -- for
+        # callers that don't want the decorative diamond cluttering a scene,
+        # e.g. an offline rollout replay framed around its own recorded
+        # trajectory/goal/obstacle instead.
+        self._spawn_flags = bool(spawn_flags)
         self._enable_topdown_viz = bool(enable_topdown_viz)
         self._topdown_resolution = (
             int(topdown_resolution[0]),
@@ -121,6 +127,8 @@ class MarsHabitatEnv:
         self._topdown_hfov_deg = float(topdown_hfov_deg)
         self._topdown_margin_m = float(topdown_margin_m)
         self._topdown_agent = None
+        self._topdown_center: Optional[Tuple[float, float]] = None
+        self._topdown_cam_height: Optional[float] = None
         self._rover_marker_scale = float(rover_marker_scale)
         # A render-only Perseverance model tracking the driving agent's live
         # pose, shown only in the topdown camera's frame (see
@@ -219,36 +227,39 @@ class MarsHabitatEnv:
             self.rocks, _rock_config = load_rock_field(self._rock_field_path)
             register_rocks(self._sim, self.rocks)
 
-        if self._flag_seed is not None:
-            from sam_vla.env.flag_placement import (
-                FlagFieldConfig,
-                generate_flag_field,
-                register_flags,
-            )
+        if self._spawn_flags:
+            if self._flag_seed is not None:
+                from sam_vla.env.flag_placement import (
+                    FlagFieldConfig,
+                    generate_flag_field,
+                    register_flags,
+                )
 
-            # Always keep flags clear of the rover's own spawn point, on top
-            # of any caller-supplied exclude zones.
-            flag_config = FlagFieldConfig(
-                seed=self._flag_seed,
-                num_flags=self._num_flags,
-                min_spacing=self._flag_min_spacing,
-                boundary_margin=self._flag_boundary_margin,
-                exclude_zones=[(x, z, self._flag_spawn_clearance)],
-            )
-            self.flags = generate_flag_field(flag_config, self._terrain, face_target=(x, z))
-            register_flags(self._sim, self.flags)
-        else:
-            # No seed given: fall back to a fixed four-flag diamond around
-            # spawn (see flag_placement.generate_default_flag_field) instead
-            # of leaving the yard empty -- a "go left find a flag" mission
-            # prompt always has something to find.
-            from sam_vla.env.flag_placement import (
-                generate_default_flag_field,
-                register_flags,
-            )
+                # Always keep flags clear of the rover's own spawn point, on
+                # top of any caller-supplied exclude zones.
+                flag_config = FlagFieldConfig(
+                    seed=self._flag_seed,
+                    num_flags=self._num_flags,
+                    min_spacing=self._flag_min_spacing,
+                    boundary_margin=self._flag_boundary_margin,
+                    exclude_zones=[(x, z, self._flag_spawn_clearance)],
+                )
+                self.flags = generate_flag_field(
+                    flag_config, self._terrain, face_target=(x, z)
+                )
+                register_flags(self._sim, self.flags)
+            else:
+                # No seed given: fall back to a fixed four-flag diamond around
+                # spawn (see flag_placement.generate_default_flag_field) instead
+                # of leaving the yard empty -- a "go left find a flag" mission
+                # prompt always has something to find.
+                from sam_vla.env.flag_placement import (
+                    generate_default_flag_field,
+                    register_flags,
+                )
 
-            self.flags = generate_default_flag_field(self._terrain, x, z, yaw)
-            register_flags(self._sim, self.flags)
+                self.flags = generate_default_flag_field(self._terrain, x, z, yaw)
+                register_flags(self._sim, self.flags)
 
         if self._topdown_agent is not None:
             self._place_topdown_camera(fallback_x=x, fallback_z=z)
@@ -277,18 +288,26 @@ class MarsHabitatEnv:
         self._registry.start_all()
         return self
 
-    def _place_topdown_camera(self, fallback_x: float, fallback_z: float) -> None:
+    def _place_topdown_camera(
+        self,
+        fallback_x: float,
+        fallback_z: float,
+        extra_points: Optional[Sequence[Tuple[float, float]]] = None,
+    ) -> None:
         """Point the fixed viz-only top-down camera (see enable_topdown_viz)
         straight down at a height/position chosen so its frame's ground
-        footprint contains every flag's (x, z) plus topdown_margin_m of
-        clearance -- never moves after this, unlike the driving agent.
-        Falls back to a small box around the rover's spawn point if no
-        flags were placed (shouldn't happen with the current flag-placement
-        paths, both of which always populate self.flags, but this camera
-        must not crash env startup either way)."""
-        if self.flags:
-            xs = [f.x for f in self.flags]
-            zs = [f.z for f in self.flags]
+        footprint contains every flag's (x, z), plus any caller-supplied
+        `extra_points` (e.g. an offline rollout's full trajectory/goal/
+        obstacle positions -- see refit_topdown_camera), plus
+        topdown_margin_m of clearance. Falls back to a small box around the
+        rover's spawn point if neither flags nor extra_points are given."""
+        xs = [f.x for f in self.flags]
+        zs = [f.z for f in self.flags]
+        if extra_points:
+            for px, pz in extra_points:
+                xs.append(float(px))
+                zs.append(float(pz))
+        if xs:
             min_x, max_x = min(xs), max(xs)
             min_z, max_z = min(zs), max(zs)
         else:
@@ -311,6 +330,50 @@ class MarsHabitatEnv:
 
         ground_y = self._terrain(cx, cz)
         set_agent_pose_topdown(self._topdown_agent, cx, ground_y + cam_height, cz)
+        # Cached for project_world_to_topdown_pixel -- the *actual* ground
+        # footprint at this cam_height, not half_width/half_depth themselves
+        # (whichever dimension isn't the constraining one ends up with a
+        # larger visible footprint than its own requested half-extent, since
+        # both dimensions share one cam_height).
+        self._topdown_center = (cx, cz)
+        self._topdown_cam_height = cam_height
+
+    def refit_topdown_camera(
+        self, extra_xz: Optional[Sequence[Tuple[float, float]]] = None
+    ) -> None:
+        """Recompute the fixed top-down camera's framing to also cover
+        `extra_xz` (world (x, z) points) -- for offline rollout replay,
+        where the interesting region (a saved episode's full trajectory,
+        goal, obstacles) can extend well beyond wherever the default flag
+        diamond landed, or beyond nothing at all if spawn_flags=False.
+        No-op if enable_topdown_viz=False."""
+        if self._topdown_agent is None:
+            return
+        self._place_topdown_camera(
+            self._start_x, self._start_z, extra_points=extra_xz
+        )
+
+    def project_world_to_topdown_pixel(
+        self, x: float, z: float
+    ) -> Optional[Tuple[int, int]]:
+        """World (x, z) -> pixel (col, row) in the top-down camera's frame,
+        for drawing 2D overlays (goal/obstacle markers, trajectory trails)
+        on top of get_topdown_rgb's render -- mirrors goal_geometry.
+        project_world_to_pixel's role for the driving agent's own camera.
+        Not clamped to the frame bounds; callers should check against
+        topdown_resolution before drawing. None if enable_topdown_viz=False."""
+        if self._topdown_agent is None or self._topdown_cam_height is None:
+            return None
+        cx, cz = self._topdown_center
+        h = self._topdown_cam_height
+        topdown_h, topdown_w = self._topdown_resolution
+        hfov = math.radians(self._topdown_hfov_deg)
+        vfov = 2.0 * math.atan(math.tan(hfov / 2.0) * topdown_h / topdown_w)
+        half_w = h * math.tan(hfov / 2.0)
+        half_d = h * math.tan(vfov / 2.0)
+        px = (topdown_w / 2.0) + (float(x) - cx) / half_w * (topdown_w / 2.0)
+        py = (topdown_h / 2.0) + (float(z) - cz) / half_d * (topdown_h / 2.0)
+        return int(round(px)), int(round(py))
 
     def _register_rover_marker(self, x: float, z: float, yaw: float) -> None:
         """Register the render-only Perseverance model at the rover's spawn

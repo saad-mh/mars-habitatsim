@@ -319,7 +319,7 @@ class NavGuiApp:
         self.cam_canvas.bind("<Button-1>", self.on_cam_click)
         ctk.CTkLabel(
             cam_frame,
-            text="POINT & SELECT — click any point in the live view to send the rover there",
+            text="",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#22d3ee",
         ).grid(row=1, column=0, pady=(0, 6))
