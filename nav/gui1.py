@@ -8,6 +8,8 @@ Run via nav/launch_nav.sh, or directly:
     conda activate habitat
     cd mars-habitatsim
     python -m nav.gui [--scene-path ...] [--heightmap-path ...] [--cbf/--no-cbf] ...
+    # this command works as is
+    python -m nav.gui1 --gen-home-base --navdp-upstream-root ../navdp_upstream/
 
 Open-vocabulary target grounding ("Ground Target" / a Command-panel GO_TO/FIND
 step) uses GroundingDINO (navdp.extensions.GroundingDINODetector, see
@@ -78,6 +80,7 @@ from pathlib import Path
 from typing import Optional
 
 import tkinter as tk
+import tkinter.font as tkfont
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 
@@ -89,6 +92,53 @@ from nav.rover_controller import MODE_REVIEW_SEGMENTATION, MODE_TURN, RoverContr
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REFRESH_MS = 66  # ~15 Hz GUI repaint, independent of the controller's own hz
+
+# NASA-STD-3001 Vol. 2 / Appendix F display typography baseline.
+#
+# The standard defines legibility in angular character height (0.25 deg
+# minimum, >=0.4 deg preferred), not in pixels.  These tokens are therefore
+# the console's program desktop baseline; final verification still has to be
+# performed at the program's worst-case viewing distance, display scaling,
+# ambient light, glare, vibration, and operator position.
+#
+# Appendix F calls for sans-serif text, mixed case for non-acronyms, and a
+# fixed-width face for numerical/tabular data.  Keep widget fonts mapped to
+# these semantic roles instead of introducing one-off CTkFont instances.
+TYPE_SIZE = {
+    "caption": 16,  # minimum operational label baseline
+    "body": 16,  # normal readable text
+    "control": 17,  # buttons and editable controls
+    "section": 18,  # panel/region headings
+    "value": 20,  # operationally important state/value
+    "status": 26,  # persistent current-status heading
+    "emergency": 24,  # safety-critical emergency control
+    "plot_marker": 28,  # map goal marker
+}
+
+FONT_FAMILY = {
+    # Exact program font standard, selected from NASA's Horizon digital
+    # typography system.  These fonts are deployment dependencies; allowing
+    # silent platform substitution would invalidate visual verification.
+    "display": "Inter",
+    "body": "Public Sans",
+    "data": "DM Mono",
+}
+
+
+def _require_standard_fonts(root: tk.Misc) -> None:
+    """Fail clearly instead of silently rendering an unverified substitute."""
+    installed = {name.casefold() for name in tkfont.families(root)}
+    missing = [
+        name for name in FONT_FAMILY.values() if name.casefold() not in installed
+    ]
+    if missing:
+        names = ", ".join(missing)
+        raise RuntimeError(
+            f"Missing required UI font families: {names}. "
+            "Install the Inter, Public Sans, and DM Mono font families on "
+            "the target system before launching this verified display."
+        )
+
 
 PLOT_BG = "#242424"
 PLOT_AXIS = "#555555"
@@ -105,7 +155,7 @@ PLOT_TELEMETRY_TEXT = "#e5e7eb"
 # console's button footprint so every primary action stays large and
 # every gap stays wide enough to miss with a thick glove -- the paper's
 # core hardware fix ("spaced the buttons further apart").
-BTN_H = 46  # primary action button height (px)
+BTN_H = 48  # primary action button height (px; 4 px layout grid)
 BTN_GAP = 8  # inter-button spacing (px)
 SECTION_GAP = 12  # spacing between labeled sections (px)
 
@@ -259,7 +309,67 @@ class NavGuiApp:
         root.grid_columnconfigure(0, weight=3)
         root.grid_columnconfigure(1, weight=1, minsize=self.SIDEBAR_MIN_W)
 
-        mode_font = ctk.CTkFont(size=17, weight="bold")
+        # One program-wide display vocabulary, as required by NASA-STD-3001.
+        # Fonts are exact deployment dependencies so tested character shape,
+        # metrics, wrapping, and control geometry cannot silently change.
+        _require_standard_fonts(root)
+        self.display_font_family = FONT_FAMILY["display"]
+        self.body_font_family = FONT_FAMILY["body"]
+        self.data_font_family = FONT_FAMILY["data"]
+        self.fonts = {
+            "caption": ctk.CTkFont(
+                family=self.body_font_family, size=TYPE_SIZE["caption"]
+            ),
+            "caption_bold": ctk.CTkFont(
+                family=self.body_font_family,
+                size=TYPE_SIZE["caption"],
+                weight="bold",
+            ),
+            "data_label": ctk.CTkFont(
+                family=self.data_font_family,
+                size=TYPE_SIZE["caption"],
+                weight="bold",
+            ),
+            "body": ctk.CTkFont(family=self.body_font_family, size=TYPE_SIZE["body"]),
+            "body_bold": ctk.CTkFont(
+                family=self.body_font_family,
+                size=TYPE_SIZE["body"],
+                weight="bold",
+            ),
+            "control": ctk.CTkFont(
+                family=self.body_font_family,
+                size=TYPE_SIZE["control"],
+                weight="bold",
+            ),
+            "section": ctk.CTkFont(
+                family=self.display_font_family,
+                size=TYPE_SIZE["section"],
+                weight="bold",
+            ),
+            "value": ctk.CTkFont(
+                family=self.data_font_family,
+                size=TYPE_SIZE["value"],
+                weight="bold",
+            ),
+            "state": ctk.CTkFont(
+                family=self.display_font_family,
+                size=TYPE_SIZE["value"],
+                weight="bold",
+            ),
+            "status": ctk.CTkFont(
+                family=self.display_font_family,
+                size=TYPE_SIZE["status"],
+                weight="bold",
+            ),
+            "emergency": ctk.CTkFont(
+                family=self.display_font_family,
+                size=TYPE_SIZE["emergency"],
+                weight="bold",
+            ),
+            "telemetry": ctk.CTkFont(
+                family=self.data_font_family, size=TYPE_SIZE["body"]
+            ),
+        }
 
         # ===== TOP STATUS / CURRENT STATUS (exp.md Sec. 1) =============== #
         # Full-width, persistent, above everything else -- the one line the
@@ -276,7 +386,7 @@ class NavGuiApp:
             text="",
             anchor="w",
             justify="left",
-            font=ctk.CTkFont(size=20, weight="bold"),
+            font=self.fonts["status"],
         )
         self.top_status_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 0))
         self.top_status_detail_label = ctk.CTkLabel(
@@ -284,7 +394,7 @@ class NavGuiApp:
             text="",
             anchor="w",
             justify="left",
-            font=ctk.CTkFont(size=13),
+            font=self.fonts["body"],
             text_color="#e5e7eb",
         )
         self.top_status_detail_label.grid(
@@ -301,7 +411,7 @@ class NavGuiApp:
             text="controller thread died -- see console",
             anchor="w",
             justify="left",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=self.fonts["caption_bold"],
             text_color="#f87171",
         )
         self._alive_label_visible = False
@@ -322,7 +432,7 @@ class NavGuiApp:
         ctk.CTkLabel(
             cam_frame,
             text="",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=self.fonts["caption_bold"],
             text_color="#22d3ee",
         ).grid(row=1, column=0, pady=(0, 6))
 
@@ -348,12 +458,10 @@ class NavGuiApp:
             ctk.CTkLabel(
                 cell,
                 text=title,
-                font=ctk.CTkFont(size=10, weight="bold"),
+                font=self.fonts["data_label"],
                 text_color="#9ca3af",
             ).pack(pady=(6, 0))
-            value_label = ctk.CTkLabel(
-                cell, text="--", font=ctk.CTkFont(size=13, weight="bold")
-            )
+            value_label = ctk.CTkLabel(cell, text="--", font=self.fonts["value"])
             value_label.pack(pady=(0, 6))
             return value_label
 
@@ -369,8 +477,8 @@ class NavGuiApp:
         self.mission_panel.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             self.mission_panel,
-            text="MISSION",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            text="Mission",
+            font=self.fonts["section"],
             text_color="#9ca3af",
         ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
 
@@ -379,18 +487,22 @@ class NavGuiApp:
             text="",
             anchor="w",
             justify="left",
-            font=ctk.CTkFont(size=13),
+            font=self.fonts["body"],
         )
         self.goal_list_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
 
         ctk.CTkLabel(
             self.mission_panel,
-            text="CURRENT GOAL",
-            font=ctk.CTkFont(size=10, weight="bold"),
+            text="Current goal",
+            font=self.fonts["data_label"],
             text_color="#9ca3af",
         ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 0))
         self.current_goal_label = ctk.CTkLabel(
-            self.mission_panel, text="--", anchor="w", justify="left", font=mode_font
+            self.mission_panel,
+            text="--",
+            anchor="w",
+            justify="left",
+            font=self.fonts["state"],
         )
         self.current_goal_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
 
@@ -398,9 +510,9 @@ class NavGuiApp:
         mission_stat_row.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 10))
         for i in range(3):
             mission_stat_row.grid_columnconfigure(i, weight=1)
-        self.goal_distance_label = _stat_cell(mission_stat_row, 0, "DISTANCE")
-        self.goal_belief_label = _stat_cell(mission_stat_row, 1, "GOAL BELIEF")
-        self.goal_status_label = _stat_cell(mission_stat_row, 2, "STATUS")
+        self.goal_distance_label = _stat_cell(mission_stat_row, 0, "Distance")
+        self.goal_belief_label = _stat_cell(mission_stat_row, 1, "Goal belief")
+        self.goal_status_label = _stat_cell(mission_stat_row, 2, "Status")
 
         self.mission_panel.bind(
             "<Configure>",
@@ -419,13 +531,17 @@ class NavGuiApp:
         self.status_panel.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             self.status_panel,
-            text="ROVER STATUS",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            text="Rover status",
+            font=self.fonts["section"],
             text_color="#9ca3af",
         ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
 
         self.mode_label = ctk.CTkLabel(
-            self.status_panel, text="", anchor="w", justify="left", font=mode_font
+            self.status_panel,
+            text="",
+            anchor="w",
+            justify="left",
+            font=self.fonts["state"],
         )
         self.mode_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
 
@@ -434,9 +550,9 @@ class NavGuiApp:
         rover_stat_row.grid_columnconfigure(0, weight=1)
         rover_stat_row.grid_columnconfigure(1, weight=1)
         self.current_uncertainty_label = _stat_cell(
-            rover_stat_row, 0, "CURRENT UNCERTAINTY"
+            rover_stat_row, 0, "Current uncertainty"
         )
-        self.home_uncertainty_label = _stat_cell(rover_stat_row, 1, "HOME UNCERTAINTY")
+        self.home_uncertainty_label = _stat_cell(rover_stat_row, 1, "Home uncertainty")
 
         # Telemetry: only the operational values exp.md calls out (position,
         # heading, velocity, yaw rate, nav state) -- model-internal/CBF
@@ -447,7 +563,7 @@ class NavGuiApp:
             text="",
             anchor="w",
             justify="left",
-            font=ctk.CTkFont(size=12, family="Consolas"),
+            font=self.fonts["telemetry"],
             text_color="#e5e7eb",
         )
         self.telemetry_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
@@ -467,26 +583,32 @@ class NavGuiApp:
         command_panel.grid(row=row, column=0, sticky="ew", pady=(SECTION_GAP, 0))
         row += 1
         command_panel.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            command_panel, text="TASKWORK", font=ctk.CTkFont(size=12, weight="bold")
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
+        ctk.CTkLabel(command_panel, text="Taskwork", font=self.fonts["section"]).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4)
+        )
         self.command_entry = ctk.CTkEntry(
             command_panel,
             placeholder_text='"go to a flag then return to home"',
-            height=38,
+            height=BTN_H,
+            font=self.fonts["body"],
         )
         self.command_entry.grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 4))
         self.command_entry.bind("<Return>", lambda e: self.submit_command())
         # REACH P3: dispatch the ordered mission.
         ctk.CTkButton(
-            command_panel, text="Send", width=72, height=38, command=self.submit_command
+            command_panel,
+            text="Send",
+            width=72,
+            height=BTN_H,
+            font=self.fonts["control"],
+            command=self.submit_command,
         ).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=(0, 4))
         self.mission_status_label = ctk.CTkLabel(
             command_panel,
             text="",
             anchor="w",
             justify="left",
-            font=ctk.CTkFont(size=12),
+            font=self.fonts["body"],
             text_color="#e5e7eb",
             wraplength=self.SIDEBAR_MIN_W - 20,
         )
@@ -548,13 +670,14 @@ class NavGuiApp:
             seg_trigger_panel.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(
                 seg_trigger_panel,
-                text="SEGMENTATION",
-                font=ctk.CTkFont(size=12, weight="bold"),
+                text="Segmentation",
+                font=self.fonts["section"],
             ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
             ctk.CTkButton(
                 seg_trigger_panel,
                 text="Run Segmentation",
                 height=BTN_H,
+                font=self.fonts["control"],
                 command=self.run_segmentation,
             ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
 
@@ -568,8 +691,8 @@ class NavGuiApp:
         self.seg_panel = ctk.CTkFrame(sidebar, border_width=2, border_color="#f59e0b")
         ctk.CTkLabel(
             self.seg_panel,
-            text="REVIEW RESOLVED GOAL",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            text="Review resolved goal",
+            font=self.fonts["section"],
             text_color="#f59e0b",
         ).pack(pady=(10, 2))
         self.seg_desc_label = ctk.CTkLabel(
@@ -577,6 +700,7 @@ class NavGuiApp:
             text="",
             wraplength=self.SIDEBAR_MIN_W - 40,
             justify="left",
+            font=self.fonts["body"],
         )
         self.seg_desc_label.pack(padx=12, pady=(0, 8), fill="x")
         self.seg_panel.bind(
@@ -591,6 +715,7 @@ class NavGuiApp:
             seg_btn_col,
             text="Confirm",
             height=BTN_H,
+            font=self.fonts["control"],
             command=self.confirm_segmentation,
             fg_color="#15803d",
             hover_color="#166534",
@@ -600,6 +725,7 @@ class NavGuiApp:
             seg_btn_col,
             text="Rerun",
             height=BTN_H,
+            font=self.fonts["control"],
             command=self.rerun_segmentation,
             fg_color="#b45309",
             hover_color="#92400e",
@@ -607,7 +733,11 @@ class NavGuiApp:
         # REACH P1 + P7: fall back to point-and-select if the auto result
         # is wrong.
         ctk.CTkButton(
-            seg_btn_col, text="Pick Manually", height=BTN_H, command=self.pick_manually
+            seg_btn_col,
+            text="Pick Manually",
+            height=BTN_H,
+            font=self.fonts["control"],
+            command=self.pick_manually,
         ).grid(row=2, column=0, sticky="ew", pady=3)
 
         # ===== CONTEXTUAL PANEL B — CONFIRM POINT GOAL (REACH P1 + P7) == #
@@ -619,7 +749,7 @@ class NavGuiApp:
         self.click_desc_label = ctk.CTkLabel(
             self.click_panel,
             text="Set the goal at the point you clicked?",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=self.fonts["body_bold"],
             text_color="#22d3ee",
             wraplength=self.SIDEBAR_MIN_W - 40,
         )
@@ -632,6 +762,7 @@ class NavGuiApp:
             click_btn_col,
             text="Confirm Point Goal",
             height=BTN_H,
+            font=self.fonts["control"],
             command=self.confirm_pixel_goal,
             fg_color="#15803d",
             hover_color="#166534",
@@ -641,6 +772,7 @@ class NavGuiApp:
             click_btn_col,
             text="Cancel",
             height=BTN_H,
+            font=self.fonts["control"],
             command=self.cancel_pixel_click,
             fg_color="#4b5563",
             hover_color="#374151",
@@ -658,7 +790,7 @@ class NavGuiApp:
             sidebar, border_width=2, border_color="#38bdf8"
         )
         self.uncertainty_title = ctk.CTkLabel(
-            self.uncertainty_panel, text="", font=ctk.CTkFont(size=14, weight="bold")
+            self.uncertainty_panel, text="", font=self.fonts["section"]
         )
         self.uncertainty_title.pack(pady=(10, 2))
         self.uncertainty_desc_label = ctk.CTkLabel(
@@ -666,6 +798,7 @@ class NavGuiApp:
             text="",
             wraplength=self.SIDEBAR_MIN_W - 40,
             justify="left",
+            font=self.fonts["body"],
         )
         self.uncertainty_desc_label.pack(padx=12, pady=(0, 8), fill="x")
         self.uncertainty_panel.bind(
@@ -686,6 +819,7 @@ class NavGuiApp:
                 text=f"{key}\n{angle:+.0f}°",
                 width=68,
                 height=50,
+                font=self.fonts["control"],
                 command=lambda a=angle: self.submit_uncertainty_heading(a),
             )
             btn.grid(row=r, column=c, padx=4, pady=4)
@@ -695,6 +829,7 @@ class NavGuiApp:
             self.uncertainty_panel,
             text="Retry (R)",
             height=BTN_H,
+            font=self.fonts["control"],
             fg_color="#b45309",
             hover_color="#92400e",
             command=self.retry_uncertainty,
@@ -713,7 +848,7 @@ class NavGuiApp:
             sidebar,
             text="",
             anchor="n",
-            font=ctk.CTkFont(size=11),
+            font=self.fonts["caption"],
             text_color="#9ca3af",
             wraplength=self.SIDEBAR_MIN_W - 20,
         )
@@ -734,8 +869,8 @@ class NavGuiApp:
         plot_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             plot_frame,
-            text="TRAJECTORY / BELIEF",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            text="Trajectory / belief",
+            font=self.fonts["section"],
             text_color="#9ca3af",
         ).grid(row=0, column=0, sticky="w", padx=10, pady=(6, 0))
         self.plot = tk.Canvas(
@@ -754,9 +889,9 @@ class NavGuiApp:
         stop_bar.grid_columnconfigure(1, weight=1)
         ctk.CTkButton(
             stop_bar,
-            text="■  EMERGENCY STOP",
+            text="■  Emergency stop",
             height=56,
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=self.fonts["emergency"],
             command=self.stop,
             fg_color="#b91c1c",
             hover_color="#991b1b",
@@ -767,6 +902,7 @@ class NavGuiApp:
             stop_bar,
             text="Reset Rover",
             height=56,
+            font=self.fonts["control"],
             command=self.reset_rover,
             fg_color="#4b5563",
             hover_color="#374151",
@@ -1134,7 +1270,7 @@ class NavGuiApp:
         belief_text, belief_color = self._derive_goal_belief(d)
         self.goal_belief_label.configure(text=belief_text, text_color=belief_color)
         self.goal_status_label.configure(
-            text=goal_status or "--",
+            text=goal_status.title() if goal_status else "--",
             text_color=GOAL_STATUS_COLORS.get(goal_status, "#e5e7eb"),
         )
 
@@ -1152,7 +1288,8 @@ class NavGuiApp:
     def _sync_rover_status_panel(self, d) -> None:
         rover_mode = self._derive_rover_mode(d)
         self.mode_label.configure(
-            text=rover_mode, text_color=ROVER_MODE_COLORS.get(rover_mode, "#e5e7eb")
+            text=rover_mode.title(),
+            text_color=ROVER_MODE_COLORS.get(rover_mode, "#e5e7eb"),
         )
 
         if d.uncertainty_enabled:
@@ -1192,7 +1329,7 @@ class NavGuiApp:
 
     def _sync_top_status(self, d, goal_status: Optional[str], alive: bool) -> None:
         state, subtext, color = self._derive_top_status(d, goal_status, alive)
-        self.top_status_label.configure(text=state, text_color=color)
+        self.top_status_label.configure(text=state.title(), text_color=color)
         # REACH P9: prefer the freshest human ack over the derived subtext
         # so a just-pressed control's acknowledgment always wins on the
         # same frame it fires, before the controller's own state catches up.
@@ -1287,12 +1424,12 @@ class NavGuiApp:
         if in_flight:
             self.uncertainty_panel.configure(border_color="#f59e0b")
             self.uncertainty_title.configure(
-                text="REQUESTING VLM SWEEP...", text_color="#f59e0b"
+                text="Requesting VLM sweep...", text_color="#f59e0b"
             )
         else:
             self.uncertainty_panel.configure(border_color="#38bdf8")
             self.uncertainty_title.configure(
-                text="UNCERTAINTY HALT -- choose a heading", text_color="#38bdf8"
+                text="Uncertainty halt — choose a heading", text_color="#38bdf8"
             )
         self.uncertainty_desc_label.configure(
             text=d.uncertainty_line or "Waiting for VLM sweep description..."
@@ -1397,7 +1534,11 @@ class NavGuiApp:
                 width=2,
             )
             self.plot.create_text(
-                gx, gy, text="*", fill=PLOT_GOAL, font=("TkDefaultFont", 26)
+                gx,
+                gy,
+                text="*",
+                fill=PLOT_GOAL,
+                font=(self.display_font_family, TYPE_SIZE["plot_marker"], "bold"),
             )
 
     def tick_forever(self) -> None:

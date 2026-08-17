@@ -62,6 +62,24 @@ def compute_metrics(logs: List[EpisodeLog], success_radius: float) -> Dict[str, 
     coverage_1sigma = float(np.mean(hit_1sigma)) if hit_1sigma else float("nan")
     coverage_2sigma = float(np.mean(hit_2sigma)) if hit_2sigma else float("nan")
 
+    # Ground-truth reachability: was the robot actually within success_radius of
+    # the true goal at episode end, regardless of whether RouteManager's
+    # belief-mean-based "advanced" flag agreed. advance_rate/false_advance_rate
+    # above are about the belief being fooled; this is about the robot itself.
+    true_success_rate = float(
+        np.mean(
+            [log.final_true_dist <= float(success_radius) for log in logs]
+        )
+    )
+    human_active_frac = float(
+        np.mean(
+            [
+                float(np.mean(log.human_active)) if log.human_active else 0.0
+                for log in logs
+            ]
+        )
+    )
+
     return {
         "mean_err_visible": (
             float(np.mean(err_visible)) if err_visible else float("nan")
@@ -84,6 +102,8 @@ def compute_metrics(logs: List[EpisodeLog], success_radius: float) -> Dict[str, 
         "false_advance_rate": (
             (len(false_advances) / n_advanced) if n_advanced else float("nan")
         ),
+        "true_success_rate": true_success_rate,
+        "human_active_frac": human_active_frac,
         "n_episodes": float(n_episodes),
     }
 

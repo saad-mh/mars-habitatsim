@@ -77,6 +77,26 @@ class EnvConfig:
 
 
 @dataclass
+class InterventionConfig:
+    """Switches steering from the belief mean to a human-provided bearing once
+    the bank's own sigma_ale crosses gate_cfg.sigma_ale_threshold -- reusing that
+    existing (previously dead, see the should_pause comment below) threshold field
+    rather than adding a second one.
+
+    The point of this study: sigma_ale climbing under heavy occlusion + odometry
+    noise reflects IRREDUCIBLE scenario noise (see README's "why mean has no sweep
+    range") -- no sigma_init/sigma_visible/odom_noise/decay_factor tuning fixes a
+    dead-reckoned mu that has drifted during a long occlusion streak. A human
+    watching the raw feed can still roughly judge the true bearing without
+    integrating that drift, so this models a teleoperator taking over steering
+    only while the belief is untrustworthy, not a better sensor or a smarter bank.
+    """
+
+    enabled: bool = False
+    human_bearing_noise_std_deg: float = 8.0
+
+
+@dataclass
 class EpisodeLog:
     t: List[int] = field(default_factory=list)
     true_goal: List[np.ndarray] = field(default_factory=list)
@@ -85,6 +105,7 @@ class EpisodeLog:
     confidence: List[float] = field(default_factory=list)
     visible: List[bool] = field(default_factory=list)
     should_pause: List[bool] = field(default_factory=list)
+    human_active: List[bool] = field(default_factory=list)
     advanced: bool = False
     steps_to_advance: Optional[int] = None
     final_true_dist: float = float("nan")
@@ -116,6 +137,7 @@ def run_episode(
     gate_cfg: GateConfig,
     rng: np.random.Generator,
     max_steps: int = 40,
+    intervention_cfg: Optional[InterventionConfig] = None,
 ) -> EpisodeLog:
     bearing0 = math.radians(rng.uniform(-env_cfg.bearing0_deg, env_cfg.bearing0_deg))
     range0 = float(rng.uniform(*env_cfg.range0))
@@ -183,6 +205,13 @@ def run_episode(
         )
         log.should_pause.append(should_pause)
 
+        human_active = bool(
+            intervention_cfg
+            and intervention_cfg.enabled
+            and sigma_ale > gate_cfg.sigma_ale_threshold
+        )
+        log.human_active.append(human_active)
+
         if bool(status["advanced"]):
             log.advanced = True
             log.steps_to_advance = t
@@ -192,8 +221,21 @@ def run_episode(
         if should_pause:
             v_fwd, v_lat, yaw = 0.0, 0.0, float(gate_cfg.scan_yaw_rate)
         else:
+            if human_active:
+                # Human steers off the raw true bearing (own small, non-accumulating
+                # noise) instead of the possibly drift-corrupted belief mean.
+                true_bearing = math.atan2(float(true_goal[1]), float(true_goal[0]))
+                noisy_bearing = true_bearing + rng.normal(
+                    0.0, math.radians(intervention_cfg.human_bearing_noise_std_deg)
+                )
+                steer_target = np.array(
+                    [math.cos(noisy_bearing), math.sin(noisy_bearing)],
+                    dtype=np.float32,
+                )
+            else:
+                steer_target = mu
             v_fwd, v_lat, yaw = p_controller(
-                mu, env_cfg.turn_kp, env_cfg.base_forward, env_cfg.max_yaw_rate
+                steer_target, env_cfg.turn_kp, env_cfg.base_forward, env_cfg.max_yaw_rate
             )
             strength = strength_from_sigma_ale(
                 sigma_ale,

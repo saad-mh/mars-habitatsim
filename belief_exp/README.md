@@ -34,10 +34,11 @@ conda run -n sam2 python belief_exp/sweep.py --configs-n 200 --episodes-per-conf
 | file | purpose |
 |---|---|
 | `common.py` | imports the real navdp belief classes; defines a tiny bearing-following P-controller and a noise-free SE(2) ground-truth integrator (generic control math, not belief logic) |
-| `scenario.py` | closed-loop episode simulator: drives the real `SubgoalBeliefBank` + `RouteManager` through a randomized occlusion/noise scenario |
+| `scenario.py` | closed-loop episode simulator: drives the real `SubgoalBeliefBank` + `RouteManager` through a randomized occlusion/noise scenario. Also defines `InterventionConfig`, an optional switch from belief-mean steering to human-bearing steering once `sigma_ale` crosses `gate_cfg.sigma_ale_threshold` (see "Human intervention vs. belief-only" below) |
 | `metrics.py` | scores a batch of episodes for one config: calibration + task-performance |
 | `sweep.py` | CLI: paired random search over the param space → leaderboard CSV |
 | `inspect_one.py` | CLI: run one config, print a step-by-step trace |
+| `intervention_study.py` | CLI: reachability study comparing belief-only vs. human-intervention steering across a severity sweep of irreducible occlusion/odometry noise → CSV + optional illustrative trace |
 
 ## Quick start
 
@@ -86,6 +87,57 @@ conda run -n sam2 python belief_exp/sweep.py --configs-n 200 --episodes-per-conf
   actually makes `mu` drift during occlusion — separate from the bank's `odom_noise`,
   which only inflates `Sigma`).
 - occlusion regime — independent per-step Bernoulli or bursty Markov streaks.
+
+## Human intervention vs. belief-only: reachability under irreducible noise
+
+`intervention_study.py` tests a specific claim: past some severity of occlusion +
+odometry noise, `mu`'s drift during a long blind dead-reckoning streak is a property
+of the *scenario*, not something any `BankConfig` can fix (this is the same fact
+the "why mean has no sweep range" section above and `sigma_min_sweep.py` already
+establish for the calibration side — here it's applied to closed-loop steering). A
+controller that blindly steers off `mu` therefore drifts off the true goal, and can
+even have `RouteManager` declare "arrived" while the robot is meters away (a false
+advance). `scenario.InterventionConfig` models a human teleoperator who, watching
+the raw feed, can still supply a roughly-correct bearing (own small, per-step,
+*non-accumulating* noise) without having integrated that drift — and switches
+steering to that bearing only while `sigma_ale = sqrt(max(Sigma_xx, Sigma_yy))`
+(the real, navdp-sourced uncertainty) exceeds `gate_cfg.sigma_ale_threshold`. Both
+conditions share one `BankConfig`/`RouteConfig`/`GateConfig` and the same paired
+scenario seeds per severity level — `InterventionConfig.enabled` is the only thing
+that differs, isolating "who supplies the steering bearing" as the single variable.
+
+```bash
+conda run -n sam2 python belief_exp/intervention_study.py \
+    --out belief_exp/results/intervention_study_001.csv --trace
+```
+
+`--trace` searches a few seeds at the most severe level for one where `belief_only`
+fails (or false-advances) and `human_intervention`, replayed on the *same* seed,
+reaches the true goal, and prints both step traces side by side.
+
+Severity is a 2D interpolation from mild to severe between `--mild/--severe-mean-streak-len`
+(markov occlusion burst length) and `--mild/--severe-env-odom-noise` (real odometry
+noise corrupting dead reckoning while occluded) — the two scenario knobs that drive
+irreducible `mu` drift (see `EnvConfig`'s docstring in `scenario.py`).
+
+New metrics (in `metrics.py`, apply to every study/sweep, not just this one):
+- `true_success_rate` — fraction of episodes where the ROBOT's true final distance
+  to the goal is `<= success_radius`, regardless of whether `RouteManager` ever
+  declared `advanced`. This is the ground-truth reachability number the belief-based
+  `advance_rate`/`false_advance_rate` don't directly give you — a false advance ends
+  the episode "successfully" from the belief's point of view while this metric still
+  correctly scores it a failure if the robot wasn't actually there.
+- `human_active_frac` — mean per-episode fraction of steps steered by the human
+  bearing instead of `mu`; `0.0` whenever `InterventionConfig.enabled=False`.
+
+Result so far (`results/intervention_study_001.csv`, 100 paired episodes/level,
+default severity range): `true_success_rate` delta (`human_intervention -
+belief_only`) is essentially noise at severity 0 (`-0.03`, intervention barely
+triggers) and turns solidly positive from severity 0.4 upward (`+0.10` to `+0.21`),
+while `belief_only`'s `false_advance_rate` climbs from `0.0` to `0.16` and its
+`mean_final_dist` roughly doubles (`0.40` → `0.71`–`0.88`) — belief-only drifts off
+and increasingly fails (including falsely declaring arrival) exactly as severity
+rises, while human-intervention's `mean_final_dist` stays flat around `0.40`–`0.47`.
 
 ## Metric glossary
 

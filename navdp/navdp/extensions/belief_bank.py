@@ -120,10 +120,14 @@ class SubgoalBeliefBank:
                 slot.confidence = float(np.clip(conf, 0.0, 1.0))
             elif slot.initialized:
                 slot.mu = ego_motion_update(slot.mu, odom_delta)
-                slot.Sigma = slot.Sigma + np.eye(self.dim, dtype=np.float32) * self.odom_noise
+                slot.Sigma = (
+                    slot.Sigma + np.eye(self.dim, dtype=np.float32) * self.odom_noise
+                )
                 slot.visible = False
                 slot.time_since_seen += 1
-                slot.confidence = float(np.clip(slot.confidence * self.decay_factor, 0.0, 1.0))
+                slot.confidence = float(
+                    np.clip(slot.confidence * self.decay_factor, 0.0, 1.0)
+                )
             else:
                 slot.mu = np.zeros(self.dim, dtype=np.float32)
                 slot.Sigma = np.eye(self.dim, dtype=np.float32) * self.large_uncertainty
@@ -218,4 +222,6 @@ def _is_valid_position(pos: object, dim: int) -> bool:
         arr = np.asarray(pos, dtype=np.float32).reshape(-1)
     except (TypeError, ValueError):
         return False
-    return arr.shape[0] >= min(dim, 2) and np.isfinite(arr[: min(dim, arr.shape[0])]).all()
+    return (
+        arr.shape[0] >= min(dim, 2) and np.isfinite(arr[: min(dim, arr.shape[0])]).all()
+    )
