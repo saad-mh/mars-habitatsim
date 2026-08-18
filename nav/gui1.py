@@ -306,6 +306,13 @@ class NavGuiApp:
         # see stop()/_release_estop()/_update_estop_button().
         self._estop_active = False
 
+        # Most recent alerts list (see _derive_alerts), refreshed every
+        # tick by _sync_alerts_panel -- the hover-detail popup's Enter
+        # handler reads this directly for an instant, un-stale first paint
+        # instead of waiting on the next refresh() tick (see
+        # _show_alerts_tooltip / _ALERTS_TOOLTIP_MAX_ROWS section below).
+        self._last_alerts: list[tuple[str, str]] = []
+
         # Purely additive, human-viz-only window (see RoverController.
         # enable_topdown_viz) -- never touches the main console's layout
         # below; only exists when the controller was started with the flag.
@@ -520,6 +527,7 @@ class NavGuiApp:
         # configure), truncating with an ellipsis rather than wrapping, so
         # a long CBF/error message can never grow this row's fixed height.
         alerts_col = ctk.CTkFrame(top_status_bar, fg_color="transparent", width=1, height=1)
+        self.alerts_col = alerts_col
         alerts_col.grid(row=0, column=2, sticky="nsew")
         alerts_col.grid_columnconfigure(0, weight=1)
         self.alerts_header_label = ctk.CTkLabel(
@@ -550,6 +558,70 @@ class NavGuiApp:
             self._alerts_col_width = e.width
 
         alerts_col.bind("<Configure>", _on_alerts_col_configure)
+
+        # ---- hover-to-expand detail overlay (REACH P6+P9+P10) ----------- #
+        # The bar itself only ever shows the single worst alert (space is
+        # fixed-height, see above) -- hovering reveals every active alert in
+        # full, un-truncated, in a borderless popup anchored just below the
+        # column so nothing about the compact/detailed pair has to be
+        # learned separately from the rest of this console's bordered
+        # panels. Built once (hidden) rather than per-hover so showing it is
+        # just a reposition + deiconify, not a widget rebuild every time the
+        # mouse passes over.
+        self._ALERTS_TOOLTIP_MAX_ROWS = 8
+        self._alerts_tooltip_visible = False
+        self._alerts_hide_job: Optional[str] = None
+        self._alerts_tooltip = ctk.CTkToplevel(self.root)
+        self._alerts_tooltip.withdraw()
+        self._alerts_tooltip.overrideredirect(True)
+        self._alerts_tooltip.attributes("-topmost", True)
+        tooltip_frame = ctk.CTkFrame(
+            self._alerts_tooltip, border_width=2, border_color="#3f3f46", width=1
+        )
+        tooltip_frame.pack(fill="both", expand=True)
+        tooltip_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            tooltip_frame,
+            text="Status & alerts",
+            font=self.fonts["section"],
+            text_color="#9ca3af",
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(10, 6))
+        self._alerts_tooltip_rows: list[ctk.CTkLabel] = []
+        for i in range(self._ALERTS_TOOLTIP_MAX_ROWS):
+            lbl = ctk.CTkLabel(
+                tooltip_frame,
+                text="",
+                anchor="w",
+                justify="left",
+                font=self.fonts["body"],
+                wraplength=420,
+            )
+            lbl.grid(row=1 + i, column=0, sticky="ew", padx=14, pady=3)
+            lbl.grid_remove()
+            self._alerts_tooltip_rows.append(lbl)
+        self._alerts_tooltip_nominal_label = ctk.CTkLabel(
+            tooltip_frame,
+            text="●  nominal — no active warnings",
+            anchor="w",
+            justify="left",
+            font=self.fonts["body"],
+            text_color=STATUS_LEVEL_COLORS["nominal"],
+        )
+        self._alerts_tooltip_nominal_label.grid(
+            row=1, column=0, sticky="ew", padx=14, pady=(3, 10)
+        )
+        # Bound on the trigger area AND on the popup itself: without the
+        # latter, moving the mouse off alerts_col and down into the popup
+        # to actually read a wrapped line would itself count as a Leave and
+        # start the hide timer before the pointer ever lands inside it.
+        for w in (
+            alerts_col,
+            self.alerts_header_label,
+            self.alerts_message_label,
+            tooltip_frame,
+        ):
+            w.bind("<Enter>", self._on_alerts_hover_enter)
+            w.bind("<Leave>", self._on_alerts_hover_leave)
 
         # ---------------- camera hero (REACH P7: point-and-select) ------- #
         # Fills all left-column space; the frame is letterboxed into it on
@@ -1152,9 +1224,14 @@ class NavGuiApp:
         # still 1x1 at construction time (nothing has been realized on
         # screen yet), so the static uniform="topbar" weights set above are
         # what's visible until the first real <Configure> event corrects
-        # them.
-        self.cam_frame.bind("<Configure>", self._sync_top_bar_ratio)
-        self.sidebar.bind("<Configure>", self._sync_top_bar_ratio)
+        # them. add=True is required on the sidebar: CTkScrollableFrame's
+        # own __init__ already does `self.bind("<Configure>", ...)` to keep
+        # its scrollregion in sync with its content (that's what makes
+        # scrolling and _scroll_sidebar_to_bottom/_scroll_sidebar_to_top
+        # work at all) -- binding without add=True replaces that handler
+        # instead of adding to it and silently breaks scrolling entirely.
+        self.cam_frame.bind("<Configure>", self._sync_top_bar_ratio, add=True)
+        self.sidebar.bind("<Configure>", self._sync_top_bar_ratio, add=True)
 
         self.root.after(REFRESH_MS, self.refresh)
 
@@ -1813,6 +1890,9 @@ class NavGuiApp:
 
     def _sync_alerts_panel(self, d, alive: bool) -> None:
         alerts = self._derive_alerts(d, alive)
+        self._last_alerts = alerts
+        if self._alerts_tooltip_visible:
+            self._populate_alerts_tooltip(alerts)
         if alerts:
             level, text = alerts[0]
             color = STATUS_LEVEL_COLORS[level]
@@ -1837,6 +1917,59 @@ class NavGuiApp:
         self.alerts_message_label.configure(
             text=f"{bullet}{message}{suffix}", text_color=color
         )
+
+    _ALERTS_HOVER_HIDE_DELAY_MS = 150
+
+    def _on_alerts_hover_enter(self, _event=None) -> None:
+        # Cancels a pending hide from a moment ago -- without this, moving
+        # the mouse from alerts_col onto one of its own child labels (or
+        # from the trigger area down into the popup itself) registers as a
+        # Leave immediately followed by an Enter, and an un-cancelled hide
+        # timer would close the popup out from under the pointer mid-hover.
+        if self._alerts_hide_job is not None:
+            self.root.after_cancel(self._alerts_hide_job)
+            self._alerts_hide_job = None
+        self._show_alerts_tooltip()
+
+    def _on_alerts_hover_leave(self, _event=None) -> None:
+        if self._alerts_hide_job is not None:
+            self.root.after_cancel(self._alerts_hide_job)
+        self._alerts_hide_job = self.root.after(
+            self._ALERTS_HOVER_HIDE_DELAY_MS, self._hide_alerts_tooltip
+        )
+
+    def _show_alerts_tooltip(self) -> None:
+        x = self.alerts_col.winfo_rootx()
+        y = self.alerts_col.winfo_rooty() + self.alerts_col.winfo_height()
+        self._alerts_tooltip.geometry(f"+{x}+{y}")
+        self._alerts_tooltip.deiconify()
+        self._alerts_tooltip.lift()
+        self._alerts_tooltip_visible = True
+        # Paint immediately from the last tick's alerts instead of waiting
+        # up to REFRESH_MS for the next refresh() -- no blank-then-populate
+        # flash on hover.
+        self._populate_alerts_tooltip(self._last_alerts)
+
+    def _hide_alerts_tooltip(self) -> None:
+        self._alerts_hide_job = None
+        self._alerts_tooltip.withdraw()
+        self._alerts_tooltip_visible = False
+
+    def _populate_alerts_tooltip(self, alerts: list[tuple[str, str]]) -> None:
+        # Unlike the compact bar (worst alert + a count), the hover popup
+        # is the "full detail" view -- every active alert gets its own row,
+        # full text, no truncation (wraplength wraps instead of cutting).
+        if alerts:
+            self._alerts_tooltip_nominal_label.grid_remove()
+        else:
+            self._alerts_tooltip_nominal_label.grid()
+        for i, lbl in enumerate(self._alerts_tooltip_rows):
+            if i < len(alerts):
+                level, text = alerts[i]
+                lbl.configure(text=f"●  {text}", text_color=STATUS_LEVEL_COLORS[level])
+                lbl.grid()
+            else:
+                lbl.grid_remove()
 
     def refresh(self) -> None:
         if self.closed:
