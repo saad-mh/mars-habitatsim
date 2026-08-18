@@ -415,28 +415,55 @@ class NavGuiApp:
         # mission, or telemetry panels (REACH P9/P10: continuous, unmissable
         # feedback on what the rover is doing right now and why).
         top_status_bar = ctk.CTkFrame(root, border_width=2, border_color="#3f3f46")
+        self.top_status_bar = top_status_bar
         top_status_bar.grid(
             row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 4)
         )
         # REACH P6/P9/P10: "Status & alerts" shares this row with the
         # primary status readout instead of living buried at the bottom of
         # the sidebar -- an active alert is often *why* the state above it
-        # just changed, so both need to land in the same glance. 3:2 gives
-        # the primary state word/subtext (the long sentence, the big type)
-        # most of the row while still leaving the alerts column enough
-        # width for a full short phrase before truncation kicks in. Row 0
-        # has weight=0 (see root.grid_rowconfigure below) so this bar's
-        # height is fixed by its own content -- both columns are built to
-        # stay at a constant 2-line height (see _sync_alerts_panel's
-        # single-line, ellipsis-truncated message) so neither column's
-        # content can grow the bar and steal height from the camera/sidebar
-        # row underneath it.
-        top_status_bar.grid_columnconfigure(0, weight=3)
+        # just changed, so both need to land in the same glance. Mirrors the
+        # camera:sidebar split directly below it so the two horizontal
+        # divisions read as the same visual system instead of two different
+        # ratios stacked on top of each other. That split is nominally 3:1
+        # (root.grid_columnconfigure weight=3/weight=1) but ISN'T always
+        # exactly that in practice -- SIDEBAR_MIN_W can win over the
+        # weight=1 share on a narrow enough window -- so the ratio set here
+        # is only the construction-time fallback; _sync_top_bar_ratio()
+        # (bound to cam_frame/sidebar's own <Configure>, called once real
+        # widths exist) overwrites it with the two rows' actual live pixel
+        # ratio, every time the window resizes. The alerts column is
+        # consequently narrow -- see _sync_alerts_panel, which always shows
+        # the single most useful (most severe) alert and bolds it so it
+        # still reads clearly even when truncated. Row 0 has weight=0 (see
+        # root.grid_rowconfigure below) so this bar's height is fixed by
+        # its own content -- both
+        # columns are built to stay at a constant 2-line height (see
+        # _sync_alerts_panel's single-line, ellipsis-truncated message) so
+        # neither column's content can grow the bar and steal height from
+        # the camera/sidebar row underneath it.
+        # uniform="topbar": plain weight=N/weight=M only splits the space
+        # left over *after* each column's own content minimum, and the
+        # alerts column's minimum (driven by its "Status & alerts" header
+        # text) is proportionally much bigger than the status column's
+        # (empty labels until refresh() fills them) -- that skewed a plain
+        # weight=3/weight=1 split to ~2:1 in practice. A shared uniform
+        # group forces widths strictly proportional to weight regardless of
+        # each column's own minimum; _sync_top_bar_ratio() below keeps the
+        # weight values themselves equal to cam_frame/sidebar's live pixel
+        # widths, so "proportional to weight" means "proportional to the
+        # row underneath it" rather than a fixed guess.
+        top_status_bar.grid_columnconfigure(0, weight=3, uniform="topbar")
         top_status_bar.grid_columnconfigure(1, weight=0)
-        top_status_bar.grid_columnconfigure(2, weight=2)
+        top_status_bar.grid_columnconfigure(2, weight=1, uniform="topbar")
         top_status_bar.grid_rowconfigure(0, weight=1)
 
-        status_col = ctk.CTkFrame(top_status_bar, fg_color="transparent")
+        # width=1/height=1: without an explicit override each defaults to
+        # CTkFrame's own 200x200, which (like the divider above) can act as
+        # a floor that fights the 3:1 weight split -- pinning both down to
+        # their content's actual size is what makes the ratio deterministic
+        # instead of only approximately 3:1 depending on current text.
+        status_col = ctk.CTkFrame(top_status_bar, fg_color="transparent", width=1, height=1)
         status_col.grid(row=0, column=0, sticky="nsew")
         status_col.grid_columnconfigure(0, weight=1)
         self.top_status_label = ctk.CTkLabel(
@@ -492,7 +519,7 @@ class NavGuiApp:
         # measured pixel width (see _fit_single_line / _on_alerts_col_
         # configure), truncating with an ellipsis rather than wrapping, so
         # a long CBF/error message can never grow this row's fixed height.
-        alerts_col = ctk.CTkFrame(top_status_bar, fg_color="transparent")
+        alerts_col = ctk.CTkFrame(top_status_bar, fg_color="transparent", width=1, height=1)
         alerts_col.grid(row=0, column=2, sticky="nsew")
         alerts_col.grid_columnconfigure(0, weight=1)
         self.alerts_header_label = ctk.CTkLabel(
@@ -504,12 +531,15 @@ class NavGuiApp:
             text_color="#9ca3af",
         )
         self.alerts_header_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 0))
+        # Bold: the 3:1 ratio leaves little room, so whatever survives
+        # truncation (see _sync_alerts_panel) still has to read as the
+        # single most-important thing on the row, not just fit in it.
         self.alerts_message_label = ctk.CTkLabel(
             alerts_col,
             text="",
             anchor="w",
             justify="left",
-            font=self.fonts["body"],
+            font=self.fonts["body_bold"],
         )
         self.alerts_message_label.grid(
             row=1, column=0, sticky="ew", padx=14, pady=(0, 8)
@@ -527,6 +557,7 @@ class NavGuiApp:
         # the primary, most intuitive way to designate a goal -- the direct
         # analog of REACH "point and select an object in the environment".
         cam_frame = ctk.CTkFrame(root)
+        self.cam_frame = cam_frame
         cam_frame.grid(row=1, column=0, sticky="nsew", padx=(10, 5), pady=(4, 4))
         cam_frame.grid_rowconfigure(0, weight=1)
         cam_frame.grid_columnconfigure(0, weight=1)
@@ -1113,6 +1144,18 @@ class NavGuiApp:
         ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
         self._update_estop_button()
 
+        # Keep the top bar's status:alerts split live-matched to
+        # cam_frame/sidebar's actual widths (see _sync_top_bar_ratio) --
+        # bound to both rather than just cam_frame since either one can be
+        # the one that changes width first (e.g. SIDEBAR_MIN_W clamping the
+        # sidebar on a resize toward a narrower window). winfo_width() is
+        # still 1x1 at construction time (nothing has been realized on
+        # screen yet), so the static uniform="topbar" weights set above are
+        # what's visible until the first real <Configure> event corrects
+        # them.
+        self.cam_frame.bind("<Configure>", self._sync_top_bar_ratio)
+        self.sidebar.bind("<Configure>", self._sync_top_bar_ratio)
+
         self.root.after(REFRESH_MS, self.refresh)
 
     # ---------------- dynamic sizing ---------------- #
@@ -1130,6 +1173,26 @@ class NavGuiApp:
         # Mirror of _scroll_sidebar_to_bottom for when a contextual panel
         # closes -- return to the always-on status/map sections above.
         self.root.after_idle(lambda: self.sidebar._parent_canvas.yview_moveto(0.0))
+
+    def _sync_top_bar_ratio(self, _event=None) -> None:
+        # Keeps the top bar's status:alerts split matched to cam_frame's and
+        # sidebar's own live pixel widths -- NOT a hardcoded 3:1, because
+        # that's only the nominal ratio; SIDEBAR_MIN_W can win over the
+        # weight=1 share and widen the sidebar's real fraction on a narrow
+        # enough window (see root.grid_columnconfigure in __init__), and a
+        # hardcoded ratio would silently drift out of sync with the actual
+        # camera/sidebar boundary when that happens. Grid `weight` is just a
+        # relative ratio, so handing it these two frames' current
+        # winfo_width() directly (combined with the uniform="topbar" group
+        # set at construction, which is what makes weight ratio -> visual
+        # ratio exact regardless of each column's own content minimum)
+        # reproduces whatever that real ratio currently is.
+        cam_w = self.cam_frame.winfo_width()
+        side_w = self.sidebar.winfo_width()
+        if cam_w <= 1 or side_w <= 1:
+            return  # not realized on screen yet -- keep the built-in 3:1 fallback
+        self.top_status_bar.grid_columnconfigure(0, weight=cam_w, uniform="topbar")
+        self.top_status_bar.grid_columnconfigure(2, weight=side_w, uniform="topbar")
 
     # ---------------- commands ---------------- #
     def _guarded(self, fn, *fn_args) -> None:
@@ -1762,8 +1825,11 @@ class NavGuiApp:
         # Reserve the bullet + "(+N more)" suffix's actual measured width
         # first -- those never truncate -- then fit only the message text
         # into whatever's left, so the count is never the part that gets
-        # cut off.
-        font = self.fonts["body"]
+        # cut off. Measured against body_bold (matching the label's actual
+        # font, see its construction) -- bold glyphs measure wider than
+        # regular, so measuring against the wrong weight would under-fit
+        # and clip a character or two early.
+        font = self.fonts["body_bold"]
         bullet = "●  "
         avail = max(0, self._alerts_col_width - 28)  # padx=14 each side
         reserve = font.measure(bullet) + font.measure(suffix)
