@@ -418,9 +418,29 @@ class NavGuiApp:
         top_status_bar.grid(
             row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 4)
         )
-        top_status_bar.grid_columnconfigure(0, weight=1)
+        # REACH P6/P9/P10: "Status & alerts" shares this row with the
+        # primary status readout instead of living buried at the bottom of
+        # the sidebar -- an active alert is often *why* the state above it
+        # just changed, so both need to land in the same glance. 3:2 gives
+        # the primary state word/subtext (the long sentence, the big type)
+        # most of the row while still leaving the alerts column enough
+        # width for a full short phrase before truncation kicks in. Row 0
+        # has weight=0 (see root.grid_rowconfigure below) so this bar's
+        # height is fixed by its own content -- both columns are built to
+        # stay at a constant 2-line height (see _sync_alerts_panel's
+        # single-line, ellipsis-truncated message) so neither column's
+        # content can grow the bar and steal height from the camera/sidebar
+        # row underneath it.
+        top_status_bar.grid_columnconfigure(0, weight=3)
+        top_status_bar.grid_columnconfigure(1, weight=0)
+        top_status_bar.grid_columnconfigure(2, weight=2)
+        top_status_bar.grid_rowconfigure(0, weight=1)
+
+        status_col = ctk.CTkFrame(top_status_bar, fg_color="transparent")
+        status_col.grid(row=0, column=0, sticky="nsew")
+        status_col.grid_columnconfigure(0, weight=1)
         self.top_status_label = ctk.CTkLabel(
-            top_status_bar,
+            status_col,
             text="",
             anchor="w",
             justify="left",
@@ -428,7 +448,7 @@ class NavGuiApp:
         )
         self.top_status_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 0))
         self.top_status_detail_label = ctk.CTkLabel(
-            top_status_bar,
+            status_col,
             text="",
             anchor="w",
             justify="left",
@@ -438,14 +458,14 @@ class NavGuiApp:
         self.top_status_detail_label.grid(
             row=1, column=0, sticky="ew", padx=14, pady=(0, 8)
         )
-        top_status_bar.bind(
+        status_col.bind(
             "<Configure>",
             lambda e: self.top_status_detail_label.configure(
                 wraplength=max(200, e.width - 28)
             ),
         )
         self.alive_label = ctk.CTkLabel(
-            top_status_bar,
+            status_col,
             text="controller thread died -- see console",
             anchor="w",
             justify="left",
@@ -453,6 +473,53 @@ class NavGuiApp:
             text_color="#f87171",
         )
         self._alive_label_visible = False
+
+        # height=1: CTkFrame defaults to height=200 and this divider has no
+        # children of its own to shrink-wrap around, so without an explicit
+        # override it silently forced the whole bar to ~220px tall (the
+        # actual bug behind the too-thick top bar) -- sticky="ns" still
+        # stretches it to match status_col/alerts_col's real content height.
+        divider = ctk.CTkFrame(top_status_bar, fg_color="#3f3f46", width=2, height=1)
+        divider.grid(row=0, column=1, sticky="ns", pady=10)
+
+        # ===== STATUS & ALERTS (shares the top bar -- REACH P6+P9+P10) === #
+        # Compact by design, not a truncated version of a bigger list: only
+        # the single most severe active condition is shown (STATUS_LEVEL_
+        # ORDER), with a "(+N more)" suffix for anything else active --
+        # matches REACH P6 (only essential information) now that this lives
+        # in permanently-visible real estate instead of a scrollable
+        # sidebar. Overflow is handled by fitting to the column's actual
+        # measured pixel width (see _fit_single_line / _on_alerts_col_
+        # configure), truncating with an ellipsis rather than wrapping, so
+        # a long CBF/error message can never grow this row's fixed height.
+        alerts_col = ctk.CTkFrame(top_status_bar, fg_color="transparent")
+        alerts_col.grid(row=0, column=2, sticky="nsew")
+        alerts_col.grid_columnconfigure(0, weight=1)
+        self.alerts_header_label = ctk.CTkLabel(
+            alerts_col,
+            text="Status & alerts",
+            anchor="w",
+            justify="left",
+            font=self.fonts["caption_bold"],
+            text_color="#9ca3af",
+        )
+        self.alerts_header_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 0))
+        self.alerts_message_label = ctk.CTkLabel(
+            alerts_col,
+            text="",
+            anchor="w",
+            justify="left",
+            font=self.fonts["body"],
+        )
+        self.alerts_message_label.grid(
+            row=1, column=0, sticky="ew", padx=14, pady=(0, 8)
+        )
+        self._alerts_col_width = 0
+
+        def _on_alerts_col_configure(e) -> None:
+            self._alerts_col_width = e.width
+
+        alerts_col.bind("<Configure>", _on_alerts_col_configure)
 
         # ---------------- camera hero (REACH P7: point-and-select) ------- #
         # Fills all left-column space; the frame is letterboxed into it on
@@ -978,68 +1045,6 @@ class NavGuiApp:
         )
         self.uncertainty_retry_button.pack(pady=(0, 12))
         self._uncertainty_panel_visible = False
-
-        # ===== STATUS & ALERTS (REACH P6 + P9 + P10) ===================== #
-        # Dedicated warning/caution/status feed occupying the sidebar's
-        # remaining vertical space (this row absorbs leftover height, same
-        # slot the old top-anchored last-click footer left blank below it).
-        # Folds in every signal that used to be scattered one-off labels or
-        # silently invisible (CBF avoidance/hard-brake, low belief
-        # confidence, the controller thread dying, the emergency-stop
-        # latch) plus the former footer's last-click outcome, all under one
-        # severity-ordered vocabulary (see STATUS_LEVEL_COLORS) instead of
-        # requiring the operator to notice each one separately.
-        self._MAX_ALERT_ROWS = 5
-        alerts_row = row
-        row += 1
-        sidebar.grid_rowconfigure(alerts_row, weight=1)
-        self.alerts_panel = ctk.CTkFrame(
-            sidebar, border_width=2, border_color="#3f3f46"
-        )
-        self.alerts_panel.grid(
-            row=alerts_row, column=0, sticky="nsew", pady=(SECTION_GAP, 0)
-        )
-        self.alerts_panel.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            self.alerts_panel,
-            text="Alerts",
-            font=self.fonts["section"],
-            text_color="#9ca3af",
-        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
-        self.alert_rows: list[ctk.CTkLabel] = []
-        for i in range(self._MAX_ALERT_ROWS):
-            lbl = ctk.CTkLabel(
-                self.alerts_panel,
-                text="",
-                anchor="w",
-                justify="left",
-                font=self.fonts["body"],
-                wraplength=self.SIDEBAR_MIN_W - 30,
-            )
-            lbl.grid(row=1 + i, column=0, sticky="ew", padx=12, pady=2)
-            lbl.grid_remove()
-            self.alert_rows.append(lbl)
-        # Shown in place of row 0 of alert_rows whenever nothing is active --
-        # an explicit "checked and fine" reading beats an empty panel, which
-        # would read as broken rather than nominal.
-        self.alerts_nominal_label = ctk.CTkLabel(
-            self.alerts_panel,
-            text="no active warnings",
-            anchor="w",
-            justify="left",
-            font=self.fonts["body"],
-            text_color=STATUS_LEVEL_COLORS["nominal"],
-        )
-        self.alerts_nominal_label.grid(
-            row=1, column=0, sticky="ew", padx=12, pady=(2, 10)
-        )
-        self.alerts_panel.bind(
-            "<Configure>",
-            lambda e: [
-                lbl.configure(wraplength=max(160, e.width - 30))
-                for lbl in self.alert_rows
-            ],
-        )
 
         # ===== TRAJECTORY / BELIEF (exp.md Sec. 5) ======================= #
         # "Where has the rover been, and where does it currently believe
@@ -1679,13 +1684,17 @@ class NavGuiApp:
         self.top_status_detail_label.configure(text=ack_live or subtext)
 
     def _derive_alerts(self, d, alive: bool) -> list[tuple[str, str]]:
-        # Sidebar "Status & alerts" feed -- every signal folded in here
-        # already exists on the controller snapshot or in this GUI's own
-        # state, it just had no single place to surface consistently before
-        # (CBF avoidance/hard-brake only ever showed up as a jitter in the
-        # trajectory plot; low belief confidence only as a color on a small
-        # stat cell; the emergency latch only on the button itself). Most
-        # severe first (STATUS_LEVEL_ORDER); callers cap to _MAX_ALERT_ROWS.
+        # "Status & alerts" feed (top bar, next to the primary status
+        # readout) -- every signal folded in here already exists on the
+        # controller snapshot or in this GUI's own state, it just had no
+        # single place to surface consistently before (CBF avoidance/
+        # hard-brake only ever showed up as a jitter in the trajectory
+        # plot; low belief confidence only as a color on a small stat cell;
+        # the emergency latch only on the button itself). Most severe first
+        # (STATUS_LEVEL_ORDER); the handful of conditions checked below
+        # bound the list's length naturally, no cap needed. _sync_alerts_
+        # panel only ever displays alerts[0] plus a count of the rest --
+        # the fixed-height top bar has no room for a full list.
         alerts: list[tuple[str, str]] = []
         if self._estop_active:
             alerts.append(("critical", "emergency stop active — driving locked"))
@@ -1713,27 +1722,54 @@ class NavGuiApp:
         if d.click_status:
             alerts.append(("info", d.click_status))
         alerts.sort(key=lambda a: STATUS_LEVEL_ORDER[a[0]])
-        return alerts[: self._MAX_ALERT_ROWS]
+        return alerts
+
+    @staticmethod
+    def _fit_single_line(font: tkfont.Font, text: str, max_width: int) -> str:
+        # Binary-search the longest prefix (+ ellipsis) that still measures
+        # within max_width in actual rendered pixels -- auto-fits to
+        # whatever width the column currently has (window resizes, ratio
+        # changes) rather than a fixed character-count guess, which would
+        # either clip a fixed-width font's text early or overflow a
+        # proportional one.
+        if max_width <= 0:
+            return ""
+        if font.measure(text) <= max_width:
+            return text
+        ellipsis = "…"
+        if font.measure(ellipsis) > max_width:
+            return ""
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid] + ellipsis) <= max_width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return (text[:lo] + ellipsis) if lo > 0 else ellipsis
 
     def _sync_alerts_panel(self, d, alive: bool) -> None:
         alerts = self._derive_alerts(d, alive)
         if alerts:
-            self.alerts_nominal_label.grid_remove()
+            level, text = alerts[0]
+            color = STATUS_LEVEL_COLORS[level]
+            extra = len(alerts) - 1
+            suffix = f"  (+{extra} more)" if extra > 0 else ""
         else:
-            self.alerts_nominal_label.grid()
-        for i, lbl in enumerate(self.alert_rows):
-            if i < len(alerts):
-                level, text = alerts[i]
-                lbl.configure(text=f"●  {text}", text_color=STATUS_LEVEL_COLORS[level])
-                lbl.grid()
-            else:
-                lbl.grid_remove()
-        # REACH P10: the panel's own border echoes the worst active level so
-        # the sidebar reads as "something needs attention" even collapsed
-        # off-screen by scroll, not only from the text inside it.
-        worst = alerts[0][0] if alerts else "nominal"
-        self.alerts_panel.configure(
-            border_color=STATUS_LEVEL_COLORS[worst] if worst != "nominal" else "#3f3f46"
+            color = STATUS_LEVEL_COLORS["nominal"]
+            text, suffix = "nominal — no active warnings", ""
+
+        # Reserve the bullet + "(+N more)" suffix's actual measured width
+        # first -- those never truncate -- then fit only the message text
+        # into whatever's left, so the count is never the part that gets
+        # cut off.
+        font = self.fonts["body"]
+        bullet = "●  "
+        avail = max(0, self._alerts_col_width - 28)  # padx=14 each side
+        reserve = font.measure(bullet) + font.measure(suffix)
+        message = self._fit_single_line(font, text, max(0, avail - reserve))
+        self.alerts_message_label.configure(
+            text=f"{bullet}{message}{suffix}", text_color=color
         )
 
     def refresh(self) -> None:
