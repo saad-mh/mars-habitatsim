@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -235,9 +236,11 @@ def _default_navdp_upstream_ckpt() -> Optional[str]:
 
 class NavGuiApp:
     SIDEBAR_MIN_W = 360
-    # exp.md Sec 5: TRAJECTORY / BELIEF is a full-width bar below the
-    # camera+sidebar body, not a square panel sized off the sidebar's own
-    # width -- a fixed height, full window width.
+    # exp.md Sec 5: TRAJECTORY / BELIEF is a fixed-height bar below the
+    # camera, not a square panel sized off the sidebar's own width. Its
+    # column width now matches the camera's own (see plot_frame.grid in
+    # __init__) rather than spanning the full window, so the sidebar can
+    # rowspan into the freed column-1 space at that row.
     PLOT_BOTTOM_H = 200
     PLOT_RANGE = 6.0  # meters shown top-to-bottom of the body-frame plot
 
@@ -263,7 +266,11 @@ class NavGuiApp:
         # REACH P9: last action acknowledged, echoed in the status header
         # the instant a button is pressed (before the controller's own
         # state catches up on the next tick) so no press ever feels lost.
+        # Expires after _ACK_HOLD_S so it can't permanently mask a later
+        # derived subtext (e.g. a stale "taskwork queued: ..." sitting under
+        # a since-reached "GOAL REACHED" label with nothing else queued).
         self._ack_text = ""
+        self._ack_until = 0.0
 
         # Purely additive, human-viz-only window (see RoverController.
         # enable_topdown_viz) -- never touches the main console's layout
@@ -442,7 +449,14 @@ class NavGuiApp:
         # Scrollable so no control is ever clipped off a short monitor
         # (contextual review panels can push the stack past screen height).
         sidebar = ctk.CTkScrollableFrame(root, fg_color="transparent")
-        sidebar.grid(row=1, column=1, sticky="nsew", padx=(5, 10), pady=(4, 4))
+        # Rowspan down into row 2 (the trajectory bar's row): the trajectory
+        # bar is now narrowed to the camera's own 3-of-4 column width (see
+        # plot_frame.grid below), which frees column 1 at row 2 for the
+        # sidebar to occupy instead of leaving it empty -- taller sidebar,
+        # fewer controls pushed below the fold / behind a scroll.
+        sidebar.grid(
+            row=1, column=1, rowspan=2, sticky="nsew", padx=(5, 10), pady=(4, 4)
+        )
         sidebar.grid_columnconfigure(0, weight=1)
         self.sidebar = sidebar
 
@@ -858,14 +872,16 @@ class NavGuiApp:
 
         # ===== TRAJECTORY / BELIEF (exp.md Sec. 5) ======================= #
         # "Where has the rover been, and where does it currently believe
-        # the goal is?" -- full-width, persistent, below the camera+sidebar
-        # body (REACH P4 map/situational-awareness), pulled out of the
-        # scrollable sidebar so it's never affected by sidebar scroll
-        # position, matching exp.md's dedicated bottom region.
+        # the goal is?" -- persistent, below the camera (REACH P4 map/
+        # situational-awareness), pulled out of the scrollable sidebar so
+        # it's never affected by sidebar scroll position. Width matches the
+        # camera's own column (the same 3-of-4-parts split as row 1's
+        # camera:sidebar division) rather than spanning the full window --
+        # narrowing it this way frees column 1 at this row for the sidebar
+        # to occupy instead (see sidebar's rowspan=2 above), so the sidebar
+        # gets more height and needs less scrolling to show its controls.
         plot_frame = ctk.CTkFrame(root)
-        plot_frame.grid(
-            row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4)
-        )
+        plot_frame.grid(row=2, column=0, sticky="ew", padx=(10, 5), pady=(0, 4))
         plot_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             plot_frame,
@@ -935,11 +951,16 @@ class NavGuiApp:
             return
         fn(*fn_args)
 
+    _ACK_HOLD_S = 3.0
+
     def _ack(self, text: str) -> None:
         # REACH P9: record an immediate human-readable acknowledgment of
         # the just-pressed control; refresh() echoes it in the status
-        # header so no press ever feels unregistered.
+        # header so no press ever feels unregistered. Held for
+        # _ACK_HOLD_S then falls back to the derived subtext (see
+        # _sync_top_status) rather than sticking around forever.
         self._ack_text = text
+        self._ack_until = time.time() + self._ACK_HOLD_S
 
     def submit_command(self) -> None:
         # Handed to RoverController.submit_nav_command, which splits it via
@@ -1242,7 +1263,20 @@ class NavGuiApp:
             )
         if d.goal_reached:
             target = self._current_goal_text(d)
-            subtext = f"Reached {target}" if target else d.status_text
+            # d.mission_goals/mission_goal_idx are only populated while
+            # RoverController has an active multi-goal mission stepping
+            # itself (rover_controller.py's _env_loop) -- empty/-1 here
+            # means there is no queued next sub-goal to auto-advance to,
+            # so reaching this one just leaves the rover sitting idle
+            # unless the operator picks a new mission.
+            if not d.mission_goals or d.mission_goal_idx < 0:
+                subtext = (
+                    f"Reached {target} -- no further goals queued. Pick the next mission."
+                    if target
+                    else "No further goals queued -- pick the next mission."
+                )
+            else:
+                subtext = f"Reached {target}" if target else d.status_text
             return "GOAL REACHED", subtext, TOP_STATUS_COLORS["GOAL REACHED"]
         if d.mode == MODE_REVIEW_SEGMENTATION:
             return (
@@ -1258,7 +1292,14 @@ class NavGuiApp:
             target = self._current_goal_text(d)
             subtext = f"Navigating to {target}" if target else d.status_text
             return "NAVIGATING", subtext, TOP_STATUS_COLORS["NAVIGATING"]
-        return "IDLE", d.status_text, TOP_STATUS_COLORS["IDLE"]
+        # d.status_text defaults to "idle -- pick a driving mode" here,
+        # which would just repeat "idle" back under a header that already
+        # says it -- show one unambiguous operating-mode indicator instead.
+        return (
+            "IDLE",
+            "Ready for mission -- pick a driving mode to begin",
+            TOP_STATUS_COLORS["IDLE"],
+        )
 
     def _sync_mission_panel(self, d, goal_status: Optional[str]) -> None:
         self.goal_list_label.configure(text=self._goal_list_text(d))
@@ -1333,7 +1374,8 @@ class NavGuiApp:
         # REACH P9: prefer the freshest human ack over the derived subtext
         # so a just-pressed control's acknowledgment always wins on the
         # same frame it fires, before the controller's own state catches up.
-        self.top_status_detail_label.configure(text=self._ack_text or subtext)
+        ack_live = self._ack_text if time.time() < self._ack_until else ""
+        self.top_status_detail_label.configure(text=ack_live or subtext)
 
     def refresh(self) -> None:
         if self.closed:
@@ -1473,7 +1515,7 @@ class NavGuiApp:
         return img
 
     def _draw_plot(self, d) -> None:
-        # exp.md Sec 5: a full-width, fixed-height bottom bar now (not a
+        # exp.md Sec 5: a camera-width, fixed-height bottom bar now (not a
         # square panel sized off the sidebar) -- scale is derived from the
         # canvas's actual current size every frame instead of a cached
         # square _plot_size, and the drawing is centered horizontally so

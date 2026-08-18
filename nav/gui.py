@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Interactive control panel for nav.rover_controller.RoverController --
+"""
+LEGACY BACKUP
+Interactive control panel for nav.rover_controller.RoverController --
 the in-house, single-process equivalent of Nav_new/MARS/launch_mars.sh's
 DINO+NavDP GUI, driving the actual published NavDP model instead of this
 repo's own custom S2DiT+NavDP model (see rover_controller.py's docstring).
