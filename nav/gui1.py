@@ -173,7 +173,27 @@ TOP_STATUS_COLORS = {
     "GOAL REACHED": "#22d3ee",
     "MISSION COMPLETE": "#4ade80",
     "MANUAL CONTROL": "#60a5fa",
+    # REACH P8: the emergency-stop latch outranks every other state --
+    # _derive_top_status checks it first, so this color always wins the
+    # header the instant STOP is engaged.
+    "EMERGENCY STOP": "#dc2626",
 }
+
+# Sidebar "Status & alerts" panel (free space below the contextual-panel
+# stack, see the panel built in __init__) -- one shared severity vocabulary
+# for every folded-in signal (CBF avoidance, low belief confidence, the
+# controller thread dying, the emergency-stop latch, the last click
+# outcome), most severe first. REACH P9/P10: a single place that always
+# tells the operator what's currently wrong, instead of scattered one-off
+# labels.
+STATUS_LEVEL_COLORS = {
+    "critical": "#f87171",
+    "warning": "#fb923c",
+    "caution": "#fbbf24",
+    "info": "#9ca3af",
+    "nominal": "#4ade80",
+}
+STATUS_LEVEL_ORDER = {"critical": 0, "warning": 1, "caution": 2, "info": 3}
 
 # exp.md Sec 3 (Mission panel) "Goal Status" -- current sub-goal's
 # execution state -> accent color, shown as one of the Mission panel's
@@ -198,21 +218,26 @@ ROVER_MODE_COLORS = {
 }
 
 # Uncertainty-halt numpad panel: rover-front-relative headings (degrees,
-# same convention as nav/goal_math.heading_ahead_point -- 0=front,
-# positive=clockwise) bound to the same physical key layout
-# scripts/habitat_tests/kb_teleop_vl.py's uncertainty panel uses, redrawn
+# same convention as nav/goal_math.heading_ahead_point/body_frame_goal --
+# 0=front, positive=left/counterclockwise, matching the belief tracker's
+# (forward, left) body frame (see _draw_plot's to_px and the sigma ellipse
+# it draws) -- NOT scripts/habitat_tests/kb_teleop_vl.py's numpad, which
+# feeds a different consumer (uncertainty_motion.resolve_absolute_heading_deg)
+# with the opposite sign (positive=right) and is intentionally left alone.
+# Bound to the same physical key layout as that script's panel (same keys,
+# same grid positions) purely so the on-screen layout looks familiar, redrawn
 # independently here rather than imported (nav/ stays decoupled from that
 # script). Grid position drives the heads-up panel's clickable button
 # layout, keys drive the numpad keyboard shortcuts.
 UNCERTAINTY_HEADING_KEYS = {
     "8": 0.0,
-    "9": 45.0,
-    "6": 90.0,
-    "3": 135.0,
+    "9": -45.0,
+    "6": -90.0,
+    "3": -135.0,
     "2": 180.0,
-    "1": -135.0,
-    "4": -90.0,
-    "7": -45.0,
+    "1": 135.0,
+    "4": 90.0,
+    "7": 45.0,
 }
 UNCERTAINTY_HEADING_GRID_POS = {
     "7": (0, 0),
@@ -271,6 +296,15 @@ class NavGuiApp:
         # a since-reached "GOAL REACHED" label with nothing else queued).
         self._ack_text = ""
         self._ack_until = 0.0
+
+        # REACH P8: the emergency stop is a latch, not a fire-and-forget
+        # button -- once engaged it stays visibly ACTIVE (button + top
+        # status + the Status & alerts panel all reflect it) and locks out
+        # every drive-initiating control (manual_press/submit_command/
+        # confirm_segmentation/confirm_pixel_goal/submit_uncertainty_heading)
+        # until explicitly released via the same button or Reset Rover --
+        # see stop()/_release_estop()/_update_estop_button().
+        self._estop_active = False
 
         # Purely additive, human-viz-only window (see RoverController.
         # enable_topdown_viz) -- never touches the main console's layout
@@ -372,9 +406,6 @@ class NavGuiApp:
                 family=self.display_font_family,
                 size=TYPE_SIZE["emergency"],
                 weight="bold",
-            ),
-            "telemetry": ctk.CTkFont(
-                family=self.data_font_family, size=TYPE_SIZE["body"]
             ),
         }
 
@@ -571,19 +602,41 @@ class NavGuiApp:
         # Telemetry: only the operational values exp.md calls out (position,
         # heading, velocity, yaw rate, nav state) -- model-internal/CBF
         # debugging detail stays out of this panel (see the trajectory/
-        # belief bar's own HUD for that).
-        self.telemetry_label = ctk.CTkLabel(
+        # belief bar's own HUD for that). Each value gets its own labeled
+        # stat cell (same title-over-bold-value vocabulary as the
+        # uncertainty cells above) instead of one crammed wrapped text
+        # blob -- lets the eye jump straight to a single field instead of
+        # re-parsing "pos (..)  heading=..deg" strings on every glance.
+        telemetry_row1 = ctk.CTkFrame(self.status_panel, fg_color="transparent")
+        telemetry_row1.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 4))
+        telemetry_row1.grid_columnconfigure(0, weight=1)
+        telemetry_row1.grid_columnconfigure(1, weight=1)
+        self.telemetry_position_label = _stat_cell(telemetry_row1, 0, "Position (x, z)")
+        self.telemetry_heading_label = _stat_cell(telemetry_row1, 1, "Heading")
+
+        telemetry_row2 = ctk.CTkFrame(self.status_panel, fg_color="transparent")
+        telemetry_row2.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
+        telemetry_row2.grid_columnconfigure(0, weight=1)
+        telemetry_row2.grid_columnconfigure(1, weight=1)
+        self.telemetry_velocity_label = _stat_cell(telemetry_row2, 0, "Velocity")
+        self.telemetry_yaw_rate_label = _stat_cell(telemetry_row2, 1, "Yaw rate")
+
+        self.telemetry_nav_state_label = ctk.CTkLabel(
             self.status_panel,
-            text="",
+            text="--",
             anchor="w",
             justify="left",
-            font=self.fonts["telemetry"],
+            font=self.fonts["body_bold"],
             text_color="#e5e7eb",
         )
-        self.telemetry_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.telemetry_nav_state_label.grid(
+            row=5, column=0, sticky="ew", padx=10, pady=(0, 10)
+        )
         self.status_panel.bind(
             "<Configure>",
-            lambda e: self.telemetry_label.configure(wraplength=max(200, e.width - 20)),
+            lambda e: self.telemetry_nav_state_label.configure(
+                wraplength=max(200, e.width - 20)
+            ),
         )
 
         # ===== SECTION 4 — TASKWORK (REACH P3 + P10) ===================== #
@@ -629,6 +682,81 @@ class NavGuiApp:
         self.mission_status_label.grid(
             row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, BTN_GAP)
         )
+
+        # ===== CONTEXTUAL PANEL — CONFIRM MISSION (REACH P1+P2+P10) ===== #
+        # Only gridded while a Taskwork command has finished VLM-parsing and
+        # is awaiting operator sign-off (RoverController._mission_awaiting_
+        # confirmation / DisplayState.mission_review) -- shows the
+        # interpreted direction/goal split *before* any driving starts, so
+        # the operator can catch a misparse from the words alone instead of
+        # discovering it from the rover already moving (REACH P2:
+        # interpreted-command feedback shown explicitly, ahead of
+        # EXECUTING; REACH P10: communicate intent before acting on it).
+        self._mission_review_row = row
+        row += 1
+        self.mission_review_panel = ctk.CTkFrame(
+            sidebar, border_width=2, border_color="#a78bfa"
+        )
+        ctk.CTkLabel(
+            self.mission_review_panel,
+            text="Confirm mission",
+            font=self.fonts["section"],
+            text_color="#a78bfa",
+        ).pack(pady=(10, 2))
+        self.mission_review_desc_label = ctk.CTkLabel(
+            self.mission_review_panel,
+            text="",
+            wraplength=self.SIDEBAR_MIN_W - 40,
+            justify="left",
+            font=self.fonts["body_bold"],
+        )
+        self.mission_review_desc_label.pack(padx=12, pady=(0, 4), fill="x")
+        self.mission_review_steps_label = ctk.CTkLabel(
+            self.mission_review_panel,
+            text="",
+            wraplength=self.SIDEBAR_MIN_W - 40,
+            justify="left",
+            font=self.fonts["body"],
+        )
+        self.mission_review_steps_label.pack(padx=12, pady=(0, 8), fill="x")
+        self.mission_review_panel.bind(
+            "<Configure>",
+            lambda e: [
+                self.mission_review_desc_label.configure(
+                    wraplength=max(200, e.width - 24)
+                ),
+                self.mission_review_steps_label.configure(
+                    wraplength=max(200, e.width - 24)
+                ),
+            ],
+        )
+        mission_review_btn_col = ctk.CTkFrame(
+            self.mission_review_panel, fg_color="transparent"
+        )
+        mission_review_btn_col.pack(pady=(0, 12), fill="x", padx=12)
+        mission_review_btn_col.grid_columnconfigure(0, weight=1)
+        # REACH P1+P2: accept the interpreted mission -- driving starts next tick.
+        ctk.CTkButton(
+            mission_review_btn_col,
+            text="Confirm & Start",
+            height=BTN_H,
+            font=self.fonts["control"],
+            command=self.confirm_mission,
+            fg_color="#15803d",
+            hover_color="#166534",
+        ).grid(row=0, column=0, sticky="ew", pady=3)
+        # REACH P1: reject -- rover stays exactly where it is (no motion
+        # ever started), operator can edit and resubmit the Taskwork entry.
+        ctk.CTkButton(
+            mission_review_btn_col,
+            text="Cancel",
+            height=BTN_H,
+            font=self.fonts["control"],
+            command=self.cancel_mission,
+            fg_color="#4b5563",
+            hover_color="#374151",
+        ).grid(row=1, column=0, sticky="ew", pady=3)
+        self._mission_review_panel_visible = False
 
         # Manual drive: arrow keys hold-to-drive (no dpad/section rendered --
         # see class docstring notes near _manual_held); guarded so typing in
@@ -851,23 +979,66 @@ class NavGuiApp:
         self.uncertainty_retry_button.pack(pady=(0, 12))
         self._uncertainty_panel_visible = False
 
-        # ===== FOOTER — last click outcome (REACH P9) =================== #
-        # Persistent one-line acknowledgment of the last point-goal click
-        # ("point goal set at ..." / "click ignored: no valid depth").
-        # This row absorbs leftover sidebar height so the stack stays
-        # top-anchored instead of floating mid-window.
-        footer_row = row
-        sidebar.grid_rowconfigure(footer_row, weight=1)
-        self.click_status_label = ctk.CTkLabel(
-            sidebar,
-            text="",
-            anchor="n",
-            font=self.fonts["caption"],
-            text_color="#9ca3af",
-            wraplength=self.SIDEBAR_MIN_W - 20,
+        # ===== STATUS & ALERTS (REACH P6 + P9 + P10) ===================== #
+        # Dedicated warning/caution/status feed occupying the sidebar's
+        # remaining vertical space (this row absorbs leftover height, same
+        # slot the old top-anchored last-click footer left blank below it).
+        # Folds in every signal that used to be scattered one-off labels or
+        # silently invisible (CBF avoidance/hard-brake, low belief
+        # confidence, the controller thread dying, the emergency-stop
+        # latch) plus the former footer's last-click outcome, all under one
+        # severity-ordered vocabulary (see STATUS_LEVEL_COLORS) instead of
+        # requiring the operator to notice each one separately.
+        self._MAX_ALERT_ROWS = 5
+        alerts_row = row
+        row += 1
+        sidebar.grid_rowconfigure(alerts_row, weight=1)
+        self.alerts_panel = ctk.CTkFrame(
+            sidebar, border_width=2, border_color="#3f3f46"
         )
-        self.click_status_label.grid(
-            row=footer_row, column=0, sticky="new", padx=4, pady=(BTN_GAP, 0)
+        self.alerts_panel.grid(
+            row=alerts_row, column=0, sticky="nsew", pady=(SECTION_GAP, 0)
+        )
+        self.alerts_panel.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            self.alerts_panel,
+            text="Alerts",
+            font=self.fonts["section"],
+            text_color="#9ca3af",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
+        self.alert_rows: list[ctk.CTkLabel] = []
+        for i in range(self._MAX_ALERT_ROWS):
+            lbl = ctk.CTkLabel(
+                self.alerts_panel,
+                text="",
+                anchor="w",
+                justify="left",
+                font=self.fonts["body"],
+                wraplength=self.SIDEBAR_MIN_W - 30,
+            )
+            lbl.grid(row=1 + i, column=0, sticky="ew", padx=12, pady=2)
+            lbl.grid_remove()
+            self.alert_rows.append(lbl)
+        # Shown in place of row 0 of alert_rows whenever nothing is active --
+        # an explicit "checked and fine" reading beats an empty panel, which
+        # would read as broken rather than nominal.
+        self.alerts_nominal_label = ctk.CTkLabel(
+            self.alerts_panel,
+            text="no active warnings",
+            anchor="w",
+            justify="left",
+            font=self.fonts["body"],
+            text_color=STATUS_LEVEL_COLORS["nominal"],
+        )
+        self.alerts_nominal_label.grid(
+            row=1, column=0, sticky="ew", padx=12, pady=(2, 10)
+        )
+        self.alerts_panel.bind(
+            "<Configure>",
+            lambda e: [
+                lbl.configure(wraplength=max(160, e.width - 30))
+                for lbl in self.alert_rows
+            ],
         )
 
         # ===== TRAJECTORY / BELIEF (exp.md Sec. 5) ======================= #
@@ -899,21 +1070,33 @@ class NavGuiApp:
         # scrollable sidebar -- always on screen. This is the paper's
         # emergency-takeover affordance: the single most safety-critical
         # control gets the largest, reddest, most reachable real estate.
+        #
+        # The button is a LATCH, not a fire-and-forget action: engaging it
+        # visibly changes shape/color/label (outlined "ready" -> solid
+        # filled "ACTIVE", taller, brighter, high-contrast text) and stays
+        # that way -- an unmissable, continuously-true readout of whether
+        # driving is currently locked out, not just a click that happened
+        # and is over (REACH P9: continuous feedback, not one-shot).
+        # _update_estop_button() is the single place that redraws it; every
+        # entry point that changes _estop_active calls it (stop(),
+        # reset_rover()).
         stop_bar = ctk.CTkFrame(root, fg_color="transparent")
         stop_bar.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
         stop_bar.grid_columnconfigure(0, weight=3)
         stop_bar.grid_columnconfigure(1, weight=1)
-        ctk.CTkButton(
+        self.stop_button = ctk.CTkButton(
             stop_bar,
-            text="■  Emergency stop",
+            text="",
             height=56,
             font=self.fonts["emergency"],
             command=self.stop,
-            fg_color="#b91c1c",
-            hover_color="#991b1b",
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+            border_width=3,
+        )
+        self.stop_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         # REACH P8: reset/recover is destructive-adjacent, so it sits next
-        # to STOP but is visually subordinate (grey, narrower).
+        # to STOP but is visually subordinate (grey, narrower). Also the
+        # one other control that releases the estop latch (a full reset
+        # already puts the rover back in a known-safe idle state).
         ctk.CTkButton(
             stop_bar,
             text="Reset Rover",
@@ -923,6 +1106,7 @@ class NavGuiApp:
             fg_color="#4b5563",
             hover_color="#374151",
         ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self._update_estop_button()
 
         self.root.after(REFRESH_MS, self.refresh)
 
@@ -962,31 +1146,99 @@ class NavGuiApp:
         self._ack_text = text
         self._ack_until = time.time() + self._ACK_HOLD_S
 
+    def _estop_block(self, what: str) -> bool:
+        # REACH P8: the latch actually gates every drive-initiating control,
+        # not just the initial stop_driving() call -- otherwise an
+        # incidental arrow-key tap or a stale Confirm click could silently
+        # resume motion while the button still reads ACTIVE. Called from
+        # each such entry point below; a no-op (returns False) whenever the
+        # estop isn't currently engaged.
+        if not self._estop_active:
+            return False
+        self._ack(f"blocked — release emergency stop before {what}")
+        return True
+
     def submit_command(self) -> None:
         # Handed to RoverController.submit_nav_command, which splits it via
         # the Qwen VLM (qwen_client.parse_nav_command) into (directions,
-        # goals) on a background thread, turns that into an ordered Mission
-        # (nav.mission.parse_parts), and drives through its sub-goals one at
-        # a time. Progress shows in mission_status_label.
+        # goals) on a background thread and turns that into an ordered
+        # Mission (nav.mission.parse_parts) -- staged into d.mission_review
+        # for the Confirm-Mission panel below rather than driven
+        # immediately; confirm_mission()/cancel_mission() is what actually
+        # starts (or discards) it. Once driving, progress shows in
+        # mission_status_label.
         text = self.command_entry.get().strip()
         if not text:
+            return
+        if self._estop_block("dispatching taskwork"):
             return
         print(f"[nav command] submitted: {text}")
         self._ack(f"taskwork queued: {text}")
         self.controller.submit_nav_command(text)
         self.command_entry.delete(0, "end")
 
+    def confirm_mission(self) -> None:
+        # REACH P2: the operator has reviewed the Confirm-Mission panel's
+        # interpreted step list -- this is the one action that actually
+        # starts driving for a Taskwork command (see submit_command above,
+        # which only queues parsing).
+        if self._estop_block("starting a mission"):
+            return
+        self._ack("mission confirmed — starting")
+        self.controller.request_confirm_mission()
+
+    def cancel_mission(self) -> None:
+        self._ack("mission cancelled")
+        self.controller.request_cancel_mission()
+
     def reset_rover(self) -> None:
         self._manual_held.clear()
         self.cancel_pixel_click()
+        # A full reset already puts the rover back in a known-safe idle
+        # state at spawn, so it's the other control (besides the stop
+        # button itself) that releases the latch.
+        self._estop_active = False
+        self._update_estop_button()
         self._ack("rover reset")
         self.controller.request_reset()
 
     def stop(self) -> None:
+        # REACH P8: a latch, not a one-shot action -- first press engages
+        # (halts driving, locks out every drive-initiating control, button
+        # goes solid/ACTIVE); the SAME button's second press releases the
+        # lock (does not itself resume driving -- a new command still has
+        # to be issued deliberately). _update_estop_button keeps the
+        # button's shape/color/label in sync as the one always-visible
+        # readout of this state.
         self._manual_held.clear()
         self.cancel_pixel_click()
-        self._ack("STOP — driving halted")
+        if self._estop_active:
+            self._estop_active = False
+            self._update_estop_button()
+            self._ack("emergency stop released — driving unlocked")
+            return
+        self._estop_active = True
+        self._update_estop_button()
+        self._ack("EMERGENCY STOP ENGAGED — driving locked")
         self.controller.stop_driving()
+
+    def _update_estop_button(self) -> None:
+        if self._estop_active:
+            self.stop_button.configure(
+                text="■  STOPPED — driving locked (click to release)",
+                fg_color="#dc2626",
+                hover_color="#b91c1c",
+                border_color="#fecaca",
+                text_color="#ffffff",
+            )
+        else:
+            self.stop_button.configure(
+                text="■  Emergency stop",
+                fg_color="#7f1d1d",
+                hover_color="#991b1b",
+                border_color="#b91c1c",
+                text_color="#fca5a5",
+            )
 
     def clear_all(self) -> None:
         # Escape key: a hard clear, not just stop() -- also strips resolved
@@ -1000,6 +1252,8 @@ class NavGuiApp:
 
     # ---------------- manual drive ---------------- #
     def manual_press(self, direction: str) -> None:
+        if self._estop_block("driving"):
+            return
         self.cancel_pixel_click()
         self._manual_held.add(direction)
         self._manual_update()
@@ -1030,6 +1284,8 @@ class NavGuiApp:
         self.controller.request_resolve()
 
     def confirm_segmentation(self) -> None:
+        if self._estop_block("confirming a goal"):
+            return
         self._ack("goal confirmed")
         self.controller.request_confirm_segmentation()
 
@@ -1044,6 +1300,8 @@ class NavGuiApp:
 
     # ---------------- uncertainty halt ---------------- #
     def submit_uncertainty_heading(self, angle_deg: float) -> None:
+        if self._estop_block("sending a heading"):
+            return
         self._ack(f"heading sent: {angle_deg:+.0f}°")
         self.controller.submit_uncertainty_heading(angle_deg)
 
@@ -1068,6 +1326,8 @@ class NavGuiApp:
 
     def confirm_pixel_goal(self) -> None:
         if self._pending_click_norm is None:
+            return
+        if self._estop_block("committing a goal"):
             return
         nx, ny = self._pending_click_norm
         self._ack("point goal committed")
@@ -1194,6 +1454,19 @@ class NavGuiApp:
             lines.append(f"{marker} {n}. {self._subgoal_label(g)}")
         return "\n".join(lines) if lines else "(no active mission)"
 
+    def _mission_review_steps_text(self, mission) -> str:
+        # Confirm-Mission panel's step list -- same _subgoal_label
+        # vocabulary as _goal_list_text, but with no done/current markers
+        # since nothing has started yet (the whole point of this panel is
+        # that it's shown *before* the mission is dispatched).
+        lines = [
+            f"{n}. {self._subgoal_label(g)}"
+            for n, g in enumerate(
+                (g for g in mission.goals if g.kind != GoalKind.DONE), start=1
+            )
+        ]
+        return "\n".join(lines) if lines else "(no steps parsed)"
+
     def _derive_goal_belief(self, d) -> tuple[str, str]:
         # exp.md Sec 3 "Goal Belief" -- a human-readable confidence label,
         # not the raw covariance value (that stays numeric in the Rover
@@ -1234,11 +1507,30 @@ class NavGuiApp:
         # specific why/what (goal name, halt reason), matching that
         # section's own "Navigating to ANTENNA" / "Goal localization
         # uncertainty exceeded threshold" examples.
+        if self._estop_active:
+            # REACH P8: outranks everything else -- the header is the first
+            # place an operator looks, and a locked-out console must never
+            # read as "navigating" or "idle" while the latch is engaged.
+            return (
+                "EMERGENCY STOP",
+                "Driving locked — release the emergency stop to resume",
+                TOP_STATUS_COLORS["EMERGENCY STOP"],
+            )
         if not alive:
             return (
                 "RECOVERING",
                 "controller thread died -- see console",
                 TOP_STATUS_COLORS["RECOVERING"],
+            )
+        if d.mission_review is not None:
+            # REACH P2/P10: a Taskwork command has finished VLM-parsing but
+            # hasn't been dispatched -- outranks whatever an already-active
+            # mission is doing, since this is the freshest thing needing the
+            # operator's attention (see Confirm-Mission panel below).
+            return (
+                "AWAITING HUMAN",
+                f'Confirm mission "{d.mission_review.instruction}" below to begin',
+                TOP_STATUS_COLORS["AWAITING HUMAN"],
             )
         if d.uncertainty_halted:
             reason = (
@@ -1352,21 +1644,30 @@ class NavGuiApp:
         # out (position, heading, velocity, yaw rate, nav state);
         # model-internal/CBF debugging detail stays in the trajectory/
         # belief bar's own HUD instead of this panel.
-        pose_txt = (
-            f"pos ({d.pose.x:.1f}, {d.pose.z:.1f})  heading={math.degrees(d.pose.yaw):.0f}deg"
-            if d.pose is not None
-            else "pos: -"
-        )
+        if d.pose is not None:
+            self.telemetry_position_label.configure(
+                text=f"{d.pose.x:.1f}, {d.pose.z:.1f} m"
+            )
+            self.telemetry_heading_label.configure(
+                text=f"{math.degrees(d.pose.yaw):.0f}°"
+            )
+        else:
+            self.telemetry_position_label.configure(text="--")
+            self.telemetry_heading_label.configure(text="--")
+
         act = d.action
+        self.telemetry_velocity_label.configure(text=f"{act.v_fwd:.2f} m/s")
+        self.telemetry_yaw_rate_label.configure(text=f"{act.yaw_rate:+.2f} rad/s")
+
         nav_state = d.mode.upper().replace("_", " ")
         if d.goal_reached:
-            nav_state += " (GOAL REACHED)"
-        lines = [
-            pose_txt,
-            f"v={act.v_fwd:.2f} m/s  yaw_rate={act.yaw_rate:+.2f} rad/s",
-            f"nav state: {nav_state}",
-        ]
-        self.telemetry_label.configure(text="\n".join(lines))
+            nav_state += "  ·  GOAL REACHED"
+        self.telemetry_nav_state_label.configure(
+            text=f"Nav state: {nav_state}",
+            text_color=TOP_STATUS_COLORS["GOAL REACHED"]
+            if d.goal_reached
+            else "#e5e7eb",
+        )
 
     def _sync_top_status(self, d, goal_status: Optional[str], alive: bool) -> None:
         state, subtext, color = self._derive_top_status(d, goal_status, alive)
@@ -1376,6 +1677,64 @@ class NavGuiApp:
         # same frame it fires, before the controller's own state catches up.
         ack_live = self._ack_text if time.time() < self._ack_until else ""
         self.top_status_detail_label.configure(text=ack_live or subtext)
+
+    def _derive_alerts(self, d, alive: bool) -> list[tuple[str, str]]:
+        # Sidebar "Status & alerts" feed -- every signal folded in here
+        # already exists on the controller snapshot or in this GUI's own
+        # state, it just had no single place to surface consistently before
+        # (CBF avoidance/hard-brake only ever showed up as a jitter in the
+        # trajectory plot; low belief confidence only as a color on a small
+        # stat cell; the emergency latch only on the button itself). Most
+        # severe first (STATUS_LEVEL_ORDER); callers cap to _MAX_ALERT_ROWS.
+        alerts: list[tuple[str, str]] = []
+        if self._estop_active:
+            alerts.append(("critical", "emergency stop active — driving locked"))
+        if not alive:
+            alerts.append(("critical", "controller thread died — see console"))
+        if d.error_text:
+            alerts.append(("critical", d.error_text))
+        cbf = d.cbf_info or {}
+        if cbf.get("hard_gate_fired"):
+            alerts.append(("warning", "CBF hard brake — collision-radius breach"))
+        elif cbf.get("orbiting") or cbf.get("blocked"):
+            alerts.append(("caution", "avoiding obstacle"))
+        if (
+            d.uncertainty_enabled
+            and not d.uncertainty_halted
+            and d.uncertainty_threshold > 0
+            and d.uncertainty_value / d.uncertainty_threshold >= 0.8
+        ):
+            alerts.append(("caution", "goal belief confidence low"))
+        if (
+            d.home_base_uncertainty_threshold > 0
+            and d.home_base_uncertainty_value / d.home_base_uncertainty_threshold >= 0.8
+        ):
+            alerts.append(("caution", "home-base belief confidence low"))
+        if d.click_status:
+            alerts.append(("info", d.click_status))
+        alerts.sort(key=lambda a: STATUS_LEVEL_ORDER[a[0]])
+        return alerts[: self._MAX_ALERT_ROWS]
+
+    def _sync_alerts_panel(self, d, alive: bool) -> None:
+        alerts = self._derive_alerts(d, alive)
+        if alerts:
+            self.alerts_nominal_label.grid_remove()
+        else:
+            self.alerts_nominal_label.grid()
+        for i, lbl in enumerate(self.alert_rows):
+            if i < len(alerts):
+                level, text = alerts[i]
+                lbl.configure(text=f"●  {text}", text_color=STATUS_LEVEL_COLORS[level])
+                lbl.grid()
+            else:
+                lbl.grid_remove()
+        # REACH P10: the panel's own border echoes the worst active level so
+        # the sidebar reads as "something needs attention" even collapsed
+        # off-screen by scroll, not only from the text inside it.
+        worst = alerts[0][0] if alerts else "nominal"
+        self.alerts_panel.configure(
+            border_color=STATUS_LEVEL_COLORS[worst] if worst != "nominal" else "#3f3f46"
+        )
 
     def refresh(self) -> None:
         if self.closed:
@@ -1393,10 +1752,10 @@ class NavGuiApp:
             self._draw_topdown(d.vis_rgb_topdown)
 
         self._draw_plot(d)
+        self._sync_mission_review_panel(d)
         self._sync_seg_panel(d)
         self._sync_click_panel()
         self._sync_uncertainty_panel(d)
-        self.click_status_label.configure(text=d.click_status)
         self.mission_status_label.configure(text=d.mission_status)
 
         goal_status = self._derive_goal_status(d)
@@ -1405,6 +1764,7 @@ class NavGuiApp:
 
         alive = self.controller.is_alive()
         self._sync_top_status(d, goal_status, alive)
+        self._sync_alerts_panel(d, alive)
         if not alive and not self._alive_label_visible:
             self.alive_label.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
             self._alive_label_visible = True
@@ -1413,6 +1773,28 @@ class NavGuiApp:
             self._alive_label_visible = False
 
         self.root.after(REFRESH_MS, self.refresh)
+
+    def _sync_mission_review_panel(self, d) -> None:
+        mission = d.mission_review
+        pending = mission is not None
+        if pending and not self._mission_review_panel_visible:
+            self.mission_review_panel.grid(
+                row=self._mission_review_row,
+                column=0,
+                sticky="ew",
+                pady=(SECTION_GAP, 0),
+            )
+            self._mission_review_panel_visible = True
+            self._scroll_sidebar_to_bottom()
+        elif not pending and self._mission_review_panel_visible:
+            self.mission_review_panel.grid_forget()
+            self._mission_review_panel_visible = False
+            self._scroll_sidebar_to_top()
+        if pending:
+            self.mission_review_desc_label.configure(text=f'"{mission.instruction}"')
+            self.mission_review_steps_label.configure(
+                text=self._mission_review_steps_text(mission)
+            )
 
     def _sync_seg_panel(self, d) -> None:
         in_review = d.mode == MODE_REVIEW_SEGMENTATION
@@ -1466,7 +1848,7 @@ class NavGuiApp:
         if in_flight:
             self.uncertainty_panel.configure(border_color="#f59e0b")
             self.uncertainty_title.configure(
-                text="Requesting VLM sweep...", text_color="#f59e0b"
+                text="Requesting VLM sweep", text_color="#f59e0b"
             )
         else:
             self.uncertainty_panel.configure(border_color="#38bdf8")
@@ -1474,7 +1856,7 @@ class NavGuiApp:
                 text="Uncertainty halt — choose a heading", text_color="#38bdf8"
             )
         self.uncertainty_desc_label.configure(
-            text=d.uncertainty_line or "Waiting for VLM sweep description..."
+            text=d.uncertainty_line or "Waiting for VLM sweep description"
         )
 
     def _draw_camera(self, vis_rgb) -> None:

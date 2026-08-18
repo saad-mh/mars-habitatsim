@@ -213,6 +213,14 @@ class DisplayState:
     # Mission at all -- gui.py falls back to a single synthesized entry).
     mission_goals: List = field(default_factory=list)
     mission_goal_idx: int = -1
+    # A Mission whose (directions, goals) VLM split has finished parsing but
+    # is awaiting operator confirmation before it starts driving (see
+    # submit_nav_command's docstring / request_confirm_mission /
+    # request_cancel_mission) -- nav/gui1.py's Confirm-Mission panel reads
+    # .instruction/.directions/.goal_texts/.goals off this to show "command
+    # interpretation" before any motion happens. None when nothing is
+    # awaiting confirmation.
+    mission_review: Optional[Mission] = None
     # Uncertainty-halt (vl_direction's "uncertainty" prompt against the real
     # BeliefGoalTracker, see this module's imports): uncertainty_value grows
     # while a MODE_RESOLVE goal mask stays unseen; once it reaches
@@ -447,6 +455,8 @@ class RoverController:
         self._pending_confirm_segmentation = False
         self._pending_rerun_segmentation = False
         self._pending_pick_manually = False
+        self._pending_confirm_mission = False
+        self._pending_cancel_mission = False
         self._pending_uncertainty_heading: Optional[float] = None
         self._pending_uncertainty_retry = False
         # Active/queued Mission (nav/gui.py's Command panel) -- only ever
@@ -461,6 +471,15 @@ class RoverController:
         # *already-parsed* Mission once that background call returns.
         self._pending_nav_command_text: Optional[str] = None
         self._pending_mission: Optional[Mission] = None
+        # A Mission whose (directions, goals) split has finished parsing but
+        # hasn't been dispatched yet -- see submit_nav_command's docstring
+        # and request_confirm_mission/request_cancel_mission. Populated from
+        # self._pending_mission once parsing completes, mirrored into
+        # self.display.mission_review for the GUI's Confirm-Mission panel,
+        # and cleared (without ever becoming self._mission) by any of the
+        # manual-override commands below via _cancel_mission_review_locked,
+        # same as an active self._mission would be.
+        self._mission_awaiting_confirmation: Optional[Mission] = None
         self._mission: Optional[Mission] = None
         # Absolute target world yaw (radians, Pose.yaw's convention) for an
         # active MODE_TURN sub-goal -- controller-thread-only (set and read
@@ -483,6 +502,18 @@ class RoverController:
         # see EventLogger's docstring. Created once per RoverController (one
         # log file per GUI process lifetime), not per-episode/reset.
         self._event_log = EventLogger()
+
+    def _cancel_mission_review_locked(self) -> None:
+        """Discard a Mission awaiting confirmation (see
+        request_confirm_mission/request_cancel_mission) -- called alongside
+        every `self._mission = None` below, so a manual override (manual
+        drive, Random Goal, Go Home, a click/resolve goal, Reset, Clear All)
+        also drops a stale interpreted mission sitting in the GUI's
+        Confirm-Mission panel instead of leaving it there to be confirmed
+        into existence later, out of context. Caller must already hold
+        self._lock."""
+        self._mission_awaiting_confirmation = None
+        self.display.mission_review = None
 
     # ------------------------------------------------------------------ #
     # thread-safe command API -- called from the GUI thread
@@ -509,6 +540,7 @@ class RoverController:
                 v_fwd=float(v_fwd), v_lat=0.0, yaw_rate=float(yaw_rate)
             )
             self._mission = None
+            self._cancel_mission_review_locked()
 
     def random_goal(self) -> None:
         with self._lock:
@@ -527,6 +559,7 @@ class RoverController:
             self._mode = MODE_POINT
             self.display.goal_reached = False
             self._mission = None
+            self._cancel_mission_review_locked()
 
     def go_home(self) -> None:
         with self._lock:
@@ -534,6 +567,7 @@ class RoverController:
             self._mode = MODE_POINT
             self.display.goal_reached = False
             self._mission = None
+            self._cancel_mission_review_locked()
 
     def request_pixel_goal(self, x_norm: float, y_norm: float) -> None:
         """Queue a click-to-goal request: (x_norm, y_norm) are normalized
@@ -543,6 +577,45 @@ class RoverController:
         with self._lock:
             self._pending_pixel_click = (float(x_norm), float(y_norm))
             self._mission = None
+            self._cancel_mission_review_locked()
+
+    def request_forward_point(self, distance_m: float) -> None:
+        """Set a world-frame point `distance_m` straight ahead of the
+        rover's current pose/heading and switch to MODE_POINT driving toward
+        it -- same math GoalKind.ADVANCE uses in _start_mission_subgoal, just
+        callable directly by a script that isn't driving through a Mission
+        (e.g. nav/run_find_and_turn_demo.py's "go straight" leg)."""
+        with self._lock:
+            pose = self.display.pose
+        if pose is None:
+            return
+        tx = pose.x - float(distance_m) * math.sin(pose.yaw)
+        tz = pose.z - float(distance_m) * math.cos(pose.yaw)
+        with self._lock:
+            self._world_goal = (tx, tz)
+            self._mode = MODE_POINT
+            self.display.goal_reached = False
+            self._mission = None
+            self._cancel_mission_review_locked()
+
+    def request_turn(self, direction: str) -> None:
+        """In-place turn to a heading relative to the rover's current yaw --
+        same heading_deg mapping GoalKind.TURN uses in _start_mission_subgoal
+        (and the same MODE_TURN driving, off self._mission_target_yaw), just
+        callable directly without a Mission."""
+        heading_deg = {"right": 90.0, "left": -90.0, "back": 180.0}.get(
+            direction, 180.0
+        )
+        with self._lock:
+            pose = self.display.pose
+        if pose is None:
+            return
+        with self._lock:
+            self._mission_target_yaw = pose.yaw - math.radians(heading_deg)
+            self._mode = MODE_TURN
+            self.display.goal_reached = False
+            self._mission = None
+            self._cancel_mission_review_locked()
 
     def request_resolve(self, target_text: Optional[str] = None) -> None:
         """target_text=None -> the original SAM2+Qwen-salience auto-resolve
@@ -555,6 +628,7 @@ class RoverController:
             self._pending_resolve = True
             self._resolve_target_text = target_text or None
             self._mission = None
+            self._cancel_mission_review_locked()
 
     def request_confirm_segmentation(self) -> None:
         """Accept the goal/obstacle masks from the most recent resolve/rerun
@@ -580,6 +654,7 @@ class RoverController:
         with self._lock:
             self._pending_reset = True
             self._mission = None
+            self._cancel_mission_review_locked()
 
     def clear_all_goals(self) -> None:
         """Hard reset of every goal/mission/mask/uncertainty-halt state back
@@ -592,13 +667,31 @@ class RoverController:
         with self._lock:
             self._pending_clear_all = True
             self._mission = None
+            self._cancel_mission_review_locked()
+
+    def request_confirm_mission(self) -> None:
+        """Accept the Mission currently awaiting confirmation (see
+        submit_nav_command's docstring) -- dispatched next tick, replacing
+        whatever mission/goal was previously active. No-op if nothing is
+        currently awaiting confirmation (stale click after a Reset/Clear
+        All or a manual override already discarded it)."""
+        with self._lock:
+            self._pending_confirm_mission = True
+
+    def request_cancel_mission(self) -> None:
+        """Reject the Mission currently awaiting confirmation without
+        starting it -- the rover stays exactly as it was (unlike Reset).
+        The operator can then edit and resubmit the Taskwork command."""
+        with self._lock:
+            self._pending_cancel_mission = True
 
     def submit_uncertainty_heading(self, angle_deg: float) -> None:
         """Answer an active uncertainty halt with a rover-front-relative
-        heading (degrees, same convention as heading_ahead_point/nav/gui.py's
-        numpad panel). No-op (consumed and dropped) if not currently
-        halted -- guards a stale click racing a halt that's already resolved
-        by a fresh sighting."""
+        heading (degrees, same convention as heading_ahead_point/
+        nav/gui1.py's numpad panel: 0=front, positive=left/counterclockwise).
+        No-op (consumed and dropped) if not currently halted -- guards a
+        stale click racing a halt that's already resolved by a fresh
+        sighting."""
         with self._lock:
             self._pending_uncertainty_heading = float(angle_deg)
 
@@ -610,7 +703,7 @@ class RoverController:
             self._pending_uncertainty_retry = True
 
     def submit_nav_command(self, text: str) -> None:
-        """Queue a free-text nav command (nav/gui.py's Command panel) for
+        """Queue a free-text nav command (nav/gui1.py's Taskwork panel) for
         background splitting into (directions, goals) via the Qwen VLM
         (qwen_client.parse_nav_command, see
         qwen_prompts.build_parse_nav_command_prompt) -- consumed next tick by
@@ -618,13 +711,18 @@ class RoverController:
         (_dispatch_nav_command) using that tick's live frame. The result
         becomes a new Mission (nav.mission.Mission, nav.mission.parse_parts:
         every direction first as an in-place TURN, then every goal as
-        GO_TO/RETURN), picked up by _env_loop's mission stepper
-        (_start_mission_subgoal) once parsing completes: GO_TO/FIND ground
-        the named target via dino_grounding_resolver and auto-confirm (no
-        review pause -- a human isn't supervising each step of a multi-part
-        instruction), RETURN drives to the spawn point, TURN rotates in
-        place. Advances on each step's ground-truth goal_reached signal,
-        same as a manually driven point/resolve goal."""
+        GO_TO/RETURN), which _env_loop stages into self._mission_awaiting_
+        confirmation (and mirrors into self.display.mission_review) rather
+        than dispatching it immediately -- the GUI's Confirm-Mission panel
+        shows the interpreted step list and the operator must
+        request_confirm_mission() before _start_mission_subgoal actually
+        starts driving (or request_cancel_mission() to discard it). Once
+        confirmed: GO_TO/FIND ground the named target via
+        dino_grounding_resolver and auto-confirm per step (no per-step
+        review pause -- the human already reviewed the whole instruction
+        up front), RETURN drives to the spawn point, TURN rotates in place.
+        Advances on each step's ground-truth goal_reached signal, same as a
+        manually driven point/resolve goal."""
         with self._lock:
             self._pending_nav_command_text = text
 
@@ -634,6 +732,7 @@ class RoverController:
             self._world_goal = None
             self._manual_action = Action(0.0, 0.0, 0.0)
             self._mission = None
+            self._cancel_mission_review_locked()
 
     def snapshot(self) -> DisplayState:
         with self._lock:
@@ -767,6 +866,8 @@ class RoverController:
                     do_uncertainty_retry,
                     nav_command_text,
                     resolve_target_text,
+                    do_confirm_mission,
+                    do_cancel_mission,
                 ) = self._consume_pending()
 
                 if do_reset or do_clear_all:
@@ -782,6 +883,7 @@ class RoverController:
                         self._resolve_target_text = None
                         self._mission = None
                         self._pending_mission = None
+                        self._cancel_mission_review_locked()
                     self._mission_target_yaw = None
                     belief_tracker = self._new_belief_tracker()
                     goal_beliefs = {}
@@ -857,48 +959,72 @@ class RoverController:
 
                 # A Mission finished parsing (background thread from a prior
                 # tick's _dispatch_nav_command, see submit_nav_command) --
-                # pick it up and start its first sub-goal.
+                # stage it for operator review instead of starting it
+                # immediately. nav/gui1.py's Confirm-Mission panel reads
+                # d.mission_review (.instruction/.directions/.goal_texts/
+                # .goals) to show the interpreted step list; the operator
+                # must request_confirm_mission() before anything below
+                # actually dispatches it, or request_cancel_mission() to
+                # discard it and try a different instruction.
                 with self._lock:
                     pending_mission = self._pending_mission
                     self._pending_mission = None
                 if pending_mission is not None:
                     with self._lock:
-                        self._mission = pending_mission
-                    # Record the rover's spawn point as a "home base" entry in
-                    # the persistent belief bank (goal_beliefs) the moment a
-                    # mission is dispatched, keyed the same way _sweep_goal_beliefs
-                    # keys everything else -- so home is remembered right from
-                    # the prompt, not only once a RETURN sub-goal is reached.
-                    # This seed is what RETURN's own drive (below) actually
-                    # navigates off of via MODE_RESOLVE -- like every other
-                    # tracked goal it's then dead-reckoned every tick (see the
-                    # "for bt in goal_beliefs.values()" propagate loop below),
-                    # so a RETURN leg accrues the same odometry drift/
-                    # uncertainty a GO_TO/FIND leg would, rather than homing in
-                    # on an exact ground-truth world position the rover has no
-                    # real way of knowing.
-                    home_forward, home_left = body_frame_goal(
-                        self.display.pose, (self.start_x, self.start_z)
-                    )
-                    goal_beliefs.setdefault(
-                        "home base", self._new_belief_tracker(mission_sweep=True)
-                    ).observe_body_point(home_forward, home_left)
-                    self._event_log.log(
-                        "home_base_seeded",
-                        world=(round(self.start_x, 2), round(self.start_z, 2)),
-                    )
-                    goal_objects, obstacle_objects, goal_spec, belief_tracker = (
-                        self._start_mission_subgoal(
-                            env,
-                            step,
-                            mask_dir,
-                            goal_objects,
-                            obstacle_objects,
-                            goal_spec,
-                            goal_beliefs,
-                            belief_tracker,
+                        self._mission_awaiting_confirmation = pending_mission
+                        self.display.mission_review = pending_mission
+                        self.display.status_text = (
+                            f"{pending_mission.instruction!r} -- confirm to begin"
                         )
-                    )
+
+                # Operator acted on a Mission awaiting confirmation.
+                if do_confirm_mission:
+                    with self._lock:
+                        confirmed_mission = self._mission_awaiting_confirmation
+                        self._cancel_mission_review_locked()
+                    if confirmed_mission is not None:
+                        with self._lock:
+                            self._mission = confirmed_mission
+                        # Record the rover's spawn point as a "home base" entry in
+                        # the persistent belief bank (goal_beliefs) the moment a
+                        # mission is dispatched, keyed the same way _sweep_goal_beliefs
+                        # keys everything else -- so home is remembered right from
+                        # the prompt, not only once a RETURN sub-goal is reached.
+                        # This seed is what RETURN's own drive (below) actually
+                        # navigates off of via MODE_RESOLVE -- like every other
+                        # tracked goal it's then dead-reckoned every tick (see the
+                        # "for bt in goal_beliefs.values()" propagate loop below),
+                        # so a RETURN leg accrues the same odometry drift/
+                        # uncertainty a GO_TO/FIND leg would, rather than homing in
+                        # on an exact ground-truth world position the rover has no
+                        # real way of knowing.
+                        home_forward, home_left = body_frame_goal(
+                            self.display.pose, (self.start_x, self.start_z)
+                        )
+                        goal_beliefs.setdefault(
+                            "home base", self._new_belief_tracker(mission_sweep=True)
+                        ).observe_body_point(home_forward, home_left)
+                        self._event_log.log(
+                            "mission_started",
+                            text=confirmed_mission.instruction,
+                            world=(round(self.start_x, 2), round(self.start_z, 2)),
+                        )
+                        goal_objects, obstacle_objects, goal_spec, belief_tracker = (
+                            self._start_mission_subgoal(
+                                env,
+                                step,
+                                mask_dir,
+                                goal_objects,
+                                obstacle_objects,
+                                goal_spec,
+                                goal_beliefs,
+                                belief_tracker,
+                            )
+                        )
+                elif do_cancel_mission:
+                    with self._lock:
+                        self._cancel_mission_review_locked()
+                        self.display.status_text = "mission cancelled -- idle"
 
                 obs = env.get_observation(frame_idx=step)
                 semantic = env.get_semantic_frame()
@@ -1379,6 +1505,8 @@ class RoverController:
         bool,
         Optional[str],
         Optional[str],
+        bool,
+        bool,
     ]:
         with self._lock:
             do_resolve = self._pending_resolve
@@ -1392,6 +1520,8 @@ class RoverController:
             uncertainty_heading = self._pending_uncertainty_heading
             do_uncertainty_retry = self._pending_uncertainty_retry
             nav_command_text = self._pending_nav_command_text
+            do_confirm_mission = self._pending_confirm_mission
+            do_cancel_mission = self._pending_cancel_mission
             self._pending_resolve = False
             self._pending_reset = False
             self._pending_clear_all = False
@@ -1402,6 +1532,8 @@ class RoverController:
             self._pending_uncertainty_heading = None
             self._pending_uncertainty_retry = False
             self._pending_nav_command_text = None
+            self._pending_confirm_mission = False
+            self._pending_cancel_mission = False
         return (
             do_resolve,
             do_reset,
@@ -1414,6 +1546,8 @@ class RoverController:
             do_uncertainty_retry,
             nav_command_text,
             resolve_target_text,
+            do_confirm_mission,
+            do_cancel_mission,
         )
 
     def _handle_pixel_click(self, obs, pixel_click: tuple) -> None:
@@ -1559,7 +1693,10 @@ class RoverController:
         into a Mission (nav.mission.Mission/parse_parts: every direction
         first as an in-place TURN, then every goal as GO_TO/RETURN). Never
         touches habitat-sim; only writes self._pending_mission under
-        self._lock, picked up next tick by _env_loop."""
+        self._lock, picked up next tick by _env_loop and staged for operator
+        confirmation (see request_confirm_mission's docstring) rather than
+        dispatched directly -- the "mission_started" event log fires once
+        the operator actually confirms it, not here."""
         try:
             directions, goals = qwen_client.parse_nav_command(frame, text)
             print(f"[nav command] {text!r} -> directions={directions} goals={goals}")
@@ -1568,7 +1705,7 @@ class RoverController:
             print(f"[nav command] {text!r} failed: {exc}")
             return
         self._event_log.log(
-            "mission_started", text=text, directions=directions, goals=goals
+            "mission_parsed", text=text, directions=directions, goals=goals
         )
         with self._lock:
             self._pending_mission = mission
@@ -1585,8 +1722,9 @@ class RoverController:
         belief_tracker,
     ):
         """Kicks off whichever driving mode the active Mission's current
-        sub-goal needs (see nav.mission.Mission) -- called once when a new
-        Mission is queued (submit_nav_command) and again every time the
+        sub-goal needs (see nav.mission.Mission) -- called once when a
+        parsed Mission is confirmed (request_confirm_mission, see
+        submit_nav_command's docstring) and again every time the
         mission-advance edge in _env_loop fires. Only ever called from the
         controller thread. A GO_TO/FIND resolve that fails (DINO doesn't
         ground the target in the frame this step starts on) no longer means
